@@ -1,0 +1,9 @@
+{
+  "id": "drivebridge-obsidian-sync",
+  "name": "DriveBridge for Obsidian",
+  "version": "0.2.0",
+  "minAppVersion": "1.5.0",
+  "description": "Production-oriented Obsidian vault sync to a managed Google Drive folder without iCloud.",
+  "author": "jayji",
+  "isDesktopOnly": false
+}

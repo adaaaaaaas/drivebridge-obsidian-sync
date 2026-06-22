@@ -1,0 +1,14 @@
+.drivebridge-status {
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-secondary);
+  white-space: pre-wrap;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-small);
+}
+
+.drivebridge-muted {
+  color: var(--text-muted);
+}
