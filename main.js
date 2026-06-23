@@ -10,6 +10,7 @@ const DEFAULT_SETTINGS = {
   safeInitialSync: true,
   allowFirstRealSync: false,
   syncDeletes: false,
+  obsidianSyncMode: "off",
   autoSyncOnStartup: false,
   autoSyncIntervalMinutes: 0,
   maxFileSizeMb: 50,
@@ -50,6 +51,23 @@ const SNAPSHOT_FILE = "snapshot.json";
 const JOURNAL_FILE = "sync-journal.json";
 const MAX_RETRY_ATTEMPTS = 4;
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
+const OBSIDIAN_SAFE_ALLOW_PATTERNS = [
+  ".obsidian/appearance.json",
+  ".obsidian/core-plugins.json",
+  ".obsidian/community-plugins.json",
+  ".obsidian/hotkeys.json",
+  ".obsidian/snippets/**",
+  ".obsidian/themes/**",
+  ".obsidian/plugins/*/manifest.json",
+  ".obsidian/plugins/*/main.js",
+  ".obsidian/plugins/*/styles.css"
+];
+const OBSIDIAN_ALWAYS_EXCLUDE_PATTERNS = [
+  ".obsidian/workspace.json",
+  ".obsidian/workspace-mobile.json",
+  ".obsidian/plugins/*/data.json",
+  ".obsidian/plugins/drivebridge-obsidian-sync/**"
+];
 
 module.exports = class DriveBridgePlugin extends Plugin {
   async onload() {
@@ -646,11 +664,25 @@ module.exports = class DriveBridgePlugin extends Plugin {
   }
 
   isExcluded(path) {
+    if (this.isAlwaysExcluded(path)) {
+      return true;
+    }
+    if (isObsidianPath(path)) {
+      return this.settings.obsidianSyncMode !== "safe" || !this.isSafeObsidianPath(path);
+    }
     const patterns = this.settings.excludedPatterns
       .split(/\r?\n/)
       .map((line) => line.trim())
       .filter(Boolean);
     return patterns.some((pattern) => globMatch(pattern, path));
+  }
+
+  isAlwaysExcluded(path) {
+    return OBSIDIAN_ALWAYS_EXCLUDE_PATTERNS.some((pattern) => globMatch(pattern, path));
+  }
+
+  isSafeObsidianPath(path) {
+    return OBSIDIAN_SAFE_ALLOW_PATTERNS.some((pattern) => globMatch(pattern, path));
   }
 
   maxFileSizeBytes() {
@@ -802,6 +834,18 @@ class DriveBridgeSettingTab extends PluginSettingTab {
         .setValue(this.plugin.settings.syncDeletes)
         .onChange(async (value) => {
           this.plugin.settings.syncDeletes = value;
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName("Obsidian config sync")
+      .setDesc("Off excludes .obsidian. Safe syncs themes, snippets, hotkeys, plugin files, and selected config while always excluding tokens, plugin data, workspaces, and DriveBridge state.")
+      .addDropdown((dropdown) => dropdown
+        .addOption("off", "Off")
+        .addOption("safe", "Safe")
+        .setValue(this.plugin.settings.obsidianSyncMode || DEFAULT_SETTINGS.obsidianSyncMode)
+        .onChange(async (value) => {
+          this.plugin.settings.obsidianSyncMode = value;
           await this.plugin.saveSettings();
         }));
 
@@ -972,6 +1016,10 @@ function sameRemote(previous, current) {
 
 function sameSize(localItem, remoteItem) {
   return localItem && remoteItem && localItem.size === remoteItem.size;
+}
+
+function isObsidianPath(path) {
+  return path === ".obsidian" || path.startsWith(".obsidian/");
 }
 
 function makeMultipartBody(boundary, metadata, bytes, mimeType) {

@@ -12,6 +12,7 @@ DriveBridge for Obsidian は、iCloud Drive を使わずに Obsidian vault と G
 - 初期状態では `Preview by default` がオンです。自動同期やコマンド実行は、まず差分計画だけを作ります。
 - 初回スナップショットがない状態でローカルとDriveの両方にファイルがある場合、実同期は `Allow first real sync once` を明示的にオンにしない限り止まります。
 - 削除同期は既定で無効です。有効化した場合でも、実削除ではなく Obsidian/Drive のゴミ箱扱いにします。
+- `.obsidian` 同期は既定で無効です。`Obsidian config sync` を `Safe` にすると、テーマ、CSS snippets、ホットキー、プラグイン本体などの安全寄りファイルだけ同期します。
 - 最大ファイルサイズを超えるファイルは同期対象外です。既定は 50 MB です。
 - Google Drive API の 429/5xx などは指数バックオフで再試行します。
 - 同期中はロックされ、二重実行を避けます。
@@ -77,6 +78,31 @@ Drive全体を無条件に読む `drive` スコープは restricted scope で、
 4. `Run sync` を押します。
 5. 問題がなければ `Preview by default` をオフにするか、自動同期を設定します。
 6. `Sync deletes` は、通常運用が安定してから必要な場合だけオンにします。
+
+## `.obsidian` Safe同期
+
+`Obsidian config sync` は既定で `Off` です。この状態では従来通り `.obsidian/**` を同期対象から除外します。
+
+`Safe` にすると、以下だけを同期対象にします。
+
+- `.obsidian/appearance.json`
+- `.obsidian/core-plugins.json`
+- `.obsidian/community-plugins.json`
+- `.obsidian/hotkeys.json`
+- `.obsidian/snippets/**`
+- `.obsidian/themes/**`
+- `.obsidian/plugins/*/manifest.json`
+- `.obsidian/plugins/*/main.js`
+- `.obsidian/plugins/*/styles.css`
+
+以下は `Safe` でも常に除外します。
+
+- `.obsidian/workspace.json`
+- `.obsidian/workspace-mobile.json`
+- `.obsidian/plugins/*/data.json`
+- `.obsidian/plugins/drivebridge-obsidian-sync/**`
+
+これにより、テーマ、スニペット、ホットキー、プラグイン本体は同期できますが、OAuth token、プラグイン個別設定、DriveBridge自身の `data.json`、`snapshot.json`、`sync-journal.json` は同期しません。
 
 ## 生成ファイル
 
