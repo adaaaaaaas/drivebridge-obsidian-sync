@@ -2139,40 +2139,30 @@ class DriveBridgeSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Recovery")
-      .setDesc("Use in order after an interrupted sync: Preview recovery, optionally discard partials, run normal Preview, then Resume safe operations.")
-      .addButton((button) => button
-        .setButtonText("1. Preview recovery")
-        .onClick(async () => {
-          await runUiAction(() => this.plugin.previewRecovery());
-          this.display();
-        }))
-      .addButton((button) => button
-        .setButtonText("2. Discard partial downloads")
-        .onClick(async () => {
-          await runUiAction(() => this.plugin.discardPartialDownloads());
-          this.display();
-        }))
-      .addButton((button) => button
-        .setButtonText("3. Normal Preview")
-        .setDisabled(!this.plugin.settings.recoveryPreviewSafe)
-        .onClick(async () => {
-          await this.plugin.previewSync();
-          this.display();
-        }))
-      .addButton((button) => {
-        const resumeEnabled = this.plugin.settings.recoveryPreviewSafe &&
-          Boolean(this.plugin.settings.recoveryPreviewRunId) &&
-          this.plugin.settings.recoveryPlanPreviewRunId === this.plugin.settings.recoveryPreviewRunId &&
-          Boolean(this.plugin.settings.recoveryPlanPreviewAt) &&
-          this.plugin.settings.recoveryPlanPreviewSafe;
-        button
-          .setButtonText("4. Resume safe operations")
-          .setDisabled(!resumeEnabled)
-          .onClick(async () => {
-            await runUiAction(() => this.plugin.syncNow({ dryRun: false, recoveryResume: true }));
-            this.display();
-          });
-      });
+      .setDesc("Use in order after an interrupted sync.");
+
+    const recoveryButtonsEl = containerEl.createDiv({ cls: "drivebridge-recovery-flow" });
+    this.addRecoveryButton(recoveryButtonsEl, "1. Preview recovery", false, async () => {
+      await runUiAction(() => this.plugin.previewRecovery());
+      this.display();
+    });
+    this.addRecoveryButton(recoveryButtonsEl, "2. Discard partial downloads", false, async () => {
+      await runUiAction(() => this.plugin.discardPartialDownloads());
+      this.display();
+    });
+    this.addRecoveryButton(recoveryButtonsEl, "3. Normal Preview", !this.plugin.settings.recoveryPreviewSafe, async () => {
+      await this.plugin.previewSync();
+      this.display();
+    });
+    const resumeEnabled = this.plugin.settings.recoveryPreviewSafe &&
+      Boolean(this.plugin.settings.recoveryPreviewRunId) &&
+      this.plugin.settings.recoveryPlanPreviewRunId === this.plugin.settings.recoveryPreviewRunId &&
+      Boolean(this.plugin.settings.recoveryPlanPreviewAt) &&
+      this.plugin.settings.recoveryPlanPreviewSafe;
+    this.addRecoveryButton(recoveryButtonsEl, "4. Resume safe operations", !resumeEnabled, async () => {
+      await runUiAction(() => this.plugin.syncNow({ dryRun: false, recoveryResume: true }));
+      this.display();
+    }, true);
 
     if (this.plugin.settings.lastRecoverySummary) {
       containerEl.createEl("div", {
@@ -2192,6 +2182,15 @@ class DriveBridgeSettingTab extends PluginSettingTab {
       text: this.plugin.settings.lastSyncSummary || "No sync has run yet.",
       cls: "drivebridge-status"
     });
+  }
+
+  addRecoveryButton(parentEl, text, disabled, onClick, cta = false) {
+    const button = parentEl.createEl("button", {
+      text,
+      cls: cta ? "mod-cta" : ""
+    });
+    button.disabled = disabled;
+    button.addEventListener("click", onClick);
   }
 }
 

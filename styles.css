@@ -49,3 +49,24 @@
   font-family: var(--font-monospace);
   font-size: var(--font-ui-small);
 }
+
+.drivebridge-recovery-flow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  margin: 8px 0 12px;
+  max-width: 420px;
+}
+
+.drivebridge-recovery-flow button {
+  width: 100%;
+  min-height: 36px;
+  justify-content: center;
+  white-space: normal;
+}
+
+@media (min-width: 720px) {
+  .drivebridge-recovery-flow {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

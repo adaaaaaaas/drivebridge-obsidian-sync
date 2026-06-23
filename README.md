@@ -2,6 +2,7 @@
 
 ## Latest change
 
+- 0.4.11: Recovery buttons now use a dedicated responsive layout instead of a crowded settings row, fixing layout issues on narrow/mobile screens.
 - 0.4.10: Recovery resume is now poka-yoke gated: run Preview recovery, discard partials if needed, run normal Preview, then Resume safe operations only when no conflict/delete risk remains.
 - 0.4.9: Adds operation journaling, interrupted-sync recovery checks, partial cleanup, and large binary conflict skip for manual review.
 - 0.4.8: Conflict handling now adopts same-size files when local MD5 matches Google Drive MD5, and downloads now write to a verified partial file before replacing the final file.
