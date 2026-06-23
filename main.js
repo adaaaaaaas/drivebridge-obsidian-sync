@@ -113,6 +113,10 @@ module.exports = class DriveBridgePlugin extends Plugin {
     this.currentSyncProgress = "";
     this.syncUiQuiet = false;
     this.skipChangedFilesDuringSync = false;
+    this.operationJournalCache = null;
+    this.operationJournalDirty = false;
+    this.operationJournalDirtyCount = 0;
+    this.operationJournalLastFlushAt = 0;
     this.statusBarItem = this.addStatusBarItem();
     this.statusBarItem.addClass("drivebridge-sync-status");
     this.clearSyncStatus();
@@ -328,6 +332,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       this.showProgressModal(this.formatErrorModalMessage("DriveBridge failed.", [failure]), this.lastProgressForModal());
       console.error("[drivebridge-obsidian-sync]", err);
     } finally {
+      await this.safeFlushOperationJournal(true);
       this.syncing = false;
       this.syncUiQuiet = false;
       this.skipChangedFilesDuringSync = false;
@@ -548,6 +553,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
         });
       }
     }
+    await this.flushOperationJournal(true);
     return { nextSnapshot, stats, errors, skippedChanged, skippedSafe, processed, total: orderedEntries.length, processedBytes, totalBytes };
   }
 
@@ -641,7 +647,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       await this.assertLocalUnchangedSincePlan(path, localItem);
       await this.assertRemoteUnchangedSincePlan(path, remoteItem);
       await this.downloadRemoteFile(path, remoteItem);
-      const refreshedLocal = (await this.scanLocalVault())[path];
+      const refreshedLocal = await this.localInfoByPath(path);
       nextSnapshot[path] = this.snapshotFrom(refreshedLocal, remoteItem);
       stats.download++;
       return;
@@ -694,7 +700,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     if (action === "keepRemoteWithBackup") {
       await this.renameLocalToConflict(path);
       await this.downloadRemoteFile(path, remoteItem);
-      const refreshedLocal = (await this.scanLocalVault())[path];
+      const refreshedLocal = await this.localInfoByPath(path);
       return this.snapshotFrom(refreshedLocal, remoteItem);
     }
     if (action === "keepBothLocalWins") {
@@ -712,7 +718,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     }
     await this.renameLocalToConflict(path);
     await this.downloadRemoteFile(path, remoteItem);
-    const refreshedLocal = (await this.scanLocalVault())[path];
+    const refreshedLocal = await this.localInfoByPath(path);
     return this.snapshotFrom(refreshedLocal, remoteItem);
   }
 
@@ -1184,7 +1190,35 @@ module.exports = class DriveBridgePlugin extends Plugin {
   }
 
   async writeOperationJournal(journal) {
+    this.operationJournalCache = journal;
+    this.operationJournalDirty = false;
+    this.operationJournalDirtyCount = 0;
+    this.operationJournalLastFlushAt = Date.now();
     await this.app.vault.adapter.write(this.pluginDataPath(OPERATION_JOURNAL_FILE), JSON.stringify(journal, null, 2));
+  }
+
+  markOperationJournalDirty() {
+    this.operationJournalDirty = true;
+    this.operationJournalDirtyCount++;
+  }
+
+  async flushOperationJournal(force = false) {
+    if (!this.operationJournalCache || !this.operationJournalDirty) {
+      return;
+    }
+    const elapsed = Date.now() - (this.operationJournalLastFlushAt || 0);
+    if (!force && this.operationJournalDirtyCount < 20 && elapsed < 2500) {
+      return;
+    }
+    await this.writeOperationJournal(this.operationJournalCache);
+  }
+
+  async safeFlushOperationJournal(force = false) {
+    try {
+      await this.flushOperationJournal(force);
+    } catch (err) {
+      console.error("[drivebridge-obsidian-sync] failed to flush operation journal", err);
+    }
   }
 
   async initializeOperationJournal(runId, plan, context) {
@@ -1218,10 +1252,11 @@ module.exports = class DriveBridgePlugin extends Plugin {
     if (!runId || !entry || !entry.path) {
       return;
     }
-    const journal = await this.readOperationJournal();
+    const journal = this.operationJournalCache || await this.readOperationJournal();
     if (!journal || journal.runId !== runId) {
       return;
     }
+    this.operationJournalCache = journal;
     const current = journal.operations[entry.path] || {
       runId,
       path: entry.path,
@@ -1245,18 +1280,21 @@ module.exports = class DriveBridgePlugin extends Plugin {
       };
     }
     journal.operations[entry.path] = current;
-    await this.writeOperationJournal(journal);
+    this.markOperationJournalDirty();
+    await this.flushOperationJournal(Boolean(err) || status === "failed" || status === "skipped");
   }
 
   async markOperationJournalComplete(runId, executed) {
-    const journal = await this.readOperationJournal();
+    const journal = this.operationJournalCache || await this.readOperationJournal();
     if (!journal || journal.runId !== runId) {
       return;
     }
+    this.operationJournalCache = journal;
     journal.completedAt = new Date().toISOString();
     journal.status = executed.errors.length ? "completed_with_errors" : "completed";
     journal.stats = executed.stats;
-    await this.writeOperationJournal(journal);
+    this.markOperationJournalDirty();
+    await this.flushOperationJournal(true);
   }
 
   async checkInterruptedSync() {

@@ -2,6 +2,7 @@
 
 ## Latest change
 
+- 0.4.12: Speeds up many small Markdown syncs by avoiding full-vault rescans after each download and batching operation journal writes.
 - 0.4.11: Recovery buttons now use a dedicated responsive layout instead of a crowded settings row, fixing layout issues on narrow/mobile screens.
 - 0.4.10: Recovery resume is now poka-yoke gated: run Preview recovery, discard partials if needed, run normal Preview, then Resume safe operations only when no conflict/delete risk remains.
 - 0.4.9: Adds operation journaling, interrupted-sync recovery checks, partial cleanup, and large binary conflict skip for manual review.
