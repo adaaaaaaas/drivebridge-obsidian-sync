@@ -201,16 +201,26 @@ module.exports = class DriveBridgePlugin extends Plugin {
       this.settings.lastSyncAt = Date.now();
       this.settings.lastSyncSummary = this.formatExecutionSummary(executed, Date.now() - started);
       await this.saveSettings();
-      new Notice(executed.errors.length ? "DriveBridge sync completed with errors." : "DriveBridge sync complete.");
-      this.showProgressModal(executed.errors.length ? "DriveBridge sync completed with errors. Check the summary before editing." : "DriveBridge sync complete.");
-      this.scheduleProgressModalClose(executed.errors.length ? 4000 : 1800);
+      if (executed.errors.length) {
+        new Notice("DriveBridge sync completed with errors. Check DriveBridge settings for details.", 10000);
+        this.showProgressModal(this.formatErrorModalMessage("DriveBridge sync completed with errors.", executed.errors));
+      } else {
+        new Notice("DriveBridge sync complete.");
+        this.showProgressModal("DriveBridge sync complete.");
+        this.scheduleProgressModalClose(1800);
+      }
     } catch (err) {
-      const message = err && err.message ? err.message : String(err);
-      this.settings.lastSyncSummary = `Failed: ${message}`;
+      const failure = this.errorRecord({ path: "(sync)", action: "sync" }, err);
+      this.settings.lastSyncSummary = this.formatFatalErrorSummary(failure, Date.now() - started);
+      await this.safeWriteJournal({
+        startedAt: new Date(started).toISOString(),
+        finishedAt: new Date().toISOString(),
+        dryRun,
+        fatalError: failure
+      });
       await this.saveSettings();
-      new Notice(`DriveBridge failed: ${message}`);
-      this.showProgressModal(`DriveBridge failed: ${message}`);
-      this.scheduleProgressModalClose(5000);
+      new Notice(`DriveBridge failed: ${failure.message}. Check DriveBridge settings for details.`, 10000);
+      this.showProgressModal(this.formatErrorModalMessage("DriveBridge failed.", [failure]));
       console.error("[drivebridge-obsidian-sync]", err);
     } finally {
       this.syncing = false;
@@ -353,8 +363,11 @@ module.exports = class DriveBridgePlugin extends Plugin {
       try {
         await this.executeEntry(entry, context, nextSnapshot, stats);
       } catch (err) {
-        errors.push({ path: entry.path, action: entry.action, message: err && err.message ? err.message : String(err) });
+        const error = this.errorRecord(entry, err);
+        errors.push(error);
         stats.error++;
+        new Notice(`DriveBridge error: ${error.action} ${error.path}: ${error.message}`, 10000);
+        this.showProgressModal(this.formatErrorModalMessage(`DriveBridge sync error ${stats.error}. Continuing...`, [error]));
         console.error("[drivebridge-obsidian-sync]", entry, err);
       }
     }
@@ -694,6 +707,14 @@ module.exports = class DriveBridgePlugin extends Plugin {
     await this.app.vault.adapter.write(this.pluginDataPath(JOURNAL_FILE), JSON.stringify(journal, null, 2));
   }
 
+  async safeWriteJournal(journal) {
+    try {
+      await this.writeJournal(journal);
+    } catch (err) {
+      console.error("[drivebridge-obsidian-sync] failed to write journal", err);
+    }
+  }
+
   async localInfo(file) {
     const info = {
       path: file.path,
@@ -841,7 +862,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
   }
 
   formatExecutionSummary(executed, elapsedMs) {
-    return [
+    const lines = [
       `Completed in ${(elapsedMs / 1000).toFixed(1)}s`,
       `Uploaded: ${executed.stats.upload}`,
       `Downloaded: ${executed.stats.download}`,
@@ -851,7 +872,55 @@ module.exports = class DriveBridgePlugin extends Plugin {
       `Deleted remote: ${executed.stats.deleteRemote}`,
       `Skipped: ${executed.stats.skip}`,
       `Errors: ${executed.errors.length}`
+    ];
+    if (executed.errors.length) {
+      lines.push("", "Error details:", ...this.formatErrorLines(executed.errors, 20));
+      lines.push("", `Full latest run details are saved in ${JOURNAL_FILE}.`);
+    }
+    return lines.join("\n");
+  }
+
+  formatFatalErrorSummary(error, elapsedMs) {
+    return [
+      `Failed after ${(elapsedMs / 1000).toFixed(1)}s`,
+      "",
+      "Error details:",
+      ...this.formatErrorLines([error], 1),
+      "",
+      `Latest failure details are saved in ${JOURNAL_FILE}.`
     ].join("\n");
+  }
+
+  formatErrorModalMessage(title, errors) {
+    return [
+      title,
+      "",
+      ...this.formatErrorLines(errors, 3),
+      "",
+      `Also saved in ${JOURNAL_FILE} and shown in DriveBridge settings.`
+    ].join("\n");
+  }
+
+  formatErrorLines(errors, limit) {
+    const visible = errors.slice(0, limit).map((error, index) => {
+      const line = `${index + 1}. ${error.action}: ${error.path}`;
+      return `${line}\n   Time: ${error.time || "unknown"}\n   Error: ${error.message}`;
+    });
+    const remaining = errors.length - visible.length;
+    if (remaining > 0) {
+      visible.push(`...and ${remaining} more error(s).`);
+    }
+    return visible;
+  }
+
+  errorRecord(entry, err) {
+    return {
+      path: entry.path || "",
+      action: entry.action || "",
+      message: err && err.message ? err.message : String(err),
+      name: err && err.name ? err.name : "",
+      time: new Date().toISOString()
+    };
   }
 };
 

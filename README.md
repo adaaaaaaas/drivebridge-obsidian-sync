@@ -1,5 +1,11 @@
 # DriveBridge for Obsidian
 
+## Latest change
+
+- Sync errors now stay visible in the progress modal instead of disappearing after a short notice.
+- Error details include the action, vault path, error message, and time.
+- The same details are saved to `sync-journal.json` and shown in the DriveBridge settings summary.
+
 DriveBridge for Obsidian は、iCloud Drive を使わずに Obsidian vault と Google Drive を同期するためのコミュニティプラグインです。iPhone/iPad の Obsidian モバイルでも動くように、OS のローカル同期フォルダではなく Obsidian Vault API と Google Drive API を使います。
 
 ## 本番仕様の考え方
