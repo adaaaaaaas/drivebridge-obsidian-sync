@@ -1,4 +1,4 @@
-const { Modal, Notice, Plugin, PluginSettingTab, Setting, TFile } = require("obsidian");
+const { Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, requestUrl } = require("obsidian");
 
 const DEFAULT_SETTINGS = {
   clientId: "",
@@ -116,7 +116,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       client_id: this.settings.clientId,
       scope: DRIVE_SCOPE
     });
-    const data = await parseJsonResponse(await fetch(OAUTH_DEVICE_CODE, {
+    const data = await parseJsonResponse(await customFetch(OAUTH_DEVICE_CODE, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body
@@ -142,7 +142,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     if (this.settings.clientSecret) {
       body.set("client_secret", this.settings.clientSecret);
     }
-    const data = await parseJsonResponse(await fetch(OAUTH_TOKEN, {
+    const data = await parseJsonResponse(await customFetch(OAUTH_TOKEN, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body
@@ -473,7 +473,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     if (this.settings.clientSecret) {
       body.set("client_secret", this.settings.clientSecret);
     }
-    const data = await parseJsonResponse(await fetch(OAUTH_TOKEN, {
+    const data = await parseJsonResponse(await customFetch(OAUTH_TOKEN, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body
@@ -494,7 +494,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     await this.ensureAccessToken();
     const headers = new Headers(options.headers || {});
     headers.set("Authorization", `Bearer ${this.settings.accessToken}`);
-    const res = await fetch(url, Object.assign({}, options, { headers }));
+    const res = await customFetch(url, Object.assign({}, options, { headers }));
     if (res.status === 401 && this.settings.refreshToken && attempt === 1) {
       this.settings.tokenExpiresAt = 0;
       await this.ensureAccessToken();
@@ -1368,6 +1368,49 @@ async function runUiAction(action) {
     new Notice(message);
     console.error("[drivebridge-obsidian-sync]", err);
   }
+}
+
+async function customFetch(url, options = {}) {
+  const method = options.method || "GET";
+  const headers = {};
+  if (options.headers) {
+    if (typeof options.headers.forEach === "function") {
+      options.headers.forEach((value, key) => {
+        headers[key] = value;
+      });
+    } else {
+      Object.assign(headers, options.headers);
+    }
+  }
+  let body = options.body;
+  if (body instanceof URLSearchParams) {
+    body = body.toString();
+  }
+  const requestParam = {
+    url,
+    method,
+    headers,
+    throw: false
+  };
+  if (body !== undefined) {
+    if (ArrayBuffer.isView(body)) {
+      requestParam.body = body.buffer;
+    } else {
+      requestParam.body = body;
+    }
+  }
+  const res = await requestUrl(requestParam);
+  return {
+    ok: res.status >= 200 && res.status < 300,
+    status: res.status,
+    statusText: `HTTP ${res.status}`,
+    text: async () => res.text,
+    json: async () => res.json,
+    arrayBuffer: async () => res.arrayBuffer,
+    headers: {
+      get: (name) => res.headers[name.toLowerCase()] || res.headers[name]
+    }
+  };
 }
 
 async function parseJsonResponse(res) {
