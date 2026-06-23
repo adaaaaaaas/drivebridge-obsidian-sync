@@ -69,6 +69,18 @@ const OBSIDIAN_SAFE_ALLOW_PATTERNS = [
   ".obsidian/plugins/*/styles.css"
 ];
 const OBSIDIAN_ALWAYS_EXCLUDE_PATTERNS = [
+  ".DS_Store",
+  "**/.DS_Store",
+  "Thumbs.db",
+  "**/Thumbs.db",
+  "desktop.ini",
+  "**/desktop.ini",
+  "*.tmp",
+  "**/*.tmp",
+  "*.temp",
+  "**/*.temp",
+  "*.conflict-*",
+  "**/*.conflict-*",
   ".obsidian/workspace.json",
   ".obsidian/workspace-mobile.json",
   ".obsidian/plugins/*/data.json"
