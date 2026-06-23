@@ -12,3 +12,8 @@
 .drivebridge-muted {
   color: var(--text-muted);
 }
+
+.drivebridge-sync-status {
+  color: var(--text-accent);
+  font-weight: 600;
+}
