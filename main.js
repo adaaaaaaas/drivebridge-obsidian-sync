@@ -1,4 +1,4 @@
-const { Notice, Plugin, PluginSettingTab, Setting, TFile } = require("obsidian");
+const { Modal, Notice, Plugin, PluginSettingTab, Setting, TFile } = require("obsidian");
 
 const DEFAULT_SETTINGS = {
   clientId: "",
@@ -76,6 +76,8 @@ module.exports = class DriveBridgePlugin extends Plugin {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
     this.syncing = false;
     this.folderCache = new Map();
+    this.progressModal = null;
+    this.progressCloseTimer = null;
     this.statusBarItem = this.addStatusBarItem();
     this.statusBarItem.addClass("drivebridge-sync-status");
     this.clearSyncStatus();
@@ -167,6 +169,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const started = Date.now();
     try {
       this.setSyncStatus(dryRun ? "DriveBridge preview running..." : "DriveBridge sync running... Do not edit notes.");
+      this.showProgressModal(dryRun ? "DriveBridge preview is running..." : "DriveBridge sync is running. Do not edit notes.");
       new Notice(dryRun ? "DriveBridge preview started." : "DriveBridge sync started. Avoid editing notes until it completes.");
       const context = await this.buildSyncContext();
       const plan = await this.buildSyncPlan(context);
@@ -177,6 +180,8 @@ module.exports = class DriveBridgePlugin extends Plugin {
         this.settings.lastSyncSummary = summary;
         await this.saveSettings();
         new Notice("DriveBridge preview complete.");
+        this.showProgressModal("DriveBridge preview complete.");
+        this.scheduleProgressModalClose(1800);
         this.clearSyncStatus();
         return;
       }
@@ -197,11 +202,15 @@ module.exports = class DriveBridgePlugin extends Plugin {
       this.settings.lastSyncSummary = this.formatExecutionSummary(executed, Date.now() - started);
       await this.saveSettings();
       new Notice(executed.errors.length ? "DriveBridge sync completed with errors." : "DriveBridge sync complete.");
+      this.showProgressModal(executed.errors.length ? "DriveBridge sync completed with errors. Check the summary before editing." : "DriveBridge sync complete.");
+      this.scheduleProgressModalClose(executed.errors.length ? 4000 : 1800);
     } catch (err) {
       const message = err && err.message ? err.message : String(err);
       this.settings.lastSyncSummary = `Failed: ${message}`;
       await this.saveSettings();
       new Notice(`DriveBridge failed: ${message}`);
+      this.showProgressModal(`DriveBridge failed: ${message}`);
+      this.scheduleProgressModalClose(5000);
       console.error("[drivebridge-obsidian-sync]", err);
     } finally {
       this.syncing = false;
@@ -340,6 +349,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const errors = [];
     for (const entry of plan.entries) {
       this.setSyncStatus(`DriveBridge sync ${stats.upload + stats.download + stats.conflict + stats.adopt + stats.deleteLocal + stats.deleteRemote + stats.skip + stats.error + 1}/${plan.entries.length}: ${entry.action} ${entry.path}`);
+      this.showProgressModal(`DriveBridge sync ${stats.upload + stats.download + stats.conflict + stats.adopt + stats.deleteLocal + stats.deleteRemote + stats.skip + stats.error + 1}/${plan.entries.length}\n${entry.action}: ${entry.path}`);
       try {
         await this.executeEntry(entry, context, nextSnapshot, stats);
       } catch (err) {
@@ -763,6 +773,34 @@ module.exports = class DriveBridgePlugin extends Plugin {
     this.setSyncStatus("");
   }
 
+  showProgressModal(message) {
+    if (this.progressCloseTimer) {
+      window.clearTimeout(this.progressCloseTimer);
+      this.progressCloseTimer = null;
+    }
+    if (!this.progressModal) {
+      this.progressModal = new DriveBridgeProgressModal(this.app);
+      this.progressModal.onClosed = () => {
+        this.progressModal = null;
+      };
+      this.progressModal.open();
+    }
+    this.progressModal.update(message);
+  }
+
+  scheduleProgressModalClose(delayMs) {
+    if (this.progressCloseTimer) {
+      window.clearTimeout(this.progressCloseTimer);
+    }
+    this.progressCloseTimer = window.setTimeout(() => {
+      this.progressCloseTimer = null;
+      if (this.progressModal) {
+        this.progressModal.close();
+        this.progressModal = null;
+      }
+    }, delayMs);
+  }
+
   maxFileSizeBytes() {
     return Math.max(1, Number(this.settings.maxFileSizeMb) || DEFAULT_SETTINGS.maxFileSizeMb) * 1024 * 1024;
   }
@@ -816,6 +854,45 @@ module.exports = class DriveBridgePlugin extends Plugin {
     ].join("\n");
   }
 };
+
+class DriveBridgeProgressModal extends Modal {
+  constructor(app) {
+    super(app);
+    this.message = "";
+    this.statusEl = null;
+    this.onClosed = null;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("drivebridge-progress-modal");
+    contentEl.createEl("h2", { text: "DriveBridge is running" });
+    this.statusEl = contentEl.createEl("pre", {
+      text: this.message || "Starting...",
+      cls: "drivebridge-progress-message"
+    });
+    contentEl.createEl("p", {
+      text: "Keep Obsidian open and avoid editing notes until this finishes.",
+      cls: "drivebridge-muted"
+    });
+  }
+
+  onClose() {
+    const { contentEl } = this;
+    contentEl.empty();
+    if (this.onClosed) {
+      this.onClosed();
+    }
+  }
+
+  update(message) {
+    this.message = message;
+    if (this.statusEl) {
+      this.statusEl.setText(message);
+    }
+  }
+}
 
 class DriveBridgeSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
