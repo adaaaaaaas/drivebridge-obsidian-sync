@@ -29,9 +29,13 @@ const DEFAULT_SETTINGS = {
     "**/*.tmp",
     "*.temp",
     "**/*.temp",
-    "*.conflict-*",
-    "**/*.conflict-*"
-  ].join("\n"),
+  "*.conflict-*",
+  "**/*.conflict-*",
+  "*.drivebridge-partial",
+  "**/*.drivebridge-partial",
+  "*.drivebridge-replace-*",
+  "**/*.drivebridge-replace-*"
+].join("\n"),
   accessToken: "",
   refreshToken: "",
   tokenExpiresAt: 0,
@@ -81,6 +85,10 @@ const OBSIDIAN_ALWAYS_EXCLUDE_PATTERNS = [
   "**/*.temp",
   "*.conflict-*",
   "**/*.conflict-*",
+  "*.drivebridge-partial",
+  "**/*.drivebridge-partial",
+  "*.drivebridge-replace-*",
+  "**/*.drivebridge-replace-*",
   ".obsidian/workspace.json",
   ".obsidian/workspace-mobile.json",
   ".obsidian/plugins/*/data.json"
@@ -547,6 +555,13 @@ module.exports = class DriveBridgePlugin extends Plugin {
       stats.adopt++;
       return;
     }
+    if ((entry.action === "upload" || entry.action === "download" || entry.action === "conflict") &&
+        await this.hasSameContent(path, localItem, remoteItem)) {
+      const currentLocal = await this.localInfoByPath(path);
+      nextSnapshot[path] = this.snapshotFrom(currentLocal, remoteItem);
+      stats.adopt++;
+      return;
+    }
     if (entry.action === "upload") {
       await this.assertLocalUnchangedSincePlan(path, localItem);
       if (remoteItem) {
@@ -884,16 +899,60 @@ module.exports = class DriveBridgePlugin extends Plugin {
     }
     const buffer = await res.arrayBuffer();
     await this.ensureLocalParent(path);
-    if (this.isConfigPath(path)) {
-      await this.app.vault.adapter.writeBinary(path, buffer);
-      return;
+    await this.writeVerifiedDownload(path, remoteItem, buffer);
+  }
+
+  async writeVerifiedDownload(path, remoteItem, buffer) {
+    const tempPath = this.partialDownloadPath(path);
+    const replacePath = this.replaceBackupPath(path);
+    if (await this.app.vault.adapter.exists(tempPath)) {
+      await this.app.vault.adapter.remove(tempPath);
     }
-    const current = this.app.vault.getAbstractFileByPath(path);
-    if (current instanceof TFile) {
-      await this.app.vault.modifyBinary(current, buffer);
-    } else {
-      await this.app.vault.createBinary(path, buffer);
+    await this.ensureLocalParent(tempPath);
+    await this.app.vault.adapter.writeBinary(tempPath, buffer);
+    await this.assertDownloadedTempMatchesRemote(tempPath, remoteItem);
+
+    let movedExisting = false;
+    if (await this.localPathExists(path)) {
+      if (await this.app.vault.adapter.exists(replacePath)) {
+        await this.app.vault.adapter.remove(replacePath);
+      }
+      await this.app.vault.adapter.rename(path, replacePath);
+      movedExisting = true;
     }
+    try {
+      await this.app.vault.adapter.rename(tempPath, path);
+      if (movedExisting && await this.app.vault.adapter.exists(replacePath)) {
+        await this.app.vault.adapter.remove(replacePath);
+      }
+    } catch (err) {
+      if (movedExisting && !(await this.localPathExists(path)) && await this.app.vault.adapter.exists(replacePath)) {
+        await this.app.vault.adapter.rename(replacePath, path);
+      }
+      throw err;
+    }
+  }
+
+  async assertDownloadedTempMatchesRemote(tempPath, remoteItem) {
+    const stat = await this.app.vault.adapter.stat(tempPath);
+    const expectedSize = Number(remoteItem.size || 0);
+    if (expectedSize && (!stat || stat.size !== expectedSize)) {
+      throw new Error(`Downloaded file size mismatch for ${tempPath}: ${stat ? stat.size : "missing"} != ${expectedSize}`);
+    }
+    if (remoteItem.md5Checksum) {
+      const localMd5 = await this.localMd5ByPath(tempPath);
+      if (localMd5 !== remoteItem.md5Checksum.toLowerCase()) {
+        throw new Error(`Downloaded file checksum mismatch for ${tempPath}`);
+      }
+    }
+  }
+
+  partialDownloadPath(path) {
+    return `${path}.drivebridge-partial`;
+  }
+
+  replaceBackupPath(path) {
+    return `${path}.drivebridge-replace-${formatTimestamp(new Date())}`;
   }
 
   async writeConflictCopy(path, remoteItem) {
@@ -1078,6 +1137,29 @@ module.exports = class DriveBridgePlugin extends Plugin {
       return this.app.vault.readBinary(file);
     }
     return this.app.vault.adapter.readBinary(path);
+  }
+
+  async localMd5ByPath(path) {
+    const data = await this.readLocalBinary(path);
+    return md5Hex(data);
+  }
+
+  async hasSameContent(path, localItem, remoteItem) {
+    if (!localItem || !remoteItem) {
+      return false;
+    }
+    if (Number(localItem.size || 0) !== Number(remoteItem.size || 0)) {
+      return false;
+    }
+    if (!remoteItem.md5Checksum) {
+      return false;
+    }
+    try {
+      const localMd5 = await this.localMd5ByPath(path);
+      return localMd5 === remoteItem.md5Checksum.toLowerCase();
+    } catch (err) {
+      return false;
+    }
   }
 
   async localPathExists(path) {
@@ -1868,6 +1950,87 @@ function formatBytes(bytes) {
     return `${Math.round(size)} ${units[unitIndex]}`;
   }
   return `${size.toFixed(size >= 10 ? 1 : 2)} ${units[unitIndex]}`;
+}
+
+function md5Hex(data) {
+  const input = data instanceof ArrayBuffer
+    ? new Uint8Array(data)
+    : new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength);
+  const originalLength = input.length;
+  const paddedLength = (((originalLength + 8) >> 6) + 1) << 6;
+  const bytes = new Uint8Array(paddedLength);
+  bytes.set(input);
+  bytes[originalLength] = 0x80;
+  const bitLength = originalLength * 8;
+  for (let i = 0; i < 8; i++) {
+    bytes[paddedLength - 8 + i] = Math.floor(bitLength / Math.pow(2, 8 * i)) & 0xff;
+  }
+
+  let a = 0x67452301;
+  let b = 0xefcdab89;
+  let c = 0x98badcfe;
+  let d = 0x10325476;
+  const shifts = [
+    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+    5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21
+  ];
+  const constants = Array.from({ length: 64 }, (_, i) => {
+    return Math.floor(Math.abs(Math.sin(i + 1)) * 0x100000000) >>> 0;
+  });
+
+  for (let offset = 0; offset < bytes.length; offset += 64) {
+    const words = new Array(16);
+    for (let i = 0; i < 16; i++) {
+      const j = offset + i * 4;
+      words[i] = bytes[j] | (bytes[j + 1] << 8) | (bytes[j + 2] << 16) | (bytes[j + 3] << 24);
+    }
+    let aa = a;
+    let bb = b;
+    let cc = c;
+    let dd = d;
+    for (let i = 0; i < 64; i++) {
+      let f;
+      let g;
+      if (i < 16) {
+        f = (bb & cc) | (~bb & dd);
+        g = i;
+      } else if (i < 32) {
+        f = (dd & bb) | (~dd & cc);
+        g = (5 * i + 1) % 16;
+      } else if (i < 48) {
+        f = bb ^ cc ^ dd;
+        g = (3 * i + 5) % 16;
+      } else {
+        f = cc ^ (bb | ~dd);
+        g = (7 * i) % 16;
+      }
+      const temp = dd;
+      dd = cc;
+      cc = bb;
+      const sum = (aa + f + constants[i] + words[g]) >>> 0;
+      bb = (bb + leftRotate(sum, shifts[i])) >>> 0;
+      aa = temp;
+    }
+    a = (a + aa) >>> 0;
+    b = (b + bb) >>> 0;
+    c = (c + cc) >>> 0;
+    d = (d + dd) >>> 0;
+  }
+  return [a, b, c, d].map(wordToLittleEndianHex).join("");
+}
+
+function leftRotate(value, shift) {
+  return ((value << shift) | (value >>> (32 - shift))) >>> 0;
+}
+
+function wordToLittleEndianHex(value) {
+  let out = "";
+  for (let i = 0; i < 4; i++) {
+    out += ((value >>> (i * 8)) & 0xff).toString(16).padStart(2, "0");
+  }
+  return out;
 }
 
 function shouldHashLocalFile(path, size) {
