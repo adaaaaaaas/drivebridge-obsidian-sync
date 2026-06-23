@@ -45,6 +45,7 @@ const DEFAULT_SETTINGS = {
   authStartedAt: 0,
   lastSyncSummary: "",
   lastPlanSummary: "",
+  lastRecoverySummary: "",
   lastSyncAt: 0,
   lastRemoteSnapshotAt: 0
 };
@@ -56,11 +57,14 @@ const OAUTH_TOKEN = "https://oauth2.googleapis.com/token";
 const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
 const SNAPSHOT_FILE = "snapshot.json";
 const JOURNAL_FILE = "sync-journal.json";
+const OPERATION_JOURNAL_FILE = "operation-journal.json";
 const REMOTE_SNAPSHOT_FILE = "remote_snapshot.json";
 const MAX_RETRY_ATTEMPTS = 4;
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 const LOCAL_HASH_MAX_BYTES = 10 * 1024 * 1024;
+const LARGE_BINARY_CONFLICT_BYTES = 10 * 1024 * 1024;
 const HASHED_LOCAL_EXTENSIONS = new Set([".md", ".txt", ".json", ".css", ".js", ".canvas"]);
+const LARGE_BINARY_EXTENSIONS = new Set([".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".mp4", ".mov", ".zip"]);
 const OBSIDIAN_SAFE_ALLOW_PATTERNS = [
   ".obsidian/appearance.json",
   ".obsidian/core-plugins.json",
@@ -199,6 +203,15 @@ module.exports = class DriveBridgePlugin extends Plugin {
     this.skipChangedFilesDuringSync = quiet;
     const started = Date.now();
     try {
+      const recovery = await this.checkInterruptedSync();
+      if (recovery.interrupted && !dryRun) {
+        const message = `Previous DriveBridge sync appears interrupted. Run Preview first or use recovery actions. In-progress: ${recovery.inProgress.length}, partial files: ${recovery.partials.length}.`;
+        this.settings.lastRecoverySummary = message;
+        this.settings.lastSyncSummary = message;
+        await this.saveSettings();
+        new Notice(message, 12000);
+        return;
+      }
       this.updateSyncProgress({
         phase: dryRun ? "Preview" : "Sync",
         message: "Scanning local vault and Google Drive..."
@@ -232,7 +245,9 @@ module.exports = class DriveBridgePlugin extends Plugin {
 
       this.assertRealSyncAllowed(context, plan);
       await this.writeJournal({ startedAt: new Date().toISOString(), dryRun, plan });
-      const executed = await this.executePlan(context, plan);
+      const runId = formatTimestamp(new Date(started));
+      await this.initializeOperationJournal(runId, plan, context);
+      const executed = await this.executePlan(context, plan, runId);
       await this.saveSnapshot(executed.nextSnapshot);
       if (!dryRun) {
         await this.saveRemoteSnapshot(context.rootFolderId, executed.nextSnapshot);
@@ -243,11 +258,14 @@ module.exports = class DriveBridgePlugin extends Plugin {
         dryRun,
         stats: executed.stats,
         errors: executed.errors,
-        skippedChanged: executed.skippedChanged
+        skippedChanged: executed.skippedChanged,
+        skippedSafe: executed.skippedSafe
       });
+      await this.markOperationJournalComplete(runId, executed);
       this.settings.allowFirstRealSync = false;
       this.settings.lastSyncAt = Date.now();
       this.settings.lastSyncSummary = this.formatExecutionSummary(executed, Date.now() - started);
+      this.settings.lastRecoverySummary = "";
       await this.saveSettings();
       if (executed.errors.length) {
         new Notice("DriveBridge sync completed with errors. Check DriveBridge settings for details.", 10000);
@@ -433,11 +451,12 @@ module.exports = class DriveBridgePlugin extends Plugin {
     return Math.max(0, Math.min(100, value)) / 100;
   }
 
-  async executePlan(context, plan) {
+  async executePlan(context, plan, runId) {
     const nextSnapshot = Object.assign({}, context.snapshot);
     const stats = newEmptyStats();
     const errors = [];
     const skippedChanged = [];
+    const skippedSafe = [];
     let processed = 0;
     let processedBytes = 0;
     const orderedEntries = this.orderPlanEntries(plan.entries);
@@ -456,16 +475,26 @@ module.exports = class DriveBridgePlugin extends Plugin {
       });
       const entryBytes = this.progressBytesForEntry(entry, context);
       try {
+        await this.updateOperation(runId, entry, "in_progress", context);
         await this.executeEntry(entry, context, nextSnapshot, stats);
+        await this.updateOperation(runId, entry, "done", context);
       } catch (err) {
         if (this.shouldSkipChangedDuringSync(err)) {
           skippedChanged.push(this.skipRecord(entry, err));
           stats.skip++;
+          await this.updateOperation(runId, entry, "skipped", context, err);
+          continue;
+        }
+        if (this.shouldSkipSafeConflict(err)) {
+          skippedSafe.push(this.skipRecord(entry, err));
+          stats.skip++;
+          await this.updateOperation(runId, entry, "skipped", context, err);
           continue;
         }
         const error = this.errorRecord(entry, err);
         errors.push(error);
         stats.error++;
+        await this.updateOperation(runId, entry, "failed", context, err);
         new Notice(`DriveBridge error: ${error.action} ${error.path}: ${error.message}`, 10000);
         this.showProgressModal(this.formatErrorModalMessage(`DriveBridge sync error ${stats.error}. Continuing...`, [error]), {
           current: processedBytes,
@@ -485,7 +514,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
         });
       }
     }
-    return { nextSnapshot, stats, errors, skippedChanged, processed, total: orderedEntries.length, processedBytes, totalBytes };
+    return { nextSnapshot, stats, errors, skippedChanged, skippedSafe, processed, total: orderedEntries.length, processedBytes, totalBytes };
   }
 
   progressBytesForEntry(entry, context) {
@@ -586,6 +615,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     if (entry.action === "conflict") {
       await this.assertLocalUnchangedSincePlan(path, localItem);
       await this.assertRemoteUnchangedSincePlan(path, remoteItem);
+      this.assertSafeConflictAutoResolve(path, localItem, remoteItem);
       nextSnapshot[path] = await this.resolveConflict(path, localItem, remoteItem, context.rootFolderId);
       stats.conflict++;
       return;
@@ -604,6 +634,19 @@ module.exports = class DriveBridgePlugin extends Plugin {
       delete nextSnapshot[path];
       stats.deleteRemote++;
       return;
+    }
+  }
+
+  assertSafeConflictAutoResolve(path, localItem, remoteItem) {
+    const size = Math.max(
+      localItem && localItem.size ? localItem.size : 0,
+      remoteItem && remoteItem.size ? remoteItem.size : 0
+    );
+    if (size >= LARGE_BINARY_CONFLICT_BYTES && isLargeBinaryPath(path)) {
+      const error = new Error(`Large binary conflict skipped for manual review: ${path} (${formatBytes(size)})`);
+      error.code = "DRIVEBRIDGE_SAFE_CONFLICT_SKIP";
+      error.side = "conflict";
+      throw error;
     }
   }
 
@@ -1097,6 +1140,149 @@ module.exports = class DriveBridgePlugin extends Plugin {
     }
   }
 
+  async readOperationJournal() {
+    try {
+      const text = await this.app.vault.adapter.read(this.pluginDataPath(OPERATION_JOURNAL_FILE));
+      return JSON.parse(text);
+    } catch (err) {
+      return null;
+    }
+  }
+
+  async writeOperationJournal(journal) {
+    await this.app.vault.adapter.write(this.pluginDataPath(OPERATION_JOURNAL_FILE), JSON.stringify(journal, null, 2));
+  }
+
+  async initializeOperationJournal(runId, plan, context) {
+    const operations = {};
+    for (const entry of plan.entries) {
+      operations[entry.path] = {
+        runId,
+        path: entry.path,
+        action: entry.action,
+        status: "pending",
+        reason: entry.reason || "",
+        localBefore: context.local[entry.path] || null,
+        remoteBefore: context.remote[entry.path] || null,
+        tempPath: this.partialDownloadPath(entry.path),
+        startedAt: "",
+        completedAt: "",
+        error: null
+      };
+    }
+    await this.writeOperationJournal({
+      version: 1,
+      runId,
+      startedAt: new Date().toISOString(),
+      completedAt: "",
+      status: "running",
+      operations
+    });
+  }
+
+  async updateOperation(runId, entry, status, context, err) {
+    if (!runId || !entry || !entry.path) {
+      return;
+    }
+    const journal = await this.readOperationJournal();
+    if (!journal || journal.runId !== runId) {
+      return;
+    }
+    const current = journal.operations[entry.path] || {
+      runId,
+      path: entry.path,
+      action: entry.action,
+      localBefore: context.local[entry.path] || null,
+      remoteBefore: context.remote[entry.path] || null,
+      tempPath: this.partialDownloadPath(entry.path)
+    };
+    current.status = status;
+    if (status === "in_progress") {
+      current.startedAt = current.startedAt || new Date().toISOString();
+    }
+    if (status === "done" || status === "failed" || status === "skipped") {
+      current.completedAt = new Date().toISOString();
+    }
+    if (err) {
+      current.error = {
+        message: err.message || String(err),
+        code: err.code || "",
+        time: new Date().toISOString()
+      };
+    }
+    journal.operations[entry.path] = current;
+    await this.writeOperationJournal(journal);
+  }
+
+  async markOperationJournalComplete(runId, executed) {
+    const journal = await this.readOperationJournal();
+    if (!journal || journal.runId !== runId) {
+      return;
+    }
+    journal.completedAt = new Date().toISOString();
+    journal.status = executed.errors.length ? "completed_with_errors" : "completed";
+    journal.stats = executed.stats;
+    await this.writeOperationJournal(journal);
+  }
+
+  async checkInterruptedSync() {
+    const journal = await this.readOperationJournal();
+    const partials = await this.findPartialDownloads();
+    const inProgress = journal && journal.status === "running"
+      ? Object.values(journal.operations || {}).filter((operation) => operation.status === "in_progress")
+      : [];
+    return {
+      interrupted: inProgress.length > 0 || partials.length > 0,
+      journal,
+      inProgress,
+      partials
+    };
+  }
+
+  async findPartialDownloads() {
+    const result = [];
+    await this.collectPartialDownloads("", result);
+    return result;
+  }
+
+  async collectPartialDownloads(folderPath, result) {
+    let listing;
+    try {
+      listing = await this.app.vault.adapter.list(folderPath);
+    } catch (err) {
+      return;
+    }
+    for (const filePath of listing.files || []) {
+      if (filePath.endsWith(".drivebridge-partial") || filePath.includes(".drivebridge-replace-")) {
+        result.push(filePath);
+      }
+    }
+    for (const childFolder of listing.folders || []) {
+      if (!this.isAlwaysExcluded(childFolder)) {
+        await this.collectPartialDownloads(childFolder, result);
+      }
+    }
+  }
+
+  async discardPartialDownloads() {
+    const partials = await this.findPartialDownloads();
+    for (const path of partials) {
+      if (await this.app.vault.adapter.exists(path)) {
+        await this.app.vault.adapter.remove(path);
+      }
+    }
+    const journal = await this.readOperationJournal();
+    if (journal && journal.status === "running") {
+      journal.status = "discarded";
+      journal.completedAt = new Date().toISOString();
+      await this.writeOperationJournal(journal);
+    }
+    this.settings.lastRecoverySummary = `Discarded ${partials.length} DriveBridge partial/replacement file(s). Run Preview before syncing.`;
+    this.settings.lastSyncSummary = this.settings.lastRecoverySummary;
+    await this.saveSettings();
+    new Notice(this.settings.lastRecoverySummary, 10000);
+  }
+
   async localInfo(file) {
     const info = {
       path: file.path,
@@ -1219,6 +1405,10 @@ module.exports = class DriveBridgePlugin extends Plugin {
     return this.skipChangedFilesDuringSync && err && err.code === "DRIVEBRIDGE_CHANGED_DURING_SYNC";
   }
 
+  shouldSkipSafeConflict(err) {
+    return err && err.code === "DRIVEBRIDGE_SAFE_CONFLICT_SKIP";
+  }
+
   pluginDataPath(filename) {
     const pluginDir = this.manifest.dir || `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
     return `${pluginDir}/${filename}`;
@@ -1252,7 +1442,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     if (path === pluginDir || path.startsWith(`${pluginDir}/`)) {
       return true;
     }
-    if (path.endsWith("/snapshot.json") || path.endsWith("/sync-journal.json") || path.endsWith(`/${REMOTE_SNAPSHOT_FILE}`)) {
+    if (path.endsWith("/snapshot.json") || path.endsWith("/sync-journal.json") || path.endsWith("/operation-journal.json") || path.endsWith(`/${REMOTE_SNAPSHOT_FILE}`)) {
       return true;
     }
     const dir = this.getConfigDir();
@@ -1423,6 +1613,11 @@ module.exports = class DriveBridgePlugin extends Plugin {
     ];
     if (executed.skippedChanged && executed.skippedChanged.length) {
       lines.push("", "Skipped because they changed during auto sync:", ...this.formatSkipLines(executed.skippedChanged, 20));
+      lines.push("", `Full latest run details are saved in ${JOURNAL_FILE}.`);
+    }
+    if (executed.skippedSafe && executed.skippedSafe.length) {
+      lines.push("", "Skipped for manual review:", ...this.formatSkipLines(executed.skippedSafe, 20));
+      lines.push("", "These files were not auto-resolved because doing so could create heavy or unsafe conflict work.");
       lines.push("", `Full latest run details are saved in ${JOURNAL_FILE}.`);
     }
     if (executed.errors.length) {
@@ -1805,6 +2000,23 @@ class DriveBridgeSettingTab extends PluginSettingTab {
           this.display();
         }));
 
+    new Setting(containerEl)
+      .setName("Recovery")
+      .setDesc("Use this after an interrupted sync to remove DriveBridge temporary files. Run Preview before syncing again.")
+      .addButton((button) => button
+        .setButtonText("Discard partial downloads")
+        .onClick(async () => {
+          await runUiAction(() => this.plugin.discardPartialDownloads());
+          this.display();
+        }));
+
+    if (this.plugin.settings.lastRecoverySummary) {
+      containerEl.createEl("div", {
+        text: this.plugin.settings.lastRecoverySummary,
+        cls: "drivebridge-status"
+      });
+    }
+
     if (this.plugin.syncing && this.plugin.currentSyncProgress) {
       containerEl.createEl("div", {
         text: this.plugin.currentSyncProgress,
@@ -1935,6 +2147,14 @@ function sameRemote(previous, current) {
 
 function sameSize(localItem, remoteItem) {
   return localItem && remoteItem && localItem.size === remoteItem.size;
+}
+
+function isLargeBinaryPath(path) {
+  const dot = path.lastIndexOf(".");
+  if (dot < 0) {
+    return false;
+  }
+  return LARGE_BINARY_EXTENSIONS.has(path.slice(dot).toLowerCase());
 }
 
 function formatBytes(bytes) {

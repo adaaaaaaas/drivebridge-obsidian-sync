@@ -2,6 +2,7 @@
 
 ## Latest change
 
+- 0.4.9: Adds operation journaling, interrupted-sync recovery checks, partial cleanup, and large binary conflict skip for manual review.
 - 0.4.8: Conflict handling now adopts same-size files when local MD5 matches Google Drive MD5, and downloads now write to a verified partial file before replacing the final file.
 - 0.4.7: Sync progress now uses transferred/affected data size instead of processed file count during real sync.
 - 0.4.6: Safe `.obsidian` sync now always excludes OS junk, temporary, and conflict-copy files such as `desktop.ini`, `.DS_Store`, and `Thumbs.db`.
