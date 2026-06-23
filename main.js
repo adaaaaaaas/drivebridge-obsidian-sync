@@ -68,7 +68,8 @@ const OBSIDIAN_ALWAYS_EXCLUDE_PATTERNS = [
   ".obsidian/workspace.json",
   ".obsidian/workspace-mobile.json",
   ".obsidian/plugins/*/data.json",
-  ".obsidian/plugins/drivebridge-obsidian-sync/**"
+  ".obsidian/plugins/drivebridge-obsidian-sync/**",
+  ".obsidian/plugins/drivebridge_obsidian_sync/**"
 ];
 
 module.exports = class DriveBridgePlugin extends Plugin {
@@ -78,6 +79,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     this.folderCache = new Map();
     this.progressModal = null;
     this.progressCloseTimer = null;
+    this.currentSyncProgress = "";
     this.statusBarItem = this.addStatusBarItem();
     this.statusBarItem.addClass("drivebridge-sync-status");
     this.clearSyncStatus();
@@ -168,8 +170,10 @@ module.exports = class DriveBridgePlugin extends Plugin {
     this.syncing = true;
     const started = Date.now();
     try {
-      this.setSyncStatus(dryRun ? "DriveBridge preview running..." : "DriveBridge sync running... Do not edit notes.");
-      this.showProgressModal(dryRun ? "DriveBridge preview is running..." : "DriveBridge sync is running. Do not edit notes.");
+      this.updateSyncProgress({
+        phase: dryRun ? "Preview" : "Sync",
+        message: "Scanning local vault and Google Drive..."
+      });
       new Notice(dryRun ? "DriveBridge preview started." : "DriveBridge sync started. Avoid editing notes until it completes.");
       const context = await this.buildSyncContext();
       const plan = await this.buildSyncPlan(context);
@@ -180,7 +184,12 @@ module.exports = class DriveBridgePlugin extends Plugin {
         this.settings.lastSyncSummary = summary;
         await this.saveSettings();
         new Notice("DriveBridge preview complete.");
-        this.showProgressModal("DriveBridge preview complete.");
+        this.updateSyncProgress({
+          phase: "Preview",
+          current: plan.entries.length,
+          total: plan.entries.length,
+          message: "Preview complete."
+        });
         this.scheduleProgressModalClose(1800);
         this.clearSyncStatus();
         return;
@@ -203,10 +212,18 @@ module.exports = class DriveBridgePlugin extends Plugin {
       await this.saveSettings();
       if (executed.errors.length) {
         new Notice("DriveBridge sync completed with errors. Check DriveBridge settings for details.", 10000);
-        this.showProgressModal(this.formatErrorModalMessage("DriveBridge sync completed with errors.", executed.errors));
+        this.showProgressModal(this.formatErrorModalMessage("DriveBridge sync completed with errors.", executed.errors), {
+          current: executed.processed,
+          total: executed.total
+        });
       } else {
         new Notice("DriveBridge sync complete.");
-        this.showProgressModal("DriveBridge sync complete.");
+        this.updateSyncProgress({
+          phase: "Sync",
+          current: executed.total,
+          total: executed.total,
+          message: "Sync complete."
+        });
         this.scheduleProgressModalClose(1800);
       }
     } catch (err) {
@@ -220,7 +237,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       });
       await this.saveSettings();
       new Notice(`DriveBridge failed: ${failure.message}. Check DriveBridge settings for details.`, 10000);
-      this.showProgressModal(this.formatErrorModalMessage("DriveBridge failed.", [failure]));
+      this.showProgressModal(this.formatErrorModalMessage("DriveBridge failed.", [failure]), this.lastProgressForModal());
       console.error("[drivebridge-obsidian-sync]", err);
     } finally {
       this.syncing = false;
@@ -357,9 +374,16 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const nextSnapshot = Object.assign({}, context.snapshot);
     const stats = newEmptyStats();
     const errors = [];
+    let processed = 0;
     for (const entry of plan.entries) {
-      this.setSyncStatus(`DriveBridge sync ${stats.upload + stats.download + stats.conflict + stats.adopt + stats.deleteLocal + stats.deleteRemote + stats.skip + stats.error + 1}/${plan.entries.length}: ${entry.action} ${entry.path}`);
-      this.showProgressModal(`DriveBridge sync ${stats.upload + stats.download + stats.conflict + stats.adopt + stats.deleteLocal + stats.deleteRemote + stats.skip + stats.error + 1}/${plan.entries.length}\n${entry.action}: ${entry.path}`);
+      processed++;
+      this.updateSyncProgress({
+        phase: "Sync",
+        current: processed,
+        total: plan.entries.length,
+        action: entry.action,
+        path: entry.path
+      });
       try {
         await this.executeEntry(entry, context, nextSnapshot, stats);
       } catch (err) {
@@ -367,11 +391,14 @@ module.exports = class DriveBridgePlugin extends Plugin {
         errors.push(error);
         stats.error++;
         new Notice(`DriveBridge error: ${error.action} ${error.path}: ${error.message}`, 10000);
-        this.showProgressModal(this.formatErrorModalMessage(`DriveBridge sync error ${stats.error}. Continuing...`, [error]));
+        this.showProgressModal(this.formatErrorModalMessage(`DriveBridge sync error ${stats.error}. Continuing...`, [error]), {
+          current: processed,
+          total: plan.entries.length
+        });
         console.error("[drivebridge-obsidian-sync]", entry, err);
       }
     }
-    return { nextSnapshot, stats, errors };
+    return { nextSnapshot, stats, errors, processed, total: plan.entries.length };
   }
 
   async executeEntry(entry, context, nextSnapshot, stats) {
@@ -520,7 +547,27 @@ module.exports = class DriveBridgePlugin extends Plugin {
         result[file.path] = await this.localInfo(file);
       }
     }
+    if (this.settings.obsidianSyncMode === "safe") {
+      await this.scanAdapterFolder(this.app.vault.configDir || ".obsidian", result);
+    }
     return result;
+  }
+
+  async scanAdapterFolder(folderPath, result) {
+    if (!(await this.app.vault.adapter.exists(folderPath))) {
+      return;
+    }
+    const listing = await this.app.vault.adapter.list(folderPath);
+    for (const filePath of listing.files || []) {
+      if (!this.isExcluded(filePath)) {
+        result[filePath] = await this.localInfoByPath(filePath);
+      }
+    }
+    for (const childFolder of listing.folders || []) {
+      if (this.shouldScanLocalFolder(childFolder)) {
+        await this.scanAdapterFolder(childFolder, result);
+      }
+    }
   }
 
   async scanRemoteVault(rootFolderId) {
@@ -570,11 +617,11 @@ module.exports = class DriveBridgePlugin extends Plugin {
   }
 
   async uploadLocalFile(path, rootFolderId, existingRemote) {
-    const file = this.app.vault.getAbstractFileByPath(path);
-    if (!(file instanceof TFile)) {
+    if (!(await this.localPathExists(path))) {
       throw new Error(`Local file not found: ${path}`);
     }
-    const data = await this.app.vault.readBinary(file);
+    const localItem = await this.localInfoByPath(path);
+    const data = await this.readLocalBinary(path);
     const parentId = await this.ensureRemoteParent(path, rootFolderId);
     const metadata = { name: basename(path) };
     if (!existingRemote) {
@@ -593,7 +640,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     return {
       id: uploaded.id,
       path,
-      size: Number(uploaded.size || file.stat.size),
+      size: Number(uploaded.size || localItem.size),
       modifiedTime: uploaded.modifiedTime,
       md5Checksum: uploaded.md5Checksum || ""
     };
@@ -647,6 +694,10 @@ module.exports = class DriveBridgePlugin extends Plugin {
     }
     const buffer = await res.arrayBuffer();
     await this.ensureLocalParent(path);
+    if (isObsidianPath(path)) {
+      await this.app.vault.adapter.writeBinary(path, buffer);
+      return;
+    }
     const current = this.app.vault.getAbstractFileByPath(path);
     if (current instanceof TFile) {
       await this.app.vault.modifyBinary(current, buffer);
@@ -665,6 +716,12 @@ module.exports = class DriveBridgePlugin extends Plugin {
   }
 
   async deleteLocal(path) {
+    if (isObsidianPath(path)) {
+      if (await this.app.vault.adapter.exists(path)) {
+        await this.app.vault.adapter.remove(path);
+      }
+      return;
+    }
     const file = this.app.vault.getAbstractFileByPath(path);
     if (file instanceof TFile) {
       await this.app.vault.trash(file, true);
@@ -684,6 +741,12 @@ module.exports = class DriveBridgePlugin extends Plugin {
     let current = "";
     for (const part of parts) {
       current = current ? `${current}/${part}` : part;
+      if (isObsidianPath(path)) {
+        if (!(await this.app.vault.adapter.exists(current))) {
+          await this.app.vault.adapter.mkdir(current);
+        }
+        continue;
+      }
       if (!this.app.vault.getAbstractFileByPath(current)) {
         await this.app.vault.createFolder(current);
       }
@@ -728,18 +791,51 @@ module.exports = class DriveBridgePlugin extends Plugin {
     return info;
   }
 
+  async localInfoByPath(path) {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (file instanceof TFile) {
+      return this.localInfo(file);
+    }
+    const stat = await this.app.vault.adapter.stat(path);
+    if (!stat) {
+      throw new Error(`Local file not found: ${path}`);
+    }
+    const info = {
+      path,
+      size: stat.size,
+      mtime: stat.mtime
+    };
+    if (shouldHashLocalFile(path, stat.size)) {
+      const data = await this.app.vault.adapter.readBinary(path);
+      info.sha256 = await sha256Hex(data);
+    }
+    return info;
+  }
+
+  async readLocalBinary(path) {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (file instanceof TFile) {
+      return this.app.vault.readBinary(file);
+    }
+    return this.app.vault.adapter.readBinary(path);
+  }
+
+  async localPathExists(path) {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    return file instanceof TFile || await this.app.vault.adapter.exists(path);
+  }
+
   async assertLocalUnchangedSincePlan(path, plannedLocal) {
-    const current = this.app.vault.getAbstractFileByPath(path);
     if (!plannedLocal) {
-      if (current instanceof TFile) {
+      if (await this.localPathExists(path)) {
         throw new Error(`Local file appeared during sync: ${path}`);
       }
       return;
     }
-    if (!(current instanceof TFile)) {
+    if (!(await this.localPathExists(path))) {
       throw new Error(`Local file changed during sync: ${path}`);
     }
-    const currentInfo = await this.localInfo(current);
+    const currentInfo = await this.localInfoByPath(path);
     if (!sameLocal(plannedLocal, currentInfo)) {
       throw new Error(`Local file changed during sync: ${path}`);
     }
@@ -765,11 +861,24 @@ module.exports = class DriveBridgePlugin extends Plugin {
   }
 
   isAlwaysExcluded(path) {
-    return OBSIDIAN_ALWAYS_EXCLUDE_PATTERNS.some((pattern) => globMatch(pattern, path));
+    const pluginDir = this.manifest.dir || `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
+    return path === pluginDir ||
+      path.startsWith(`${pluginDir}/`) ||
+      OBSIDIAN_ALWAYS_EXCLUDE_PATTERNS.some((pattern) => globMatch(pattern, path));
   }
 
   isSafeObsidianPath(path) {
     return OBSIDIAN_SAFE_ALLOW_PATTERNS.some((pattern) => globMatch(pattern, path));
+  }
+
+  shouldScanLocalFolder(path) {
+    if (this.isAlwaysExcluded(path)) {
+      return false;
+    }
+    if (isObsidianPath(path)) {
+      return this.settings.obsidianSyncMode === "safe" && isPrefixOfAnyPattern(path, OBSIDIAN_SAFE_ALLOW_PATTERNS);
+    }
+    return !this.isExcluded(path);
   }
 
   shouldScanRemoteFolder(path) {
@@ -780,6 +889,41 @@ module.exports = class DriveBridgePlugin extends Plugin {
       return this.settings.obsidianSyncMode === "safe" && isPrefixOfAnyPattern(path, OBSIDIAN_SAFE_ALLOW_PATTERNS);
     }
     return !this.isExcluded(path);
+  }
+
+  updateSyncProgress(progress) {
+    const text = this.formatProgressText(progress);
+    this.currentSyncProgress = text;
+    this.currentProgressState = {
+      current: progress.current || 0,
+      total: progress.total || 0
+    };
+    this.setSyncStatus(text.replace(/\n/g, " | "));
+    this.showProgressModal(text, this.currentProgressState);
+  }
+
+  formatProgressText(progress) {
+    if (progress.total > 0) {
+      const percent = Math.floor((progress.current / progress.total) * 100);
+      const lines = [
+        `DriveBridge ${progress.phase}: ${progress.current}/${progress.total} (${percent}%)`
+      ];
+      if (progress.action && progress.path) {
+        lines.push(`${progress.action}: ${progress.path}`);
+      }
+      if (progress.message) {
+        lines.push(progress.message);
+      }
+      return lines.join("\n");
+    }
+    return [
+      `DriveBridge ${progress.phase}`,
+      progress.message || "Preparing..."
+    ].join("\n");
+  }
+
+  lastProgressForModal() {
+    return this.currentProgressState || { current: 0, total: 0 };
   }
 
   setSyncStatus(message) {
@@ -794,7 +938,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     this.setSyncStatus("");
   }
 
-  showProgressModal(message) {
+  showProgressModal(message, progress) {
     if (this.progressCloseTimer) {
       window.clearTimeout(this.progressCloseTimer);
       this.progressCloseTimer = null;
@@ -806,7 +950,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       };
       this.progressModal.open();
     }
-    this.progressModal.update(message);
+    this.progressModal.update(message, progress);
   }
 
   scheduleProgressModalClose(delayMs) {
@@ -928,7 +1072,10 @@ class DriveBridgeProgressModal extends Modal {
   constructor(app) {
     super(app);
     this.message = "";
+    this.progress = null;
     this.statusEl = null;
+    this.progressEl = null;
+    this.progressTextEl = null;
     this.onClosed = null;
   }
 
@@ -937,6 +1084,12 @@ class DriveBridgeProgressModal extends Modal {
     contentEl.empty();
     contentEl.addClass("drivebridge-progress-modal");
     contentEl.createEl("h2", { text: "DriveBridge is running" });
+    this.progressEl = contentEl.createEl("progress", {
+      cls: "drivebridge-progress-bar"
+    });
+    this.progressTextEl = contentEl.createEl("div", {
+      cls: "drivebridge-progress-count"
+    });
     this.statusEl = contentEl.createEl("pre", {
       text: this.message || "Starting...",
       cls: "drivebridge-progress-message"
@@ -945,6 +1098,7 @@ class DriveBridgeProgressModal extends Modal {
       text: "Keep Obsidian open and avoid editing notes until this finishes.",
       cls: "drivebridge-muted"
     });
+    this.updateProgressElements();
   }
 
   onClose() {
@@ -955,10 +1109,33 @@ class DriveBridgeProgressModal extends Modal {
     }
   }
 
-  update(message) {
+  update(message, progress) {
     this.message = message;
+    if (progress) {
+      this.progress = progress;
+    }
     if (this.statusEl) {
       this.statusEl.setText(message);
+    }
+    this.updateProgressElements();
+  }
+
+  updateProgressElements() {
+    if (!this.progressEl || !this.progressTextEl) {
+      return;
+    }
+    const current = this.progress && this.progress.current ? this.progress.current : 0;
+    const total = this.progress && this.progress.total ? this.progress.total : 0;
+    if (total > 0) {
+      const percent = Math.floor((current / total) * 100);
+      this.progressEl.style.display = "";
+      this.progressTextEl.style.display = "";
+      this.progressEl.max = total;
+      this.progressEl.value = current;
+      this.progressTextEl.setText(`${current}/${total} (${percent}%)`);
+    } else {
+      this.progressEl.style.display = "none";
+      this.progressTextEl.style.display = "none";
     }
   }
 }
@@ -1168,6 +1345,13 @@ class DriveBridgeSettingTab extends PluginSettingTab {
           await this.plugin.syncNow({ dryRun: false });
           this.display();
         }));
+
+    if (this.plugin.syncing && this.plugin.currentSyncProgress) {
+      containerEl.createEl("div", {
+        text: this.plugin.currentSyncProgress,
+        cls: "drivebridge-status drivebridge-live-status"
+      });
+    }
 
     containerEl.createEl("div", {
       text: this.plugin.settings.lastSyncSummary || "No sync has run yet.",
