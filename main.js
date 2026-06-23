@@ -244,8 +244,9 @@ module.exports = class DriveBridgePlugin extends Plugin {
       if (executed.errors.length) {
         new Notice("DriveBridge sync completed with errors. Check DriveBridge settings for details.", 10000);
         this.showProgressModal(this.formatErrorModalMessage("DriveBridge sync completed with errors.", executed.errors), {
-          current: executed.processed,
-          total: executed.total
+          current: executed.processedBytes,
+          total: executed.totalBytes,
+          unit: "bytes"
         });
       } else {
         if (!quiet) {
@@ -253,8 +254,9 @@ module.exports = class DriveBridgePlugin extends Plugin {
         }
         this.updateSyncProgress({
           phase: "Sync",
-          current: executed.total,
-          total: executed.total,
+          current: executed.processedBytes,
+          total: executed.totalBytes,
+          unit: "bytes",
           message: "Sync complete."
         });
         if (!quiet) {
@@ -429,16 +431,22 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const errors = [];
     const skippedChanged = [];
     let processed = 0;
+    let processedBytes = 0;
     const orderedEntries = this.orderPlanEntries(plan.entries);
+    const totalBytes = orderedEntries.reduce((sum, entry) => {
+      return sum + this.progressBytesForEntry(entry, context);
+    }, 0);
     for (const entry of orderedEntries) {
       processed++;
       this.updateSyncProgress({
         phase: "Sync",
-        current: processed,
-        total: orderedEntries.length,
+        current: processedBytes,
+        total: totalBytes,
+        unit: "bytes",
         action: entry.action,
         path: entry.path
       });
+      const entryBytes = this.progressBytesForEntry(entry, context);
       try {
         await this.executeEntry(entry, context, nextSnapshot, stats);
       } catch (err) {
@@ -452,13 +460,52 @@ module.exports = class DriveBridgePlugin extends Plugin {
         stats.error++;
         new Notice(`DriveBridge error: ${error.action} ${error.path}: ${error.message}`, 10000);
         this.showProgressModal(this.formatErrorModalMessage(`DriveBridge sync error ${stats.error}. Continuing...`, [error]), {
-          current: processed,
-          total: orderedEntries.length
+          current: processedBytes,
+          total: totalBytes,
+          unit: "bytes"
         });
         console.error("[drivebridge-obsidian-sync]", entry, err);
+      } finally {
+        processedBytes += entryBytes;
+        this.updateSyncProgress({
+          phase: "Sync",
+          current: processedBytes,
+          total: totalBytes,
+          unit: "bytes",
+          action: entry.action,
+          path: entry.path
+        });
       }
     }
-    return { nextSnapshot, stats, errors, skippedChanged, processed, total: orderedEntries.length };
+    return { nextSnapshot, stats, errors, skippedChanged, processed, total: orderedEntries.length, processedBytes, totalBytes };
+  }
+
+  progressBytesForEntry(entry, context) {
+    if (!entry || entry.action === "skip" || entry.action === "adopt") {
+      return 0;
+    }
+    const localItem = context.local[entry.path];
+    const remoteItem = context.remote[entry.path];
+    if (entry.action === "upload") {
+      return localItem && localItem.size ? localItem.size : 0;
+    }
+    if (entry.action === "download") {
+      return remoteItem && remoteItem.size ? remoteItem.size : 0;
+    }
+    if (entry.action === "deleteRemote") {
+      return remoteItem && remoteItem.size ? remoteItem.size : 0;
+    }
+    if (entry.action === "deleteLocal") {
+      return localItem && localItem.size ? localItem.size : 0;
+    }
+    if (entry.action === "conflict") {
+      return (localItem && localItem.size ? localItem.size : 0) +
+        (remoteItem && remoteItem.size ? remoteItem.size : 0);
+    }
+    return Math.max(
+      localItem && localItem.size ? localItem.size : 0,
+      remoteItem && remoteItem.size ? remoteItem.size : 0
+    );
   }
 
   orderPlanEntries(entries) {
@@ -1162,7 +1209,8 @@ module.exports = class DriveBridgePlugin extends Plugin {
     this.currentSyncProgress = text;
     this.currentProgressState = {
       current: progress.current || 0,
-      total: progress.total || 0
+      total: progress.total || 0,
+      unit: progress.unit || ""
     };
     this.setSyncStatus(text.replace(/\n/g, " | "));
     if (!this.syncUiQuiet) {
@@ -1172,9 +1220,12 @@ module.exports = class DriveBridgePlugin extends Plugin {
 
   formatProgressText(progress) {
     if (progress.total > 0) {
-      const percent = Math.floor((progress.current / progress.total) * 100);
+      const percent = Math.min(100, Math.floor((progress.current / progress.total) * 100));
+      const fraction = progress.unit === "bytes"
+        ? `${formatBytes(progress.current)} / ${formatBytes(progress.total)}`
+        : `${progress.current}/${progress.total}`;
       const lines = [
-        `DriveBridge ${progress.phase}: ${progress.current}/${progress.total} (${percent}%)`
+        `DriveBridge ${progress.phase}: ${fraction} (${percent}%)`
       ];
       if (progress.action && progress.path) {
         lines.push(`${progress.action}: ${progress.path}`);
@@ -1278,6 +1329,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
   formatExecutionSummary(executed, elapsedMs) {
     const lines = [
       `Completed in ${(elapsedMs / 1000).toFixed(1)}s`,
+      `Data processed: ${formatBytes(executed.processedBytes || 0)} / ${formatBytes(executed.totalBytes || 0)}`,
       `Uploaded: ${executed.stats.upload}`,
       `Downloaded: ${executed.stats.download}`,
       `Conflicts: ${executed.stats.conflict}`,
@@ -1422,13 +1474,17 @@ class DriveBridgeProgressModal extends Modal {
     }
     const current = this.progress && this.progress.current ? this.progress.current : 0;
     const total = this.progress && this.progress.total ? this.progress.total : 0;
+    const unit = this.progress && this.progress.unit ? this.progress.unit : "";
     if (total > 0) {
-      const percent = Math.floor((current / total) * 100);
+      const percent = Math.min(100, Math.floor((current / total) * 100));
+      const fraction = unit === "bytes"
+        ? `${formatBytes(current)} / ${formatBytes(total)}`
+        : `${current}/${total}`;
       this.progressEl.style.display = "";
       this.progressTextEl.style.display = "";
       this.progressEl.max = total;
       this.progressEl.value = current;
-      this.progressTextEl.setText(`${current}/${total} (${percent}%)`);
+      this.progressTextEl.setText(`${fraction} (${percent}%)`);
     } else {
       this.progressEl.style.display = "none";
       this.progressTextEl.style.display = "none";
@@ -1797,6 +1853,21 @@ function sameRemote(previous, current) {
 
 function sameSize(localItem, remoteItem) {
   return localItem && remoteItem && localItem.size === remoteItem.size;
+}
+
+function formatBytes(bytes) {
+  const value = Math.max(0, Number(bytes) || 0);
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let size = value;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex++;
+  }
+  if (unitIndex === 0) {
+    return `${Math.round(size)} ${units[unitIndex]}`;
+  }
+  return `${size.toFixed(size >= 10 ? 1 : 2)} ${units[unitIndex]}`;
 }
 
 function shouldHashLocalFile(path, size) {

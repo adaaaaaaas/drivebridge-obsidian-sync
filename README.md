@@ -2,6 +2,7 @@
 
 ## Latest change
 
+- 0.4.7: Sync progress now uses transferred/affected data size instead of processed file count during real sync.
 - 0.4.6: Safe `.obsidian` sync now always excludes OS junk, temporary, and conflict-copy files such as `desktop.ini`, `.DS_Store`, and `Thumbs.db`.
 - 0.4.5: remote smart mirror snapshot support, configurable conflict handling, configurable protect-modify threshold, and safer execution ordering.
 - Auto sync now runs quietly: it updates the status bar but does not open the large progress modal unless an error needs attention.
