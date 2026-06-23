@@ -46,6 +46,11 @@ const DEFAULT_SETTINGS = {
   lastSyncSummary: "",
   lastPlanSummary: "",
   lastRecoverySummary: "",
+  recoveryPreviewRunId: "",
+  recoveryPreviewSafe: false,
+  recoveryPlanPreviewRunId: "",
+  recoveryPlanPreviewAt: 0,
+  recoveryPlanPreviewSafe: false,
   lastSyncAt: 0,
   lastRemoteSnapshotAt: 0
 };
@@ -192,6 +197,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
   async syncNow(options = {}) {
     const dryRun = options.dryRun !== undefined ? options.dryRun : this.settings.dryRunDefault;
     const quiet = Boolean(options.quiet);
+    const recoveryResume = Boolean(options.recoveryResume);
     if (this.syncing) {
       if (!quiet) {
         new Notice("DriveBridge sync is already running.");
@@ -204,13 +210,16 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const started = Date.now();
     try {
       const recovery = await this.checkInterruptedSync();
-      if (recovery.interrupted && !dryRun) {
+      if (recovery.interrupted && !dryRun && !recoveryResume) {
         const message = `Previous DriveBridge sync appears interrupted. Run Preview first or use recovery actions. In-progress: ${recovery.inProgress.length}, partial files: ${recovery.partials.length}.`;
         this.settings.lastRecoverySummary = message;
         this.settings.lastSyncSummary = message;
         await this.saveSettings();
         new Notice(message, 12000);
         return;
+      }
+      if (recoveryResume) {
+        this.assertRecoveryResumeAllowed(recovery);
       }
       this.updateSyncProgress({
         phase: dryRun ? "Preview" : "Sync",
@@ -223,6 +232,18 @@ module.exports = class DriveBridgePlugin extends Plugin {
       const plan = await this.buildSyncPlan(context);
       const summary = this.formatPlanSummary(plan, dryRun, Date.now() - started);
       this.settings.lastPlanSummary = summary;
+      if (dryRun && this.recoveryPreviewIsCurrent(recovery)) {
+        const unsafeResumeActions = this.unsafeResumePlanEntries(plan);
+        this.settings.recoveryPlanPreviewRunId = recovery.runId;
+        this.settings.recoveryPlanPreviewAt = Date.now();
+        this.settings.recoveryPlanPreviewSafe = unsafeResumeActions.length === 0;
+        this.settings.lastRecoverySummary = [
+          "Normal Preview completed after recovery preview.",
+          unsafeResumeActions.length
+            ? `Resume safe operations is blocked because Preview includes ${unsafeResumeActions.length} conflict/delete action(s).`
+            : "Resume safe operations is now available."
+        ].join("\n");
+      }
 
       if (dryRun) {
         this.settings.lastSyncSummary = summary;
@@ -244,10 +265,14 @@ module.exports = class DriveBridgePlugin extends Plugin {
       }
 
       this.assertRealSyncAllowed(context, plan);
+      if (recoveryResume) {
+        this.assertResumePlanSafe(plan);
+      }
       await this.writeJournal({ startedAt: new Date().toISOString(), dryRun, plan });
       const runId = formatTimestamp(new Date(started));
       await this.initializeOperationJournal(runId, plan, context);
-      const executed = await this.executePlan(context, plan, runId);
+      const resumeDonePaths = recoveryResume ? this.recoveryDonePaths(recovery) : new Set();
+      const executed = await this.executePlan(context, plan, runId, { skipDonePaths: resumeDonePaths });
       await this.saveSnapshot(executed.nextSnapshot);
       if (!dryRun) {
         await this.saveRemoteSnapshot(context.rootFolderId, executed.nextSnapshot);
@@ -451,12 +476,13 @@ module.exports = class DriveBridgePlugin extends Plugin {
     return Math.max(0, Math.min(100, value)) / 100;
   }
 
-  async executePlan(context, plan, runId) {
+  async executePlan(context, plan, runId, options = {}) {
     const nextSnapshot = Object.assign({}, context.snapshot);
     const stats = newEmptyStats();
     const errors = [];
     const skippedChanged = [];
     const skippedSafe = [];
+    const skipDonePaths = options.skipDonePaths || new Set();
     let processed = 0;
     let processedBytes = 0;
     const orderedEntries = this.orderPlanEntries(plan.entries);
@@ -464,6 +490,14 @@ module.exports = class DriveBridgePlugin extends Plugin {
       return sum + this.progressBytesForEntry(entry, context);
     }, 0);
     for (const entry of orderedEntries) {
+      if (skipDonePaths.has(entry.path)) {
+        const localItem = context.local[entry.path];
+        const remoteItem = context.remote[entry.path];
+        nextSnapshot[entry.path] = this.snapshotFrom(localItem, remoteItem);
+        stats.adopt++;
+        await this.updateOperation(runId, entry, "skipped", context, new Error("Skipped because previous operation was already done."));
+        continue;
+      }
       processed++;
       this.updateSyncProgress({
         phase: "Sync",
@@ -1233,10 +1267,108 @@ module.exports = class DriveBridgePlugin extends Plugin {
       : [];
     return {
       interrupted: inProgress.length > 0 || partials.length > 0,
+      runId: journal && journal.runId ? journal.runId : "",
       journal,
       inProgress,
       partials
     };
+  }
+
+  async previewRecovery() {
+    const recovery = await this.checkInterruptedSync();
+    const operations = recovery.journal ? Object.values(recovery.journal.operations || {}) : [];
+    const dangerousInProgress = recovery.inProgress.filter((operation) => this.isDangerousRecoveryOperation(operation));
+    const pendingSafe = operations.filter((operation) => this.isSafeRecoveryOperation(operation));
+    const done = operations.filter((operation) => operation.status === "done");
+    const failed = operations.filter((operation) => operation.status === "failed");
+    const blockers = [];
+    if (!recovery.journal) {
+      blockers.push("No operation journal found.");
+    }
+    if (recovery.partials.length) {
+      blockers.push(`${recovery.partials.length} partial/replacement file(s) remain. Use Discard partial downloads before resume.`);
+    }
+    if (dangerousInProgress.length) {
+      blockers.push(`${dangerousInProgress.length} dangerous in-progress operation(s) require manual review.`);
+    }
+    const safe = Boolean(recovery.journal) && blockers.length === 0;
+    this.settings.recoveryPreviewRunId = recovery.runId;
+    this.settings.recoveryPreviewSafe = safe;
+    this.settings.recoveryPlanPreviewRunId = "";
+    this.settings.recoveryPlanPreviewAt = 0;
+    this.settings.recoveryPlanPreviewSafe = false;
+    this.settings.lastRecoverySummary = [
+      "Recovery preview",
+      `Run ID: ${recovery.runId || "none"}`,
+      `Interrupted: ${recovery.interrupted ? "yes" : "no"}`,
+      `Done operations: ${done.length}`,
+      `Safe pending/failed/skipped operations: ${pendingSafe.length}`,
+      `Failed operations: ${failed.length}`,
+      `In-progress operations: ${recovery.inProgress.length}`,
+      `Partial/replacement files: ${recovery.partials.length}`,
+      `Resume gate: ${safe ? "recovery preview passed; run normal Preview next" : "blocked"}`,
+      ...(blockers.length ? ["", "Blockers:", ...blockers.map((item) => `- ${item}`)] : [])
+    ].join("\n");
+    this.settings.lastSyncSummary = this.settings.lastRecoverySummary;
+    await this.saveSettings();
+    new Notice(safe ? "Recovery preview passed. Run normal Preview next." : "Recovery preview found blockers.", 10000);
+  }
+
+  isDangerousRecoveryOperation(operation) {
+    return operation && (operation.action === "conflict" || operation.action === "deleteLocal" || operation.action === "deleteRemote");
+  }
+
+  isSafeRecoveryOperation(operation) {
+    return operation &&
+      (operation.status === "pending" || operation.status === "failed" || operation.status === "skipped") &&
+      !this.isDangerousRecoveryOperation(operation);
+  }
+
+  recoveryPreviewIsCurrent(recovery) {
+    return recovery &&
+      recovery.runId &&
+      this.settings.recoveryPreviewRunId === recovery.runId &&
+      this.settings.recoveryPreviewSafe;
+  }
+
+  assertRecoveryResumeAllowed(recovery) {
+    if (!recovery || !recovery.journal) {
+      throw new Error("No recovery journal found. Use normal Run sync instead.");
+    }
+    if (!this.recoveryPreviewIsCurrent(recovery)) {
+      throw new Error("Run Preview recovery before Resume safe operations.");
+    }
+    if (this.settings.recoveryPlanPreviewRunId !== recovery.runId || !this.settings.recoveryPlanPreviewAt) {
+      throw new Error("Run normal Preview after Preview recovery before Resume safe operations.");
+    }
+    if (!this.settings.recoveryPlanPreviewSafe) {
+      throw new Error("Normal Preview still includes conflict/delete actions. Resolve them before Resume safe operations.");
+    }
+    if (recovery.partials.length) {
+      throw new Error("Partial/replacement files remain. Use Discard partial downloads, then Preview recovery and normal Preview again.");
+    }
+    const dangerousInProgress = recovery.inProgress.filter((operation) => this.isDangerousRecoveryOperation(operation));
+    if (dangerousInProgress.length) {
+      throw new Error("Dangerous in-progress conflict/delete operation requires manual review before resume.");
+    }
+  }
+
+  assertResumePlanSafe(plan) {
+    const unsafe = this.unsafeResumePlanEntries(plan);
+    if (unsafe.length) {
+      throw new Error(`Resume safe operations blocked: Preview still includes ${unsafe.length} conflict/delete action(s). Resolve or change mode before resuming.`);
+    }
+  }
+
+  unsafeResumePlanEntries(plan) {
+    return plan.entries.filter((entry) => {
+      return entry.action === "conflict" || entry.action === "deleteLocal" || entry.action === "deleteRemote";
+    });
+  }
+
+  recoveryDonePaths(recovery) {
+    const operations = recovery && recovery.journal ? Object.values(recovery.journal.operations || {}) : [];
+    return new Set(operations.filter((operation) => operation.status === "done").map((operation) => operation.path));
   }
 
   async findPartialDownloads() {
@@ -1277,6 +1409,11 @@ module.exports = class DriveBridgePlugin extends Plugin {
       journal.completedAt = new Date().toISOString();
       await this.writeOperationJournal(journal);
     }
+    this.settings.recoveryPreviewRunId = "";
+    this.settings.recoveryPreviewSafe = false;
+    this.settings.recoveryPlanPreviewRunId = "";
+    this.settings.recoveryPlanPreviewAt = 0;
+    this.settings.recoveryPlanPreviewSafe = false;
     this.settings.lastRecoverySummary = `Discarded ${partials.length} DriveBridge partial/replacement file(s). Run Preview before syncing.`;
     this.settings.lastSyncSummary = this.settings.lastRecoverySummary;
     await this.saveSettings();
@@ -2002,13 +2139,40 @@ class DriveBridgeSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Recovery")
-      .setDesc("Use this after an interrupted sync to remove DriveBridge temporary files. Run Preview before syncing again.")
+      .setDesc("Use in order after an interrupted sync: Preview recovery, optionally discard partials, run normal Preview, then Resume safe operations.")
       .addButton((button) => button
-        .setButtonText("Discard partial downloads")
+        .setButtonText("1. Preview recovery")
+        .onClick(async () => {
+          await runUiAction(() => this.plugin.previewRecovery());
+          this.display();
+        }))
+      .addButton((button) => button
+        .setButtonText("2. Discard partial downloads")
         .onClick(async () => {
           await runUiAction(() => this.plugin.discardPartialDownloads());
           this.display();
-        }));
+        }))
+      .addButton((button) => button
+        .setButtonText("3. Normal Preview")
+        .setDisabled(!this.plugin.settings.recoveryPreviewSafe)
+        .onClick(async () => {
+          await this.plugin.previewSync();
+          this.display();
+        }))
+      .addButton((button) => {
+        const resumeEnabled = this.plugin.settings.recoveryPreviewSafe &&
+          Boolean(this.plugin.settings.recoveryPreviewRunId) &&
+          this.plugin.settings.recoveryPlanPreviewRunId === this.plugin.settings.recoveryPreviewRunId &&
+          Boolean(this.plugin.settings.recoveryPlanPreviewAt) &&
+          this.plugin.settings.recoveryPlanPreviewSafe;
+        button
+          .setButtonText("4. Resume safe operations")
+          .setDisabled(!resumeEnabled)
+          .onClick(async () => {
+            await runUiAction(() => this.plugin.syncNow({ dryRun: false, recoveryResume: true }));
+            this.display();
+          });
+      });
 
     if (this.plugin.settings.lastRecoverySummary) {
       containerEl.createEl("div", {
