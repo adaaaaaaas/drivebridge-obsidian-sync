@@ -14,6 +14,11 @@
 }
 
 .drivebridge-sync-status {
+  flex: 0 1 auto;
+  max-width: clamp(140px, 24vw, 320px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--text-accent);
   font-weight: 600;
 }

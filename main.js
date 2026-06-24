@@ -1696,16 +1696,38 @@ module.exports = class DriveBridgePlugin extends Plugin {
 
   updateSyncProgress(progress) {
     const text = this.formatProgressText(progress);
+    const statusText = this.formatStatusProgressText(progress);
     this.currentSyncProgress = text;
     this.currentProgressState = {
       current: progress.current || 0,
       total: progress.total || 0,
       unit: progress.unit || ""
     };
-    this.setSyncStatus(text.replace(/\n/g, " | "));
+    this.setSyncStatus(statusText, text.replace(/\n/g, " | "));
     if (!this.syncUiQuiet) {
       this.showProgressModal(text, this.currentProgressState);
     }
+  }
+
+  formatStatusProgressText(progress) {
+    const parts = [];
+    if (progress.total > 0) {
+      const percent = Math.min(100, Math.floor((progress.current / progress.total) * 100));
+      const fraction = progress.unit === "bytes"
+        ? `${formatBytes(progress.current)} / ${formatBytes(progress.total)}`
+        : `${progress.current}/${progress.total}`;
+      parts.push(`DriveBridge ${fraction} (${percent}%)`);
+    } else {
+      parts.push(`DriveBridge ${progress.phase}`);
+    }
+    if (progress.action && progress.path) {
+      const fileName = basename(progress.path);
+      const tail = fileName.length > 42 ? `...${fileName.slice(-39)}` : fileName;
+      parts.push(`${progress.action}: ${tail}`);
+    } else if (progress.message) {
+      parts.push(progress.message);
+    }
+    return parts.join(" | ");
   }
 
   formatProgressText(progress) {
@@ -1735,11 +1757,13 @@ module.exports = class DriveBridgePlugin extends Plugin {
     return this.currentProgressState || { current: 0, total: 0 };
   }
 
-  setSyncStatus(message) {
+  setSyncStatus(message, fullMessage = message) {
     if (!this.statusBarItem) {
       return;
     }
     this.statusBarItem.setText(message);
+    this.statusBarItem.setAttribute("title", fullMessage || "");
+    this.statusBarItem.setAttribute("aria-label", fullMessage || "");
     this.statusBarItem.style.display = message ? "" : "none";
   }
 
