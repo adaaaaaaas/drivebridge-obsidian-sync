@@ -131,6 +131,14 @@ module.exports = class DriveBridgePlugin extends Plugin {
       name: "Sync vault with Google Drive",
       callback: () => this.syncNow({ dryRun: false })
     });
+    this.addCommand({
+      id: "drivebridge-compact-sync",
+      name: "Run compact sync",
+      callback: () => this.syncNow({
+        dryRun: this.settings.dryRunDefault,
+        quiet: true
+      })
+    });
     this.addRibbonIcon("refresh-cw", "Preview Google Drive sync", () => this.previewSync());
     if (this.settings.autoSyncOnStartup) {
       this.app.workspace.onLayoutReady(() => this.syncNow({ dryRun: this.settings.dryRunDefault, quiet: true }));
