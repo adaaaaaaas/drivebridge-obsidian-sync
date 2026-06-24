@@ -2,6 +2,8 @@
 
 ## Latest change
 
+- 0.4.14: Ensures the plugin data directory exists before writing sync journals or snapshots, with one retry for iCloud parent-folder availability races.
+- 0.4.13: Adopts same-size files during the first scan and limits repeated per-file error notices to avoid UI overload.
 - 0.4.12: Speeds up many small Markdown syncs by avoiding full-vault rescans after each download and batching operation journal writes.
 - 0.4.11: Recovery buttons now use a dedicated responsive layout instead of a crowded settings row, fixing layout issues on narrow/mobile screens.
 - 0.4.10: Recovery resume is now poka-yoke gated: run Preview recovery, discard partials if needed, run normal Preview, then Resume safe operations only when no conflict/delete risk remains.

@@ -406,7 +406,10 @@ module.exports = class DriveBridgePlugin extends Plugin {
       return { path, action: "download", reason: "remote only" };
     }
     if (!previous && localItem && remoteItem) {
-      return { path, action: "conflict", reason: sameSize(localItem, remoteItem) ? "same-size files on both sides during first scan" : "different files on first scan" };
+      if (sameSize(localItem, remoteItem)) {
+        return { path, action: "adopt", reason: "same-size files on both sides during first scan" };
+      }
+      return { path, action: "conflict", reason: "different files on first scan" };
     }
     if (!localChanged && !remoteChanged) {
       return { path, action: "skip", reason: "unchanged" };
@@ -534,7 +537,11 @@ module.exports = class DriveBridgePlugin extends Plugin {
         errors.push(error);
         stats.error++;
         await this.updateOperation(runId, entry, "failed", context, err);
-        new Notice(`DriveBridge error: ${error.action} ${error.path}: ${error.message}`, 10000);
+        if (stats.error <= 3) {
+          new Notice(`DriveBridge error: ${error.action} ${error.path}: ${error.message}`, 10000);
+        } else if (stats.error === 4) {
+          new Notice(`More DriveBridge errors occurred. See developer console for details.`, 10000);
+        }
         this.showProgressModal(this.formatErrorModalMessage(`DriveBridge sync error ${stats.error}. Continuing...`, [error]), {
           current: processedBytes,
           total: totalBytes,
@@ -1165,11 +1172,11 @@ module.exports = class DriveBridgePlugin extends Plugin {
   }
 
   async saveSnapshot(snapshot) {
-    await this.app.vault.adapter.write(this.pluginDataPath(SNAPSHOT_FILE), JSON.stringify(snapshot, null, 2));
+    await this.writePluginDataFile(SNAPSHOT_FILE, JSON.stringify(snapshot, null, 2));
   }
 
   async writeJournal(journal) {
-    await this.app.vault.adapter.write(this.pluginDataPath(JOURNAL_FILE), JSON.stringify(journal, null, 2));
+    await this.writePluginDataFile(JOURNAL_FILE, JSON.stringify(journal, null, 2));
   }
 
   async safeWriteJournal(journal) {
@@ -1194,7 +1201,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     this.operationJournalDirty = false;
     this.operationJournalDirtyCount = 0;
     this.operationJournalLastFlushAt = Date.now();
-    await this.app.vault.adapter.write(this.pluginDataPath(OPERATION_JOURNAL_FILE), JSON.stringify(journal, null, 2));
+    await this.writePluginDataFile(OPERATION_JOURNAL_FILE, JSON.stringify(journal, null, 2));
   }
 
   markOperationJournalDirty() {
@@ -1585,8 +1592,36 @@ module.exports = class DriveBridgePlugin extends Plugin {
   }
 
   pluginDataPath(filename) {
-    const pluginDir = this.manifest.dir || `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
-    return `${pluginDir}/${filename}`;
+    return `${this.pluginDataDir()}/${filename}`;
+  }
+
+  pluginDataDir() {
+    return this.manifest.dir || `${this.getConfigDir()}/plugins/${this.manifest.id}`;
+  }
+
+  async ensureAdapterFolderPath(folderPath) {
+    const parts = folderPath.split("/").filter(Boolean);
+    let current = "";
+    for (const part of parts) {
+      current = current ? `${current}/${part}` : part;
+      if (!(await this.app.vault.adapter.exists(current))) {
+        await this.app.vault.adapter.mkdir(current);
+      }
+    }
+  }
+
+  async writePluginDataFile(filename, content) {
+    await this.ensureAdapterFolderPath(this.pluginDataDir());
+    const path = this.pluginDataPath(filename);
+    try {
+      await this.app.vault.adapter.write(path, content);
+    } catch (err) {
+      if (!err || !String(err.message || err).includes("Parent folder doesn't exist")) {
+        throw err;
+      }
+      await this.ensureAdapterFolderPath(this.pluginDataDir());
+      await this.app.vault.adapter.write(path, content);
+    }
   }
 
   getConfigDir() {
