@@ -678,7 +678,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     if (entry.action === "upload") {
       await this.assertLocalUnchangedSincePlan(path, localItem);
       if (remoteItem) {
-        await this.assertRemoteUnchangedSincePlan(path, remoteItem);
+        await this.assertRemoteContentUnchangedSincePlan(path, remoteItem);
       }
       const uploaded = await this.uploadLocalFile(path, context.rootFolderId, remoteItem);
       const refreshed = this.app.vault.getAbstractFileByPath(path);
@@ -720,8 +720,8 @@ module.exports = class DriveBridgePlugin extends Plugin {
           await this.trashRemote(deletedRemote.id);
         }
       } else {
-        await this.assertRemoteUnchangedSincePlan(path, remoteItem);
-        await this.trashRemote(remoteItem.id);
+        deletedRemote = await this.assertRemoteContentUnchangedSincePlan(path, remoteItem);
+        await this.trashRemote(deletedRemote.id);
       }
       delete nextSnapshot[path];
       remoteDeleted[path] = this.remoteDeleteTombstone(deletedRemote || remoteItem);
@@ -1624,6 +1624,17 @@ module.exports = class DriveBridgePlugin extends Plugin {
     }
   }
 
+  async assertRemoteContentUnchangedSincePlan(path, plannedRemote) {
+    if (!plannedRemote || !plannedRemote.id) {
+      return null;
+    }
+    const currentInfo = await this.remoteInfoById(path, plannedRemote.id);
+    if (!currentInfo || !sameRemoteContent(plannedRemote, currentInfo)) {
+      throw this.changedDuringSyncError(`Google Drive file changed during sync: ${path}`, "remote");
+    }
+    return currentInfo;
+  }
+
   changedDuringSyncError(message, side) {
     const error = new Error(message);
     error.code = "DRIVEBRIDGE_CHANGED_DURING_SYNC";
@@ -2500,6 +2511,16 @@ function sameRemote(previous, current) {
     previous.size === current.size &&
     previous.modifiedTime === current.modifiedTime &&
     (previous.md5Checksum || "") === (current.md5Checksum || "");
+}
+
+function sameRemoteContent(previous, current) {
+  if (!previous || !current || previous.size !== current.size) {
+    return false;
+  }
+  if (previous.md5Checksum && current.md5Checksum) {
+    return previous.md5Checksum === current.md5Checksum;
+  }
+  return sameRemote(previous, current);
 }
 
 function sameSize(localItem, remoteItem) {
