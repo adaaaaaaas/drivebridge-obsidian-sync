@@ -403,6 +403,9 @@ module.exports = class DriveBridgePlugin extends Plugin {
         }
         return { path, action: "deleteLocal", reason: "remote deletion tombstone detected" };
       }
+      if (this.settings.syncMode === "pull") {
+        return { path, action: "deleteLocal", reason: "pull mode remote missing" };
+      }
       if (previous && previous.remote && (this.settings.syncMode === "pull" || !localChanged)) {
         return { path, action: "deleteLocal", reason: "remote deletion detected" };
       }
