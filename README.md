@@ -2,6 +2,7 @@
 
 ## Latest change
 
+- 0.4.17: Remote deletes now write short-lived tombstones into `remote_snapshot.json`, so iPhone/iPad can delete local files even when their local snapshot missed the pre-delete baseline.
 - 0.4.16: Keeps compact sync status out of the center by showing only the trailing part of long filenames, with the full path available as a tooltip.
 - 0.4.15: Adds a configurable `Run compact sync` command that uses the same quiet behavior as auto sync and can be assigned in Obsidian Hotkeys.
 - 0.4.14: Ensures the plugin data directory exists before writing sync journals or snapshots, with one retry for iCloud parent-folder availability races.

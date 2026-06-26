@@ -64,6 +64,7 @@ const SNAPSHOT_FILE = "snapshot.json";
 const JOURNAL_FILE = "sync-journal.json";
 const OPERATION_JOURNAL_FILE = "operation-journal.json";
 const REMOTE_SNAPSHOT_FILE = "remote_snapshot.json";
+const REMOTE_DELETE_TOMBSTONE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_RETRY_ATTEMPTS = 4;
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 const LOCAL_HASH_MAX_BYTES = 10 * 1024 * 1024;
@@ -287,7 +288,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       const executed = await this.executePlan(context, plan, runId, { skipDonePaths: resumeDonePaths });
       await this.saveSnapshot(executed.nextSnapshot);
       if (!dryRun) {
-        await this.saveRemoteSnapshot(context.rootFolderId, executed.nextSnapshot);
+        await this.saveRemoteSnapshot(context.rootFolderId, executed.nextSnapshot, context.remoteDeleted, executed.remoteDeleted);
       }
       await this.writeJournal({
         startedAt: new Date(started).toISOString(),
@@ -353,15 +354,22 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const rootFolderId = await this.ensureRootFolder();
     const snapshot = await this.loadSnapshot();
     const local = await this.scanLocalVault();
-    const remote = await this.scanRemoteVault(rootFolderId);
-    return { rootFolderId, snapshot, local, remote };
+    const remoteState = await this.scanRemoteVault(rootFolderId);
+    return {
+      rootFolderId,
+      snapshot,
+      local,
+      remote: remoteState.files,
+      remoteDeleted: remoteState.deleted
+    };
   }
 
   async buildSyncPlan(context) {
     const allPaths = Array.from(new Set([
       ...Object.keys(context.local),
       ...Object.keys(context.remote),
-      ...Object.keys(context.snapshot)
+      ...Object.keys(context.snapshot),
+      ...Object.keys(context.remoteDeleted || {})
     ])).sort();
     const entries = [];
     const stats = newEmptyStats();
@@ -380,9 +388,29 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const localItem = context.local[path];
     const remoteItem = context.remote[path];
     const previous = context.snapshot[path];
+    const remoteDeleted = context.remoteDeleted && context.remoteDeleted[path];
 
     if (!localItem && !remoteItem) {
       return { path, action: "skip", reason: "missing on both sides" };
+    }
+    const localChanged = localItem ? !previous || !sameLocal(previous.local, localItem) : Boolean(previous && previous.local);
+    const remoteChanged = remoteItem ? !previous || !sameRemote(previous.remote, remoteItem) : Boolean(previous && previous.remote);
+
+    if (localItem && !remoteItem && this.settings.syncDeletes && this.settings.syncMode !== "push") {
+      if (remoteDeleted && this.remoteDeleteTombstoneIsFresh(remoteDeleted)) {
+        if (this.localChangedAfterRemoteDeletion(localItem, remoteDeleted)) {
+          return { path, action: "skip", reason: "local changed after remote deletion tombstone; manual review required" };
+        }
+        return { path, action: "deleteLocal", reason: "remote deletion tombstone detected" };
+      }
+      if (previous && previous.remote && (this.settings.syncMode === "pull" || !localChanged)) {
+        return { path, action: "deleteLocal", reason: "remote deletion detected" };
+      }
+    }
+    if (!localItem && remoteItem && previous && previous.local && this.settings.syncDeletes && this.settings.syncMode !== "pull") {
+      if (this.settings.syncMode === "push" || !remoteChanged) {
+        return { path, action: "deleteRemote", reason: "local deletion detected" };
+      }
     }
     if (localItem && localItem.size > this.maxFileSizeBytes()) {
       return { path, action: "skip", reason: `local file exceeds ${this.settings.maxFileSizeMb} MB` };
@@ -390,9 +418,6 @@ module.exports = class DriveBridgePlugin extends Plugin {
     if (remoteItem && remoteItem.size > this.maxFileSizeBytes()) {
       return { path, action: "skip", reason: `remote file exceeds ${this.settings.maxFileSizeMb} MB` };
     }
-
-    const localChanged = localItem ? !previous || !sameLocal(previous.local, localItem) : Boolean(previous && previous.local);
-    const remoteChanged = remoteItem ? !previous || !sameRemote(previous.remote, remoteItem) : Boolean(previous && previous.remote);
 
     if (this.settings.syncMode === "push") {
       return this.planPushOnly(path, localItem, remoteItem, previous, localChanged);
@@ -498,6 +523,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const errors = [];
     const skippedChanged = [];
     const skippedSafe = [];
+    const remoteDeleted = {};
     const skipDonePaths = options.skipDonePaths || new Set();
     let processed = 0;
     let processedBytes = 0;
@@ -526,7 +552,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       const entryBytes = this.progressBytesForEntry(entry, context);
       try {
         await this.updateOperation(runId, entry, "in_progress", context);
-        await this.executeEntry(entry, context, nextSnapshot, stats);
+        await this.executeEntry(entry, context, nextSnapshot, stats, remoteDeleted);
         await this.updateOperation(runId, entry, "done", context);
       } catch (err) {
         if (this.shouldSkipChangedDuringSync(err)) {
@@ -569,7 +595,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       }
     }
     await this.flushOperationJournal(true);
-    return { nextSnapshot, stats, errors, skippedChanged, skippedSafe, processed, total: orderedEntries.length, processedBytes, totalBytes };
+    return { nextSnapshot, stats, errors, skippedChanged, skippedSafe, remoteDeleted, processed, total: orderedEntries.length, processedBytes, totalBytes };
   }
 
   progressBytesForEntry(entry, context) {
@@ -623,7 +649,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     });
   }
 
-  async executeEntry(entry, context, nextSnapshot, stats) {
+  async executeEntry(entry, context, nextSnapshot, stats, remoteDeleted) {
     const path = entry.path;
     const localItem = context.local[path];
     const remoteItem = context.remote[path];
@@ -687,6 +713,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       await this.assertRemoteUnchangedSincePlan(path, remoteItem);
       await this.trashRemote(remoteItem.id);
       delete nextSnapshot[path];
+      remoteDeleted[path] = this.remoteDeleteTombstone(remoteItem);
       stats.deleteRemote++;
       return;
     }
@@ -865,7 +892,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
           const content = await res.text();
           const parsed = JSON.parse(content);
           this.settings.lastRemoteSnapshotAt = Date.parse(data.files[0].modifiedTime || "") || Date.now();
-          return parsed && parsed.files ? parsed.files : parsed;
+          return normalizeRemoteState(parsed);
         }
       }
     } catch (err) {
@@ -873,7 +900,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     }
     const result = {};
     await this.scanRemoteFolder(rootFolderId, "", result);
-    return result;
+    return { files: result, deleted: {} };
   }
 
   async scanRemoteFolder(folderId, prefix, result) {
@@ -1121,17 +1148,19 @@ module.exports = class DriveBridgePlugin extends Plugin {
     return res.id;
   }
 
-  async saveRemoteSnapshot(rootFolderId, nextSnapshot) {
+  async saveRemoteSnapshot(rootFolderId, nextSnapshot, previousDeleted = {}, newDeleted = {}) {
     const remoteState = {};
     for (const [path, snap] of Object.entries(nextSnapshot)) {
       if (snap.remote) {
         remoteState[path] = snap.remote;
       }
     }
+    const deleted = this.mergeRemoteDeleteTombstones(previousDeleted, newDeleted, remoteState);
     const content = JSON.stringify({
       version: 1,
       generatedAt: new Date().toISOString(),
-      files: remoteState
+      files: remoteState,
+      deleted
     }, null, 2);
     
     let existingId = null;
@@ -1803,6 +1832,42 @@ module.exports = class DriveBridgePlugin extends Plugin {
     return Math.max(1, Number(this.settings.maxFileSizeMb) || DEFAULT_SETTINGS.maxFileSizeMb) * 1024 * 1024;
   }
 
+  remoteDeleteTombstone(remoteItem) {
+    return {
+      deletedAt: new Date().toISOString(),
+      remote: remoteItem ? {
+        id: remoteItem.id,
+        size: remoteItem.size,
+        modifiedTime: remoteItem.modifiedTime,
+        md5Checksum: remoteItem.md5Checksum || ""
+      } : null
+    };
+  }
+
+  mergeRemoteDeleteTombstones(previousDeleted, newDeleted, remoteState) {
+    const now = Date.now();
+    const merged = Object.assign({}, previousDeleted || {}, newDeleted || {});
+    for (const path of Object.keys(merged)) {
+      if (remoteState[path] || !this.remoteDeleteTombstoneIsFresh(merged[path], now)) {
+        delete merged[path];
+      }
+    }
+    return merged;
+  }
+
+  remoteDeleteTombstoneIsFresh(tombstone, now = Date.now()) {
+    const deletedAt = Date.parse(tombstone && tombstone.deletedAt || "");
+    return Number.isFinite(deletedAt) && now - deletedAt <= REMOTE_DELETE_TOMBSTONE_RETENTION_MS;
+  }
+
+  localChangedAfterRemoteDeletion(localItem, tombstone) {
+    const deletedAt = Date.parse(tombstone && tombstone.deletedAt || "");
+    if (!Number.isFinite(deletedAt)) {
+      return true;
+    }
+    return localItem && localItem.mtime > deletedAt + 2000;
+  }
+
   snapshotFrom(localItem, remoteItem) {
     return {
       local: localItem ? { size: localItem.size, mtime: localItem.mtime, sha256: localItem.sha256 || "" } : null,
@@ -2389,6 +2454,19 @@ function remoteInfo(path, file) {
     size: Number(file.size || 0),
     modifiedTime: file.modifiedTime,
     md5Checksum: file.md5Checksum || ""
+  };
+}
+
+function normalizeRemoteState(value) {
+  if (value && value.files && typeof value.files === "object") {
+    return {
+      files: value.files || {},
+      deleted: value.deleted && typeof value.deleted === "object" ? value.deleted : {}
+    };
+  }
+  return {
+    files: value && typeof value === "object" ? value : {},
+    deleted: {}
   };
 }
 
