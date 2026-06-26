@@ -2,6 +2,7 @@
 
 ## Latest change
 
+- 0.4.19: Push-mode remote deletes now tolerate stale remote snapshot metadata by refreshing the Drive file by ID before trashing it.
 - 0.4.18: Pull mode with `Sync deletes` now treats Google Drive as authoritative and deletes local-only files even when the device missed the original delete tombstone.
 - 0.4.17: Remote deletes now write short-lived tombstones into `remote_snapshot.json`, so iPhone/iPad can delete local files even when their local snapshot missed the pre-delete baseline.
 - 0.4.16: Keeps compact sync status out of the center by showing only the trailing part of long filenames, with the full path available as a tooltip.

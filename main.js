@@ -713,10 +713,18 @@ module.exports = class DriveBridgePlugin extends Plugin {
       return;
     }
     if (entry.action === "deleteRemote") {
-      await this.assertRemoteUnchangedSincePlan(path, remoteItem);
-      await this.trashRemote(remoteItem.id);
+      let deletedRemote = remoteItem;
+      if (this.settings.syncMode === "push") {
+        deletedRemote = await this.remoteInfoById(path, remoteItem.id);
+        if (deletedRemote) {
+          await this.trashRemote(deletedRemote.id);
+        }
+      } else {
+        await this.assertRemoteUnchangedSincePlan(path, remoteItem);
+        await this.trashRemote(remoteItem.id);
+      }
       delete nextSnapshot[path];
-      remoteDeleted[path] = this.remoteDeleteTombstone(remoteItem);
+      remoteDeleted[path] = this.remoteDeleteTombstone(deletedRemote || remoteItem);
       stats.deleteRemote++;
       return;
     }
