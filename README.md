@@ -2,6 +2,7 @@
 
 ## Latest change
 
+- 0.4.21: Adds MCP/agent-memory local-only exclusion defaults for `98_mcp/output/**`, `98_mcp/cache/**`, `98_mcp/tmp/**`, and `.mcp/**`, plus a settings button to add them to existing installs.
 - 0.4.20: Upload and bidirectional remote-delete checks now tolerate stale Drive modifiedTime when the file ID, size, and md5 content still match.
 - 0.4.19: Push-mode remote deletes now tolerate stale remote snapshot metadata by refreshing the Drive file by ID before trashing it.
 - 0.4.18: Pull mode with `Sync deletes` now treats Google Drive as authoritative and deletes local-only files even when the device missed the original delete tombstone.

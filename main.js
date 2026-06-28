@@ -1,5 +1,32 @@
 const { Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, requestUrl } = require("obsidian");
 
+const DEFAULT_EXCLUDED_PATTERNS = [
+  ".obsidian/**",
+  ".trash/**",
+  ".DS_Store",
+  "**/.DS_Store",
+  "Thumbs.db",
+  "**/Thumbs.db",
+  "desktop.ini",
+  "**/desktop.ini",
+  "*.tmp",
+  "**/*.tmp",
+  "*.temp",
+  "**/*.temp",
+  "*.conflict-*",
+  "**/*.conflict-*",
+  "*.drivebridge-partial",
+  "**/*.drivebridge-partial",
+  "*.drivebridge-replace-*",
+  "**/*.drivebridge-replace-*"
+];
+const AGENT_MEMORY_EXCLUDED_PATTERNS = [
+  "98_mcp/output/**",
+  "98_mcp/cache/**",
+  "98_mcp/tmp/**",
+  ".mcp/**"
+];
+
 const DEFAULT_SETTINGS = {
   clientId: "",
   clientSecret: "",
@@ -16,26 +43,7 @@ const DEFAULT_SETTINGS = {
   autoSyncOnStartup: false,
   autoSyncIntervalMinutes: 0,
   maxFileSizeMb: 50,
-  excludedPatterns: [
-    ".obsidian/**",
-    ".trash/**",
-    ".DS_Store",
-    "**/.DS_Store",
-    "Thumbs.db",
-    "**/Thumbs.db",
-    "desktop.ini",
-    "**/desktop.ini",
-    "*.tmp",
-    "**/*.tmp",
-    "*.temp",
-    "**/*.temp",
-  "*.conflict-*",
-  "**/*.conflict-*",
-  "*.drivebridge-partial",
-  "**/*.drivebridge-partial",
-  "*.drivebridge-replace-*",
-  "**/*.drivebridge-replace-*"
-].join("\n"),
+  excludedPatterns: DEFAULT_EXCLUDED_PATTERNS.concat(AGENT_MEMORY_EXCLUDED_PATTERNS).join("\n"),
   accessToken: "",
   refreshToken: "",
   tokenExpiresAt: 0,
@@ -2278,7 +2286,7 @@ class DriveBridgeSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Excluded patterns")
-      .setDesc("One pattern per line. `*` and `**` are supported.")
+      .setDesc("One pattern per line. `*` and `**` are supported. Excluded paths are local-only and are not uploaded, downloaded, or deleted remotely.")
       .addTextArea((text) => {
         text.inputEl.rows = 8;
         text.inputEl.cols = 40;
@@ -2288,6 +2296,23 @@ class DriveBridgeSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           });
       });
+
+    new Setting(containerEl)
+      .setName("Agent memory exclusions")
+      .setDesc("Add standard local-only folders for MCP and agent logs: 98_mcp/output, 98_mcp/cache, 98_mcp/tmp, and .mcp.")
+      .addButton((button) => button
+        .setButtonText("Add defaults")
+        .onClick(async () => {
+          const next = appendMissingPatterns(this.plugin.settings.excludedPatterns, AGENT_MEMORY_EXCLUDED_PATTERNS);
+          if (next === this.plugin.settings.excludedPatterns) {
+            new Notice("Agent memory exclusions are already present.");
+            return;
+          }
+          this.plugin.settings.excludedPatterns = next;
+          await this.plugin.saveSettings();
+          new Notice("Agent memory exclusions added.");
+          this.display();
+        }));
 
     new Setting(containerEl)
       .setName("Authorize")
@@ -2709,6 +2734,19 @@ function globMatch(pattern, path) {
   const normalizedPath = path.replace(/\\/g, "/");
   const regex = new RegExp(`^${globToRegexSource(normalizedPattern)}$`);
   return regex.test(normalizedPath);
+}
+
+function appendMissingPatterns(value, patterns) {
+  const lines = String(value || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const existing = new Set(lines);
+  const missing = patterns.filter((pattern) => !existing.has(pattern));
+  if (!missing.length) {
+    return value;
+  }
+  return lines.concat(missing).join("\n");
 }
 
 function globToRegexSource(value) {
