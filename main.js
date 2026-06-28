@@ -20,13 +20,6 @@ const DEFAULT_EXCLUDED_PATTERNS = [
   "*.drivebridge-replace-*",
   "**/*.drivebridge-replace-*"
 ];
-const AGENT_MEMORY_EXCLUDED_PATTERNS = [
-  "98_mcp/output/**",
-  "98_mcp/cache/**",
-  "98_mcp/tmp/**",
-  ".mcp/**"
-];
-
 const DEFAULT_SETTINGS = {
   clientId: "",
   clientSecret: "",
@@ -43,7 +36,8 @@ const DEFAULT_SETTINGS = {
   autoSyncOnStartup: false,
   autoSyncIntervalMinutes: 0,
   maxFileSizeMb: 50,
-  excludedPatterns: DEFAULT_EXCLUDED_PATTERNS.concat(AGENT_MEMORY_EXCLUDED_PATTERNS).join("\n"),
+  excludedFolders: "",
+  excludedPatterns: DEFAULT_EXCLUDED_PATTERNS.join("\n"),
   accessToken: "",
   refreshToken: "",
   tokenExpiresAt: 0,
@@ -1707,10 +1701,10 @@ module.exports = class DriveBridgePlugin extends Plugin {
     if (this.isConfigPath(path)) {
       return this.settings.obsidianSyncMode !== "safe" || !this.isSafeObsidianPath(path);
     }
-    const patterns = this.settings.excludedPatterns
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean);
+    if (isInExcludedFolder(path, this.settings.excludedFolders)) {
+      return true;
+    }
+    const patterns = patternLines(this.settings.excludedPatterns);
     return patterns.some((pattern) => globMatch(pattern, path));
   }
 
@@ -1745,6 +1739,9 @@ module.exports = class DriveBridgePlugin extends Plugin {
       return OBSIDIAN_SAFE_ALLOW_PATTERNS.some((pattern) => {
         return isPrefixOfAnyPattern(path, [pattern.replace(/^\.obsidian/, dir)]);
       });
+    }
+    if (isInExcludedFolder(path, this.settings.excludedFolders)) {
+      return false;
     }
     return !this.isExcluded(path);
   }
@@ -2285,6 +2282,20 @@ class DriveBridgeSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
+      .setName("Excluded folders")
+      .setDesc("One vault-relative folder per line. Files below these folders stay local-only and are not uploaded, downloaded, or deleted remotely.")
+      .addTextArea((text) => {
+        text.inputEl.rows = 4;
+        text.inputEl.cols = 40;
+        text.setPlaceholder("folder/to/keep-local")
+          .setValue(this.plugin.settings.excludedFolders || "")
+          .onChange(async (value) => {
+            this.plugin.settings.excludedFolders = value;
+            await this.plugin.saveSettings();
+          });
+      });
+
+    new Setting(containerEl)
       .setName("Excluded patterns")
       .setDesc("One pattern per line. `*` and `**` are supported. Excluded paths are local-only and are not uploaded, downloaded, or deleted remotely.")
       .addTextArea((text) => {
@@ -2296,23 +2307,6 @@ class DriveBridgeSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           });
       });
-
-    new Setting(containerEl)
-      .setName("Agent memory exclusions")
-      .setDesc("Add standard local-only folders for MCP and agent logs: 98_mcp/output, 98_mcp/cache, 98_mcp/tmp, and .mcp.")
-      .addButton((button) => button
-        .setButtonText("Add defaults")
-        .onClick(async () => {
-          const next = appendMissingPatterns(this.plugin.settings.excludedPatterns, AGENT_MEMORY_EXCLUDED_PATTERNS);
-          if (next === this.plugin.settings.excludedPatterns) {
-            new Notice("Agent memory exclusions are already present.");
-            return;
-          }
-          this.plugin.settings.excludedPatterns = next;
-          await this.plugin.saveSettings();
-          new Notice("Agent memory exclusions added.");
-          this.display();
-        }));
 
     new Setting(containerEl)
       .setName("Authorize")
@@ -2736,17 +2730,35 @@ function globMatch(pattern, path) {
   return regex.test(normalizedPath);
 }
 
-function appendMissingPatterns(value, patterns) {
-  const lines = String(value || "")
+function patternLines(value) {
+  return String(value || "")
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
-  const existing = new Set(lines);
-  const missing = patterns.filter((pattern) => !existing.has(pattern));
-  if (!missing.length) {
-    return value;
+}
+
+function excludedFolderLines(value) {
+  return patternLines(value)
+    .map(normalizeVaultFolderPath)
+    .filter(Boolean);
+}
+
+function normalizeVaultFolderPath(path) {
+  return String(path || "")
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "")
+    .replace(/\/+$/, "")
+    .trim();
+}
+
+function isInExcludedFolder(path, excludedFolders) {
+  const normalizedPath = normalizeVaultFolderPath(path);
+  if (!normalizedPath) {
+    return false;
   }
-  return lines.concat(missing).join("\n");
+  return excludedFolderLines(excludedFolders).some((folder) => {
+    return normalizedPath === folder || normalizedPath.startsWith(`${folder}/`);
+  });
 }
 
 function globToRegexSource(value) {
