@@ -2,6 +2,10 @@
 
 ## Latest change
 
+- 0.4.26: Adopts bulk timestamp-only local updates when Google Drive materialization touches many unchanged same-size files at once.
+- 0.4.25: Keeps local files when Google Drive is merely missing a previously synced path unless a remote deletion tombstone proves the delete.
+- 0.4.24: Prevents stale devices from deleting remote files when the shared remote snapshot is newer than the device's last completed sync.
+- 0.4.23: Detects safe local file moves and applies them as Google Drive moves, treats files that change during manual sync as skipped instead of errors, and keeps operation journals focused on actionable sync work instead of unchanged/excluded files.
 - 0.4.22: Adds configurable excluded folders, letting each vault choose local-only folders from settings without hard-coded private paths.
 - 0.4.20: Upload and bidirectional remote-delete checks now tolerate stale Drive modifiedTime when the file ID, size, and md5 content still match.
 - 0.4.19: Push-mode remote deletes now tolerate stale remote snapshot metadata by refreshing the Drive file by ID before trashing it.

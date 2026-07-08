@@ -71,6 +71,8 @@ const MAX_RETRY_ATTEMPTS = 4;
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 const LOCAL_HASH_MAX_BYTES = 10 * 1024 * 1024;
 const LARGE_BINARY_CONFLICT_BYTES = 10 * 1024 * 1024;
+const BULK_TIMESTAMP_SLOT_MS = 60 * 1000;
+const BULK_TIMESTAMP_MIN_FILES = 30;
 const HASHED_LOCAL_EXTENSIONS = new Set([".md", ".txt", ".json", ".css", ".js", ".canvas"]);
 const LARGE_BINARY_EXTENSIONS = new Set([".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".mp4", ".mov", ".zip"]);
 const OBSIDIAN_SAFE_ALLOW_PATTERNS = [
@@ -221,7 +223,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     }
     this.syncing = true;
     this.syncUiQuiet = quiet;
-    this.skipChangedFilesDuringSync = quiet;
+    this.skipChangedFilesDuringSync = true;
     const started = Date.now();
     try {
       const recovery = await this.checkInterruptedSync();
@@ -362,7 +364,8 @@ module.exports = class DriveBridgePlugin extends Plugin {
       snapshot,
       local,
       remote: remoteState.files,
-      remoteDeleted: remoteState.deleted
+      remoteDeleted: remoteState.deleted,
+      remoteSnapshotAt: remoteState.snapshotAt || 0
     };
   }
 
@@ -380,7 +383,151 @@ module.exports = class DriveBridgePlugin extends Plugin {
       entries.push(entry);
       stats[entry.action] = (stats[entry.action] || 0) + 1;
     }
-    return { entries, stats };
+    const moveAwareEntries = await this.detectMoveEntries(entries, context);
+    const timestampAwareEntries = this.bypassBulkTimestampUpdate(moveAwareEntries, context);
+    return { entries: timestampAwareEntries, stats: statsFromEntries(timestampAwareEntries) };
+  }
+
+  bypassBulkTimestampUpdate(entries, context) {
+    const bySlot = new Map();
+    for (const entry of entries) {
+      if (entry.action !== "upload" && entry.action !== "conflict") {
+        continue;
+      }
+      if (!this.isBulkTimestampCandidate(entry, context)) {
+        continue;
+      }
+      const localItem = context.local[entry.path];
+      const slot = Math.floor(localItem.mtime / BULK_TIMESTAMP_SLOT_MS);
+      const slotEntries = bySlot.get(slot) || [];
+      slotEntries.push(entry.path);
+      bySlot.set(slot, slotEntries);
+    }
+
+    const adoptedByPath = new Map();
+    for (const [slot, paths] of bySlot.entries()) {
+      if (paths.length < BULK_TIMESTAMP_MIN_FILES) {
+        continue;
+      }
+      const slotStart = new Date(slot * BULK_TIMESTAMP_SLOT_MS).toISOString();
+      for (const path of paths) {
+        adoptedByPath.set(path, {
+          action: "adopt",
+          reason: `bulk timestamp-only update detected (${paths.length} files around ${slotStart})`
+        });
+      }
+    }
+    if (!adoptedByPath.size) {
+      return entries;
+    }
+    return entries.map((entry) => {
+      const adopted = adoptedByPath.get(entry.path);
+      return adopted ? Object.assign({}, entry, adopted) : entry;
+    });
+  }
+
+  isBulkTimestampCandidate(entry, context) {
+    const localItem = context.local[entry.path];
+    const remoteItem = context.remote[entry.path];
+    const previous = context.snapshot[entry.path];
+    if (!localItem || !remoteItem || !previous || !previous.local || !previous.remote) {
+      return false;
+    }
+    if (localItem.size !== remoteItem.size ||
+        localItem.size !== previous.local.size ||
+        localItem.size !== previous.remote.size) {
+      return false;
+    }
+    if (!sameRemoteContent(previous.remote, remoteItem)) {
+      return false;
+    }
+    if (previous.local.sha256 && localItem.sha256 && previous.local.sha256 !== localItem.sha256) {
+      return false;
+    }
+    return Math.abs(previous.local.mtime - localItem.mtime) >= 2000;
+  }
+
+  async detectMoveEntries(entries, context) {
+    if (this.settings.syncMode === "pull" || !this.settings.syncDeletes) {
+      return entries;
+    }
+    const uploadCandidates = entries.filter((entry) => {
+      return entry.action === "upload" && context.local[entry.path] && !context.remote[entry.path];
+    });
+    const deleteCandidates = entries.filter((entry) => {
+      const previous = context.snapshot[entry.path];
+      return entry.action === "deleteRemote" &&
+        context.remote[entry.path] &&
+        previous &&
+        previous.local &&
+        previous.remote;
+    });
+    if (!uploadCandidates.length || !deleteCandidates.length) {
+      return entries;
+    }
+
+    const oldBySignature = new Map();
+    const ambiguousSignatures = new Set();
+    for (const entry of deleteCandidates) {
+      const previous = context.snapshot[entry.path];
+      const signature = moveSignatureFromSnapshot(previous);
+      if (!signature) {
+        continue;
+      }
+      if (oldBySignature.has(signature)) {
+        ambiguousSignatures.add(signature);
+        oldBySignature.delete(signature);
+        continue;
+      }
+      oldBySignature.set(signature, entry);
+    }
+
+    const usedOldPaths = new Set();
+    const movesByNewPath = new Map();
+    for (const entry of uploadCandidates) {
+      const signature = await this.moveSignatureForLocal(entry.path, context.local[entry.path], oldBySignature);
+      if (!signature || ambiguousSignatures.has(signature)) {
+        continue;
+      }
+      const oldEntry = oldBySignature.get(signature);
+      if (!oldEntry || usedOldPaths.has(oldEntry.path)) {
+        continue;
+      }
+      usedOldPaths.add(oldEntry.path);
+      movesByNewPath.set(entry.path, {
+        path: entry.path,
+        fromPath: oldEntry.path,
+        action: "moveRemote",
+        reason: `local move detected from ${oldEntry.path}`
+      });
+    }
+    if (!movesByNewPath.size) {
+      return entries;
+    }
+    return entries
+      .filter((entry) => !usedOldPaths.has(entry.path))
+      .map((entry) => movesByNewPath.get(entry.path) || entry);
+  }
+
+  async moveSignatureForLocal(path, localItem, oldBySignature) {
+    if (!localItem) {
+      return "";
+    }
+    if (localItem.sha256) {
+      const signature = `sha256:${localItem.size}:${localItem.sha256}`;
+      if (oldBySignature.has(signature)) {
+        return signature;
+      }
+    }
+    const hasMd5Candidate = Array.from(oldBySignature.keys()).some((signature) => {
+      return signature.startsWith(`md5:${localItem.size}:`);
+    });
+    if (!hasMd5Candidate) {
+      return "";
+    }
+    const md5 = await this.localMd5ByPath(path);
+    const signature = `md5:${localItem.size}:${md5}`;
+    return oldBySignature.has(signature) ? signature : "";
   }
 
   planPath(path, context) {
@@ -409,10 +556,13 @@ module.exports = class DriveBridgePlugin extends Plugin {
         return { path, action: "deleteLocal", reason: "pull mode remote missing" };
       }
       if (previous && previous.remote && (this.settings.syncMode === "pull" || !localChanged)) {
-        return { path, action: "deleteLocal", reason: "remote deletion detected" };
+        return { path, action: "skip", reason: "remote missing without deletion tombstone; kept local for manual review" };
       }
     }
     if (!localItem && remoteItem && previous && previous.local && this.settings.syncDeletes && this.settings.syncMode !== "pull") {
+      if (this.remoteSnapshotNewerThanLocalSync(context)) {
+        return { path, action: "download", reason: "remote snapshot is newer than this device; local deletion not trusted" };
+      }
       if (this.settings.syncMode === "push" || !remoteChanged) {
         return { path, action: "deleteRemote", reason: "local deletion detected" };
       }
@@ -433,12 +583,15 @@ module.exports = class DriveBridgePlugin extends Plugin {
 
     if (localItem && !remoteItem) {
       if (previous && previous.remote && this.settings.syncDeletes && !localChanged) {
-        return { path, action: "deleteLocal", reason: "remote deletion detected" };
+        return { path, action: "skip", reason: "remote missing without deletion tombstone; kept local for manual review" };
       }
       return { path, action: "upload", reason: "local only" };
     }
     if (!localItem && remoteItem) {
       if (previous && previous.local && this.settings.syncDeletes && !remoteChanged) {
+        if (this.remoteSnapshotNewerThanLocalSync(context)) {
+          return { path, action: "download", reason: "remote snapshot is newer than this device; local deletion not trusted" };
+        }
         return { path, action: "deleteRemote", reason: "local deletion detected" };
       }
       return { path, action: "download", reason: "remote only" };
@@ -621,6 +774,9 @@ module.exports = class DriveBridgePlugin extends Plugin {
     if (entry.action === "deleteLocal") {
       return localItem && localItem.size ? localItem.size : 0;
     }
+    if (entry.action === "moveRemote") {
+      return 0;
+    }
     if (entry.action === "conflict") {
       return (localItem && localItem.size ? localItem.size : 0) +
         (remoteItem && remoteItem.size ? remoteItem.size : 0);
@@ -637,6 +793,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       adopt: 0,
       upload: 1,
       download: 1,
+      moveRemote: 1,
       conflict: 1,
       deleteRemote: 2,
       deleteLocal: 2
@@ -704,6 +861,18 @@ module.exports = class DriveBridgePlugin extends Plugin {
       this.assertSafeConflictAutoResolve(path, localItem, remoteItem);
       nextSnapshot[path] = await this.resolveConflict(path, localItem, remoteItem, context.rootFolderId);
       stats.conflict++;
+      return;
+    }
+    if (entry.action === "moveRemote") {
+      const oldPath = entry.fromPath;
+      const oldRemoteItem = context.remote[oldPath];
+      await this.assertLocalUnchangedSincePlan(path, localItem);
+      const currentRemote = await this.assertRemoteContentUnchangedSincePlan(oldPath, oldRemoteItem);
+      const movedRemote = await this.moveRemoteFile(oldPath, path, currentRemote || oldRemoteItem, context.rootFolderId);
+      const currentLocal = await this.localInfoByPath(path);
+      delete nextSnapshot[oldPath];
+      nextSnapshot[path] = this.snapshotFrom(currentLocal, movedRemote);
+      stats.moveRemote++;
       return;
     }
     if (entry.action === "deleteLocal") {
@@ -905,7 +1074,11 @@ module.exports = class DriveBridgePlugin extends Plugin {
           const content = await res.text();
           const parsed = JSON.parse(content);
           this.settings.lastRemoteSnapshotAt = Date.parse(data.files[0].modifiedTime || "") || Date.now();
-          return normalizeRemoteState(parsed);
+          const normalized = normalizeRemoteState(parsed);
+          normalized.snapshotAt = Date.parse(parsed && parsed.generatedAt || "") ||
+            Date.parse(data.files[0].modifiedTime || "") ||
+            0;
+          return normalized;
         }
       }
     } catch (err) {
@@ -913,7 +1086,13 @@ module.exports = class DriveBridgePlugin extends Plugin {
     }
     const result = {};
     await this.scanRemoteFolder(rootFolderId, "", result);
-    return { files: result, deleted: {} };
+    return { files: result, deleted: {}, snapshotAt: 0 };
+  }
+
+  remoteSnapshotNewerThanLocalSync(context) {
+    const remoteSnapshotAt = Number(context && context.remoteSnapshotAt || 0);
+    const lastSyncAt = Number(this.settings.lastSyncAt || 0);
+    return remoteSnapshotAt > 0 && lastSyncAt > 0 && remoteSnapshotAt > lastSyncAt + 2000;
   }
 
   async scanRemoteFolder(folderId, prefix, result) {
@@ -922,7 +1101,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     do {
       const params = new URLSearchParams({
         q: `'${folderId}' in parents and trashed=false`,
-        fields: "nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum)",
+        fields: "nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum,parents)",
         pageSize: "1000",
         spaces: "drive"
       });
@@ -952,7 +1131,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
           if (result[path]) {
             throw new Error(`Duplicate Google Drive path "${path}". Rename duplicates before syncing.`);
           }
-          result[path] = remoteInfo(path, file);
+          result[path] = remoteInfo(path, Object.assign({}, file, { parentId: folderId }));
         }
       }
       pageToken = data.nextPageToken || "";
@@ -987,6 +1166,29 @@ module.exports = class DriveBridgePlugin extends Plugin {
       modifiedTime: uploaded.modifiedTime,
       md5Checksum: uploaded.md5Checksum || ""
     };
+  }
+
+  async moveRemoteFile(oldPath, newPath, remoteItem, rootFolderId) {
+    if (!remoteItem || !remoteItem.id) {
+      throw new Error(`Remote file not found for move: ${oldPath}`);
+    }
+    const newParentId = await this.ensureRemoteParent(newPath, rootFolderId);
+    const oldParentId = remoteItem.parentId || "";
+    const params = new URLSearchParams({
+      fields: "id,name,size,modifiedTime,md5Checksum,parents"
+    });
+    if (newParentId && newParentId !== oldParentId) {
+      params.set("addParents", newParentId);
+      if (oldParentId) {
+        params.set("removeParents", oldParentId);
+      }
+    }
+    const moved = await parseJsonResponse(await this.driveFetch(`${DRIVE_API}/files/${remoteItem.id}?${params}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: basename(newPath) })
+    }));
+    return remoteInfo(newPath, moved);
   }
 
   async ensureRemoteParent(path, rootFolderId) {
@@ -1281,6 +1483,9 @@ module.exports = class DriveBridgePlugin extends Plugin {
   async initializeOperationJournal(runId, plan, context) {
     const operations = {};
     for (const entry of plan.entries) {
+      if (!this.shouldJournalOperation(entry)) {
+        continue;
+      }
       operations[entry.path] = {
         runId,
         path: entry.path,
@@ -1314,6 +1519,9 @@ module.exports = class DriveBridgePlugin extends Plugin {
       return;
     }
     this.operationJournalCache = journal;
+    if (!journal.operations[entry.path] && !this.shouldJournalOperation(entry)) {
+      return;
+    }
     const current = journal.operations[entry.path] || {
       runId,
       path: entry.path,
@@ -1339,6 +1547,10 @@ module.exports = class DriveBridgePlugin extends Plugin {
     journal.operations[entry.path] = current;
     this.markOperationJournalDirty();
     await this.flushOperationJournal(Boolean(err) || status === "failed" || status === "skipped");
+  }
+
+  shouldJournalOperation(entry) {
+    return entry && entry.action !== "skip" && entry.action !== "adopt";
   }
 
   async markOperationJournalComplete(runId, executed) {
@@ -1603,7 +1815,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
 
   async remoteInfoById(path, fileId) {
     const params = new URLSearchParams({
-      fields: "id,size,modifiedTime,md5Checksum,trashed"
+      fields: "id,name,size,modifiedTime,md5Checksum,parents,trashed"
     });
     const res = await this.driveFetch(`${DRIVE_API}/files/${fileId}?${params}`);
     if (res.status === 404) {
@@ -1916,6 +2128,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       `Protect modify threshold: ${this.settings.protectModifyPercentage ?? DEFAULT_SETTINGS.protectModifyPercentage}%`,
       `Upload: ${plan.stats.upload}`,
       `Download: ${plan.stats.download}`,
+      `Move remote: ${plan.stats.moveRemote}`,
       `Conflicts: ${plan.stats.conflict}`,
       `Adopt unchanged: ${plan.stats.adopt}`,
       `Delete local: ${plan.stats.deleteLocal}`,
@@ -1938,6 +2151,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       `Data processed: ${formatBytes(executed.processedBytes || 0)} / ${formatBytes(executed.totalBytes || 0)}`,
       `Uploaded: ${executed.stats.upload}`,
       `Downloaded: ${executed.stats.download}`,
+      `Moved remote: ${executed.stats.moveRemote}`,
       `Conflicts: ${executed.stats.conflict}`,
       `Adopted: ${executed.stats.adopt}`,
       `Deleted local: ${executed.stats.deleteLocal}`,
@@ -1946,7 +2160,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       `Errors: ${executed.errors.length}`
     ];
     if (executed.skippedChanged && executed.skippedChanged.length) {
-      lines.push("", "Skipped because they changed during auto sync:", ...this.formatSkipLines(executed.skippedChanged, 20));
+      lines.push("", "Skipped because they changed during sync:", ...this.formatSkipLines(executed.skippedChanged, 20));
       lines.push("", `Full latest run details are saved in ${JOURNAL_FILE}.`);
     }
     if (executed.skippedSafe && executed.skippedSafe.length) {
@@ -2479,6 +2693,7 @@ function newEmptyStats() {
   return {
     upload: 0,
     download: 0,
+    moveRemote: 0,
     conflict: 0,
     adopt: 0,
     deleteLocal: 0,
@@ -2488,13 +2703,22 @@ function newEmptyStats() {
   };
 }
 
+function statsFromEntries(entries) {
+  const stats = newEmptyStats();
+  for (const entry of entries) {
+    stats[entry.action] = (stats[entry.action] || 0) + 1;
+  }
+  return stats;
+}
+
 function remoteInfo(path, file) {
   return {
     id: file.id,
     path,
     size: Number(file.size || 0),
     modifiedTime: file.modifiedTime,
-    md5Checksum: file.md5Checksum || ""
+    md5Checksum: file.md5Checksum || "",
+    parentId: file.parentId || (file.parents && file.parents.length ? file.parents[0] : "")
   };
 }
 
@@ -2544,6 +2768,19 @@ function sameRemoteContent(previous, current) {
 
 function sameSize(localItem, remoteItem) {
   return localItem && remoteItem && localItem.size === remoteItem.size;
+}
+
+function moveSignatureFromSnapshot(snapshot) {
+  if (!snapshot) {
+    return "";
+  }
+  if (snapshot.local && snapshot.local.sha256) {
+    return `sha256:${snapshot.local.size}:${snapshot.local.sha256}`;
+  }
+  if (snapshot.remote && snapshot.remote.md5Checksum) {
+    return `md5:${snapshot.remote.size}:${snapshot.remote.md5Checksum.toLowerCase()}`;
+  }
+  return "";
 }
 
 function isLargeBinaryPath(path) {
