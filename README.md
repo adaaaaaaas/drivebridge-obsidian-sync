@@ -2,6 +2,8 @@
 
 ## Latest change
 
+- 0.4.28: Reads and updates the newest `remote_snapshot.json` when duplicate root snapshots exist, avoiding stale snapshot selection.
+- 0.4.27: Shortens remote delete tombstone retention from 30 days to 20 days so intentional manual restores stop being blocked sooner.
 - 0.4.26: Adopts bulk timestamp-only local updates when Google Drive materialization touches many unchanged same-size files at once.
 - 0.4.25: Keeps local files when Google Drive is merely missing a previously synced path unless a remote deletion tombstone proves the delete.
 - 0.4.24: Prevents stale devices from deleting remote files when the shared remote snapshot is newer than the device's last completed sync.

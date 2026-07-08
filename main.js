@@ -66,7 +66,7 @@ const SNAPSHOT_FILE = "snapshot.json";
 const JOURNAL_FILE = "sync-journal.json";
 const OPERATION_JOURNAL_FILE = "operation-journal.json";
 const REMOTE_SNAPSHOT_FILE = "remote_snapshot.json";
-const REMOTE_DELETE_TOMBSTONE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const REMOTE_DELETE_TOMBSTONE_RETENTION_MS = 20 * 24 * 60 * 60 * 1000;
 const MAX_RETRY_ATTEMPTS = 4;
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 const LOCAL_HASH_MAX_BYTES = 10 * 1024 * 1024;
@@ -1064,6 +1064,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       const params = new URLSearchParams({
         q: `'${rootFolderId}' in parents and name='${REMOTE_SNAPSHOT_FILE}' and trashed=false`,
         fields: "files(id,modifiedTime)",
+        orderBy: "modifiedTime desc",
         spaces: "drive"
       });
       const data = await parseJsonResponse(await this.driveFetch(`${DRIVE_API}/files?${params}`));
@@ -1383,6 +1384,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       const params = new URLSearchParams({
         q: `'${rootFolderId}' in parents and name='${REMOTE_SNAPSHOT_FILE}' and trashed=false`,
         fields: "files(id)",
+        orderBy: "modifiedTime desc",
         spaces: "drive"
       });
       const data = await parseJsonResponse(await this.driveFetch(`${DRIVE_API}/files?${params}`));
