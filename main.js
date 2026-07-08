@@ -292,7 +292,13 @@ module.exports = class DriveBridgePlugin extends Plugin {
       const executed = await this.executePlan(context, plan, runId, { skipDonePaths: resumeDonePaths });
       await this.saveSnapshot(executed.nextSnapshot);
       if (!dryRun) {
-        await this.saveRemoteSnapshot(context.rootFolderId, executed.nextSnapshot, context.remoteDeleted, executed.remoteDeleted);
+        await this.saveRemoteSnapshot(
+          context.rootFolderId,
+          executed.nextSnapshot,
+          context.remoteDeleted,
+          executed.remoteDeleted,
+          executed.remoteSnapshotUpdates
+        );
       }
       await this.writeJournal({
         startedAt: new Date(started).toISOString(),
@@ -681,6 +687,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const errors = [];
     const skippedChanged = [];
     const skippedSafe = [];
+    const remoteSnapshotUpdates = {};
     const remoteDeleted = {};
     const skipDonePaths = options.skipDonePaths || new Set();
     let processed = 0;
@@ -715,6 +722,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       } catch (err) {
         if (this.shouldSkipChangedDuringSync(err)) {
           skippedChanged.push(this.skipRecord(entry, err));
+          this.recordRemoteSnapshotUpdate(remoteSnapshotUpdates, entry, err);
           stats.skip++;
           await this.updateOperation(runId, entry, "skipped", context, err);
           continue;
@@ -753,7 +761,14 @@ module.exports = class DriveBridgePlugin extends Plugin {
       }
     }
     await this.flushOperationJournal(true);
-    return { nextSnapshot, stats, errors, skippedChanged, skippedSafe, remoteDeleted, processed, total: orderedEntries.length, processedBytes, totalBytes };
+    return { nextSnapshot, stats, errors, skippedChanged, skippedSafe, remoteDeleted, remoteSnapshotUpdates, processed, total: orderedEntries.length, processedBytes, totalBytes };
+  }
+
+  recordRemoteSnapshotUpdate(remoteSnapshotUpdates, entry, err) {
+    if (!entry || !err || err.side !== "remote" || !err.hasCurrentRemote) {
+      return;
+    }
+    remoteSnapshotUpdates[entry.path] = err.currentRemote || null;
   }
 
   progressBytesForEntry(entry, context) {
@@ -1365,11 +1380,18 @@ module.exports = class DriveBridgePlugin extends Plugin {
     return res.id;
   }
 
-  async saveRemoteSnapshot(rootFolderId, nextSnapshot, previousDeleted = {}, newDeleted = {}) {
+  async saveRemoteSnapshot(rootFolderId, nextSnapshot, previousDeleted = {}, newDeleted = {}, remoteSnapshotUpdates = {}) {
     const remoteState = {};
     for (const [path, snap] of Object.entries(nextSnapshot)) {
       if (snap.remote) {
         remoteState[path] = snap.remote;
+      }
+    }
+    for (const [path, remote] of Object.entries(remoteSnapshotUpdates || {})) {
+      if (remote) {
+        remoteState[path] = remote;
+      } else {
+        delete remoteState[path];
       }
     }
     const deleted = this.mergeRemoteDeleteTombstones(previousDeleted, newDeleted, remoteState);
@@ -1838,9 +1860,10 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const currentInfo = await this.remoteInfoById(path, plannedRemote.id);
     if (!currentInfo || !sameRemote(plannedRemote, currentInfo)) {
       throw this.changedDuringSyncError(
-        `Google Drive file changed during sync: ${path}`,
+        `Google Drive file differs from planned remote snapshot: ${path}`,
         "remote",
-        remoteDiffDetails(plannedRemote, currentInfo)
+        remoteDiffDetails(plannedRemote, currentInfo),
+        currentInfo
       );
     }
   }
@@ -1852,19 +1875,24 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const currentInfo = await this.remoteInfoById(path, plannedRemote.id);
     if (!currentInfo || !sameRemoteContent(plannedRemote, currentInfo)) {
       throw this.changedDuringSyncError(
-        `Google Drive file changed during sync: ${path}`,
+        `Google Drive file differs from planned remote snapshot: ${path}`,
         "remote",
-        remoteDiffDetails(plannedRemote, currentInfo)
+        remoteDiffDetails(plannedRemote, currentInfo),
+        currentInfo
       );
     }
     return currentInfo;
   }
 
-  changedDuringSyncError(message, side, details = "") {
+  changedDuringSyncError(message, side, details = "", currentRemote = undefined) {
     const error = new Error(message);
     error.code = "DRIVEBRIDGE_CHANGED_DURING_SYNC";
     error.side = side;
     error.details = details;
+    if (currentRemote !== undefined) {
+      error.hasCurrentRemote = true;
+      error.currentRemote = currentRemote;
+    }
     return error;
   }
 
@@ -2174,7 +2202,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       `Errors: ${executed.errors.length}`
     ];
     if (executed.skippedChanged && executed.skippedChanged.length) {
-      lines.push("", "Skipped because they changed during sync:", ...this.formatSkipLines(executed.skippedChanged, 20));
+      lines.push("", "Skipped because files changed before/during sync:", ...this.formatSkipLines(executed.skippedChanged, 20));
       lines.push("", `Full latest run details are saved in ${JOURNAL_FILE}.`);
     }
     if (executed.skippedSafe && executed.skippedSafe.length) {
