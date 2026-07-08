@@ -1837,7 +1837,11 @@ module.exports = class DriveBridgePlugin extends Plugin {
     }
     const currentInfo = await this.remoteInfoById(path, plannedRemote.id);
     if (!currentInfo || !sameRemote(plannedRemote, currentInfo)) {
-      throw this.changedDuringSyncError(`Google Drive file changed during sync: ${path}`, "remote");
+      throw this.changedDuringSyncError(
+        `Google Drive file changed during sync: ${path}`,
+        "remote",
+        remoteDiffDetails(plannedRemote, currentInfo)
+      );
     }
   }
 
@@ -1847,15 +1851,20 @@ module.exports = class DriveBridgePlugin extends Plugin {
     }
     const currentInfo = await this.remoteInfoById(path, plannedRemote.id);
     if (!currentInfo || !sameRemoteContent(plannedRemote, currentInfo)) {
-      throw this.changedDuringSyncError(`Google Drive file changed during sync: ${path}`, "remote");
+      throw this.changedDuringSyncError(
+        `Google Drive file changed during sync: ${path}`,
+        "remote",
+        remoteDiffDetails(plannedRemote, currentInfo)
+      );
     }
     return currentInfo;
   }
 
-  changedDuringSyncError(message, side) {
+  changedDuringSyncError(message, side, details = "") {
     const error = new Error(message);
     error.code = "DRIVEBRIDGE_CHANGED_DURING_SYNC";
     error.side = side;
+    error.details = details;
     return error;
   }
 
@@ -2125,6 +2134,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
   formatPlanSummary(plan, dryRun, elapsedMs) {
     const lines = [
       dryRun ? "Preview only. No files changed." : "Planned real sync.",
+      `DriveBridge version: ${this.manifest.version}`,
       `Elapsed: ${(elapsedMs / 1000).toFixed(1)}s`,
       `Mode: ${this.settings.syncMode}`,
       `Conflict handling: ${this.settings.conflictAction || DEFAULT_SETTINGS.conflictAction}`,
@@ -2151,6 +2161,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
   formatExecutionSummary(executed, elapsedMs) {
     const lines = [
       `Completed in ${(elapsedMs / 1000).toFixed(1)}s`,
+      `DriveBridge version: ${this.manifest.version}`,
       `Data processed: ${formatBytes(executed.processedBytes || 0)} / ${formatBytes(executed.totalBytes || 0)}`,
       `Uploaded: ${executed.stats.upload}`,
       `Downloaded: ${executed.stats.download}`,
@@ -2227,6 +2238,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       action: entry.action || "",
       reason: err && err.message ? err.message : String(err),
       side: err && err.side ? err.side : "",
+      details: err && err.details ? err.details : "",
       time: new Date().toISOString()
     };
   }
@@ -2234,7 +2246,8 @@ module.exports = class DriveBridgePlugin extends Plugin {
   formatSkipLines(skipped, limit) {
     const visible = skipped.slice(0, limit).map((item, index) => {
       const line = `${index + 1}. ${item.action}: ${item.path}`;
-      return `${line}\n   Side: ${item.side || "unknown"}\n   Reason: ${item.reason}`;
+      const details = item.details ? `\n   Details: ${item.details}` : "";
+      return `${line}\n   Side: ${item.side || "unknown"}\n   Reason: ${item.reason}${details}`;
     });
     const remaining = skipped.length - visible.length;
     if (remaining > 0) {
@@ -2767,6 +2780,32 @@ function sameRemoteContent(previous, current) {
     return previous.md5Checksum === current.md5Checksum;
   }
   return sameRemote(previous, current);
+}
+
+function remoteDiffDetails(previous, current) {
+  if (!previous) {
+    return "planned remote missing";
+  }
+  if (!current) {
+    return `current remote missing or trashed; planned id=${previous.id || ""}, size=${previous.size || 0}, md5=${previous.md5Checksum || ""}, modifiedTime=${previous.modifiedTime || ""}`;
+  }
+  const parts = [];
+  if ((previous.id || "") !== (current.id || "")) {
+    parts.push(`id planned=${previous.id || ""} current=${current.id || ""}`);
+  }
+  if (Number(previous.size || 0) !== Number(current.size || 0)) {
+    parts.push(`size planned=${previous.size || 0} current=${current.size || 0}`);
+  }
+  if ((previous.md5Checksum || "") !== (current.md5Checksum || "")) {
+    parts.push(`md5 planned=${previous.md5Checksum || ""} current=${current.md5Checksum || ""}`);
+  }
+  if ((previous.modifiedTime || "") !== (current.modifiedTime || "")) {
+    parts.push(`modifiedTime planned=${previous.modifiedTime || ""} current=${current.modifiedTime || ""}`);
+  }
+  if ((previous.parentId || "") !== (current.parentId || "")) {
+    parts.push(`parentId planned=${previous.parentId || ""} current=${current.parentId || ""}`);
+  }
+  return parts.length ? parts.join("; ") : "remote metadata differs";
 }
 
 function sameSize(localItem, remoteItem) {

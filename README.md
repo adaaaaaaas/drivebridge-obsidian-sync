@@ -2,6 +2,7 @@
 
 ## Latest change
 
+- 0.4.30: Shows the running plugin version and planned/current remote metadata differences for changed-during-sync skips.
 - 0.4.29: Allows downloads to proceed when Google Drive content is unchanged but remote metadata timestamps differ from the snapshot.
 - 0.4.28: Reads and updates the newest `remote_snapshot.json` when duplicate root snapshots exist, avoiding stale snapshot selection.
 - 0.4.27: Shortens remote delete tombstone retention from 30 days to 20 days so intentional manual restores stop being blocked sooner.
