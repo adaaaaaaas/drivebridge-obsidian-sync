@@ -848,10 +848,11 @@ module.exports = class DriveBridgePlugin extends Plugin {
     }
     if (entry.action === "download") {
       await this.assertLocalUnchangedSincePlan(path, localItem);
-      await this.assertRemoteUnchangedSincePlan(path, remoteItem);
-      await this.downloadRemoteFile(path, remoteItem);
+      const currentRemote = await this.assertRemoteContentUnchangedSincePlan(path, remoteItem);
+      const remoteToDownload = currentRemote || remoteItem;
+      await this.downloadRemoteFile(path, remoteToDownload);
       const refreshedLocal = await this.localInfoByPath(path);
-      nextSnapshot[path] = this.snapshotFrom(refreshedLocal, remoteItem);
+      nextSnapshot[path] = this.snapshotFrom(refreshedLocal, remoteToDownload);
       stats.download++;
       return;
     }
