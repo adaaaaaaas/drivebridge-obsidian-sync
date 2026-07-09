@@ -144,6 +144,11 @@ module.exports = class DriveBridgePlugin extends Plugin {
         quiet: true
       })
     });
+    this.addCommand({
+      id: "drivebridge-rebuild-remote-snapshot",
+      name: "Rebuild remote snapshot from Google Drive",
+      callback: () => this.rebuildRemoteSnapshotFromDrive()
+    });
     this.addRibbonIcon("refresh-cw", "Preview Google Drive sync", () => this.previewSync());
     if (this.settings.autoSyncOnStartup) {
       this.app.workspace.onLayoutReady(() => this.syncNow({ dryRun: this.settings.dryRunDefault, quiet: true }));
@@ -373,6 +378,48 @@ module.exports = class DriveBridgePlugin extends Plugin {
       remoteDeleted: remoteState.deleted,
       remoteSnapshotAt: remoteState.snapshotAt || 0
     };
+  }
+
+  async rebuildRemoteSnapshotFromDrive() {
+    if (this.syncing) {
+      new Notice("DriveBridge is already running.");
+      return;
+    }
+    const started = Date.now();
+    this.syncing = true;
+    try {
+      this.updateSyncProgress({
+        phase: "Repair",
+        current: 0,
+        total: 0,
+        message: "Scanning Google Drive to rebuild remote snapshot..."
+      });
+      await this.ensureAccessToken();
+      const rootFolderId = await this.ensureRootFolder();
+      const files = {};
+      await this.scanRemoteFolder(rootFolderId, "", files);
+      await this.writeRemoteSnapshotFile(rootFolderId, files, {});
+      const count = Object.keys(files).length;
+      this.settings.lastSyncSummary = [
+        `Remote snapshot rebuilt in ${((Date.now() - started) / 1000).toFixed(1)}s`,
+        `DriveBridge version: ${this.manifest.version}`,
+        `Remote files indexed: ${count}`,
+        "Local files changed: 0",
+        `Local ${SNAPSHOT_FILE} changed: no`,
+        "Remote delete tombstones: cleared"
+      ].join("\n");
+      await this.saveSettings();
+      new Notice(`DriveBridge rebuilt remote snapshot from ${count} Google Drive file(s).`, 10000);
+    } catch (err) {
+      const failure = this.errorRecord({ path: REMOTE_SNAPSHOT_FILE, action: "rebuildRemoteSnapshot" }, err);
+      this.settings.lastSyncSummary = this.formatFatalErrorSummary(failure, Date.now() - started);
+      await this.saveSettings();
+      new Notice(`DriveBridge remote snapshot rebuild failed: ${failure.message}`, 10000);
+      console.error("[drivebridge-obsidian-sync]", err);
+    } finally {
+      this.syncing = false;
+      this.clearSyncStatus();
+    }
   }
 
   async buildSyncPlan(context) {
@@ -1395,13 +1442,17 @@ module.exports = class DriveBridgePlugin extends Plugin {
       }
     }
     const deleted = this.mergeRemoteDeleteTombstones(previousDeleted, newDeleted, remoteState);
+    await this.writeRemoteSnapshotFile(rootFolderId, remoteState, deleted);
+  }
+
+  async writeRemoteSnapshotFile(rootFolderId, files, deleted = {}) {
     const content = JSON.stringify({
       version: 1,
       generatedAt: new Date().toISOString(),
-      files: remoteState,
+      files,
       deleted
     }, null, 2);
-    
+
     let existingId = null;
     try {
       const params = new URLSearchParams({
@@ -2603,6 +2654,16 @@ class DriveBridgeSettingTab extends PluginSettingTab {
         .setCta()
         .onClick(async () => {
           await this.plugin.syncNow({ dryRun: false });
+          this.display();
+        }));
+
+    new Setting(containerEl)
+      .setName("Remote snapshot repair")
+      .setDesc(`Full-scan Google Drive and rewrite only ${REMOTE_SNAPSHOT_FILE}. Local files and ${SNAPSHOT_FILE} are not changed. Remote delete tombstones are cleared.`)
+      .addButton((button) => button
+        .setButtonText("Rebuild remote snapshot")
+        .onClick(async () => {
+          await runUiAction(() => this.plugin.rebuildRemoteSnapshotFromDrive());
           this.display();
         }));
 
