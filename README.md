@@ -2,6 +2,7 @@
 
 ## Latest change
 
+- 0.4.33: Adds Duplicate guard Auto/Strict/Off. Auto checks Drive folder contents only before risky new uploads, using per-folder caching to avoid per-file searches.
 - 0.4.32: Adds a manual remote snapshot repair action that full-scans Google Drive and rewrites only `remote_snapshot.json`.
 - 0.4.31: Updates the shared remote snapshot with current Drive metadata for remote changed-before/during-sync skips, without advancing the local sync baseline.
 - 0.4.30: Shows the running plugin version and planned/current remote metadata differences for changed-during-sync skips.

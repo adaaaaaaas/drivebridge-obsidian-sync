@@ -36,6 +36,7 @@ const DEFAULT_SETTINGS = {
   autoSyncOnStartup: false,
   autoSyncIntervalMinutes: 0,
   maxFileSizeMb: 50,
+  duplicateGuardMode: "auto",
   excludedFolders: "",
   excludedPatterns: DEFAULT_EXCLUDED_PATTERNS.join("\n"),
   accessToken: "",
@@ -54,7 +55,11 @@ const DEFAULT_SETTINGS = {
   recoveryPlanPreviewAt: 0,
   recoveryPlanPreviewSafe: false,
   lastSyncAt: 0,
-  lastRemoteSnapshotAt: 0
+  lastRemoteSnapshotAt: 0,
+  lastSyncHadErrors: false,
+  duplicateGuardRootChanged: false,
+  duplicateGuardAfterRebuild: false,
+  duplicateGuardFolderPaths: ""
 };
 
 const DRIVE_API = "https://www.googleapis.com/drive/v3";
@@ -122,6 +127,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     this.operationJournalDirty = false;
     this.operationJournalDirtyCount = 0;
     this.operationJournalLastFlushAt = 0;
+    this.remoteChildCache = new Map();
     this.statusBarItem = this.addStatusBarItem();
     this.statusBarItem.addClass("drivebridge-sync-status");
     this.clearSyncStatus();
@@ -252,6 +258,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       }
       const context = await this.buildSyncContext();
       const plan = await this.buildSyncPlan(context);
+      context.newUploadParentPathCounts = this.newUploadParentPathCounts(plan, context);
       const summary = this.formatPlanSummary(plan, dryRun, Date.now() - started);
       this.settings.lastPlanSummary = summary;
       if (dryRun && this.recoveryPreviewIsCurrent(recovery)) {
@@ -317,6 +324,11 @@ module.exports = class DriveBridgePlugin extends Plugin {
       await this.markOperationJournalComplete(runId, executed);
       this.settings.allowFirstRealSync = false;
       this.settings.lastSyncAt = Date.now();
+      this.settings.lastSyncHadErrors = executed.errors.length > 0;
+      if (!executed.errors.length) {
+        this.settings.duplicateGuardRootChanged = false;
+        this.settings.duplicateGuardAfterRebuild = false;
+      }
       this.settings.lastSyncSummary = this.formatExecutionSummary(executed, Date.now() - started);
       this.settings.lastRecoverySummary = "";
       await this.saveSettings();
@@ -345,6 +357,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     } catch (err) {
       const failure = this.errorRecord({ path: "(sync)", action: "sync" }, err);
       this.settings.lastSyncSummary = this.formatFatalErrorSummary(failure, Date.now() - started);
+      this.settings.lastSyncHadErrors = true;
       await this.safeWriteJournal({
         startedAt: new Date(started).toISOString(),
         finishedAt: new Date().toISOString(),
@@ -357,6 +370,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       console.error("[drivebridge-obsidian-sync]", err);
     } finally {
       await this.safeFlushOperationJournal(true);
+      this.remoteChildCache = new Map();
       this.syncing = false;
       this.syncUiQuiet = false;
       this.skipChangedFilesDuringSync = false;
@@ -376,7 +390,9 @@ module.exports = class DriveBridgePlugin extends Plugin {
       local,
       remote: remoteState.files,
       remoteDeleted: remoteState.deleted,
-      remoteSnapshotAt: remoteState.snapshotAt || 0
+      remoteSnapshotAt: remoteState.snapshotAt || 0,
+      remoteSnapshotFromFullScan: Boolean(remoteState.fromFullScan),
+      remoteSnapshotMissing: Boolean(remoteState.snapshotMissing)
     };
   }
 
@@ -408,11 +424,14 @@ module.exports = class DriveBridgePlugin extends Plugin {
         `Local ${SNAPSHOT_FILE} changed: no`,
         "Remote delete tombstones: cleared"
       ].join("\n");
+      this.settings.duplicateGuardAfterRebuild = true;
+      this.settings.lastSyncHadErrors = false;
       await this.saveSettings();
       new Notice(`DriveBridge rebuilt remote snapshot from ${count} Google Drive file(s).`, 10000);
     } catch (err) {
       const failure = this.errorRecord({ path: REMOTE_SNAPSHOT_FILE, action: "rebuildRemoteSnapshot" }, err);
       this.settings.lastSyncSummary = this.formatFatalErrorSummary(failure, Date.now() - started);
+      this.settings.lastSyncHadErrors = true;
       await this.saveSettings();
       new Notice(`DriveBridge remote snapshot rebuild failed: ${failure.message}`, 10000);
       console.error("[drivebridge-obsidian-sync]", err);
@@ -728,6 +747,59 @@ module.exports = class DriveBridgePlugin extends Plugin {
     return Math.max(0, Math.min(100, value)) / 100;
   }
 
+  newUploadParentPathCounts(plan, context) {
+    const counts = {};
+    for (const entry of plan.entries || []) {
+      if (entry.action !== "upload" || context.remote[entry.path]) {
+        continue;
+      }
+      const parent = parentPath(entry.path);
+      counts[parent] = (counts[parent] || 0) + 1;
+    }
+    return counts;
+  }
+
+  shouldUseDuplicateGuard(context, entry, existingRemote) {
+    if (existingRemote || !entry || entry.action !== "upload") {
+      return false;
+    }
+    const mode = this.settings.duplicateGuardMode || DEFAULT_SETTINGS.duplicateGuardMode;
+    if (mode === "off") {
+      return false;
+    }
+    if (mode === "strict") {
+      return true;
+    }
+    const snapshotEmpty = Object.keys(context.snapshot || {}).length === 0;
+    const parent = parentPath(entry.path);
+    const parentCounts = context.newUploadParentPathCounts || {};
+    return Boolean(
+      context.remoteSnapshotMissing ||
+      context.remoteSnapshotFromFullScan ||
+      !context.remoteSnapshotAt ||
+      snapshotEmpty ||
+      this.settings.lastSyncHadErrors ||
+      this.settings.duplicateGuardRootChanged ||
+      this.settings.duplicateGuardAfterRebuild ||
+      this.duplicateGuardFolderPathSet().has(parent || "/") ||
+      (parentCounts[parent] || 0) > 1
+    );
+  }
+
+  duplicateGuardFolderPathSet() {
+    return new Set(String(this.settings.duplicateGuardFolderPaths || "")
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter(Boolean));
+  }
+
+  rememberDuplicateGuardFolder(folderPath) {
+    const normalized = folderPath || "/";
+    const paths = this.duplicateGuardFolderPathSet();
+    paths.add(normalized);
+    this.settings.duplicateGuardFolderPaths = Array.from(paths).sort().join("\n");
+  }
+
   async executePlan(context, plan, runId, options = {}) {
     const nextSnapshot = Object.assign({}, context.snapshot);
     const stats = newEmptyStats();
@@ -901,7 +973,9 @@ module.exports = class DriveBridgePlugin extends Plugin {
       if (remoteItem) {
         await this.assertRemoteContentUnchangedSincePlan(path, remoteItem);
       }
-      const uploaded = await this.uploadLocalFile(path, context.rootFolderId, remoteItem);
+      const uploaded = await this.uploadLocalFile(path, context.rootFolderId, remoteItem, {
+        duplicateGuard: this.shouldUseDuplicateGuard(context, entry, remoteItem)
+      });
       const refreshed = this.app.vault.getAbstractFileByPath(path);
       const localAfter = refreshed instanceof TFile ? await this.localInfo(refreshed) : localItem;
       nextSnapshot[path] = this.snapshotFrom(localAfter, uploaded);
@@ -1076,6 +1150,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
         throw new Error(`Multiple Google Drive folders named "${name}" are visible. Set Root folder ID manually or rename duplicates.`);
       }
       this.settings.rootFolderId = list.files[0].id;
+      this.settings.duplicateGuardRootChanged = true;
       await this.saveSettings();
       return this.settings.rootFolderId;
     }
@@ -1088,6 +1163,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       })
     }));
     this.settings.rootFolderId = created.id;
+    this.settings.duplicateGuardRootChanged = true;
     await this.saveSettings();
     return created.id;
   }
@@ -1142,6 +1218,8 @@ module.exports = class DriveBridgePlugin extends Plugin {
           normalized.snapshotAt = Date.parse(parsed && parsed.generatedAt || "") ||
             Date.parse(data.files[0].modifiedTime || "") ||
             0;
+          normalized.fromFullScan = false;
+          normalized.snapshotMissing = false;
           return normalized;
         }
       }
@@ -1150,7 +1228,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     }
     const result = {};
     await this.scanRemoteFolder(rootFolderId, "", result);
-    return { files: result, deleted: {}, snapshotAt: 0 };
+    return { files: result, deleted: {}, snapshotAt: 0, fromFullScan: true, snapshotMissing: true };
   }
 
   remoteSnapshotNewerThanLocalSync(context) {
@@ -1202,7 +1280,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     } while (pageToken);
   }
 
-  async uploadLocalFile(path, rootFolderId, existingRemote) {
+  async uploadLocalFile(path, rootFolderId, existingRemote, options = {}) {
     if (!(await this.localPathExists(path))) {
       throw new Error(`Local file not found: ${path}`);
     }
@@ -1211,6 +1289,9 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const parentId = await this.ensureRemoteParent(path, rootFolderId);
     const metadata = { name: basename(path) };
     if (!existingRemote) {
+      if (options.duplicateGuard) {
+        await this.ensureNoRemoteNameCollision(parentId, metadata.name, parentPath(path));
+      }
       metadata.parents = [parentId];
     }
     const boundary = `drivebridge-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -1230,6 +1311,50 @@ module.exports = class DriveBridgePlugin extends Plugin {
       modifiedTime: uploaded.modifiedTime,
       md5Checksum: uploaded.md5Checksum || ""
     };
+  }
+
+  async ensureNoRemoteNameCollision(parentId, name, folderPath) {
+    const names = await this.remoteChildNames(parentId, folderPath);
+    if (names.has(name)) {
+      this.rememberDuplicateGuardFolder(folderPath);
+      const displayFolder = folderPath || "/";
+      throw new Error(`Google Drive item "${name}" already exists under "${displayFolder}". Rename duplicates or rebuild after cleanup before uploading.`);
+    }
+  }
+
+  async remoteChildNames(parentId, folderPath) {
+    if (this.remoteChildCache.has(parentId)) {
+      return this.remoteChildCache.get(parentId);
+    }
+    const names = new Set();
+    let pageToken = "";
+    do {
+      const params = new URLSearchParams({
+        q: `'${parentId}' in parents and trashed=false`,
+        fields: "nextPageToken,files(id,name,mimeType)",
+        pageSize: "1000",
+        spaces: "drive"
+      });
+      if (pageToken) {
+        params.set("pageToken", pageToken);
+      }
+      const data = await parseJsonResponse(await this.driveFetch(`${DRIVE_API}/files?${params}`));
+      for (const file of data.files || []) {
+        assertSafeRemoteName(file.name);
+        if (file.name === REMOTE_SNAPSHOT_FILE && !folderPath) {
+          continue;
+        }
+        if (names.has(file.name)) {
+          this.rememberDuplicateGuardFolder(folderPath);
+          const displayFolder = folderPath || "/";
+          throw new Error(`Duplicate Google Drive item name "${file.name}" under "${displayFolder}". Rename duplicates before syncing.`);
+        }
+        names.add(file.name);
+      }
+      pageToken = data.nextPageToken || "";
+    } while (pageToken);
+    this.remoteChildCache.set(parentId, names);
+    return names;
   }
 
   async moveRemoteFile(oldPath, newPath, remoteItem, rootFolderId) {
@@ -1280,6 +1405,9 @@ module.exports = class DriveBridgePlugin extends Plugin {
       spaces: "drive"
     });
     const data = await parseJsonResponse(await this.driveFetch(`${DRIVE_API}/files?${params}`));
+    if (data.files && data.files.length > 1) {
+      throw new Error(`Multiple Google Drive folders named "${name}" are visible under the same parent. Rename duplicates before syncing.`);
+    }
     return data.files && data.files.length ? data.files[0] : null;
   }
 
@@ -2452,9 +2580,13 @@ class DriveBridgeSettingTab extends PluginSettingTab {
       .addText((text) => text
         .setValue(this.plugin.settings.rootFolderName)
         .onChange(async (value) => {
-          this.plugin.settings.rootFolderName = value.trim() || DEFAULT_SETTINGS.rootFolderName;
-          this.plugin.settings.rootFolderId = "";
-          await this.plugin.saveSettings();
+          const nextName = value.trim() || DEFAULT_SETTINGS.rootFolderName;
+          if (nextName !== this.plugin.settings.rootFolderName) {
+            this.plugin.settings.rootFolderName = nextName;
+            this.plugin.settings.rootFolderId = "";
+            this.plugin.settings.duplicateGuardRootChanged = true;
+            await this.plugin.saveSettings();
+          }
         }));
 
     new Setting(containerEl)
@@ -2542,7 +2674,24 @@ class DriveBridgeSettingTab extends PluginSettingTab {
         .setPlaceholder("Google Drive folder ID")
         .setValue(this.plugin.settings.rootFolderId)
         .onChange(async (value) => {
-          this.plugin.settings.rootFolderId = value.trim();
+          const nextId = value.trim();
+          if (nextId !== this.plugin.settings.rootFolderId) {
+            this.plugin.settings.rootFolderId = nextId;
+            this.plugin.settings.duplicateGuardRootChanged = true;
+            await this.plugin.saveSettings();
+          }
+        }));
+
+    new Setting(containerEl)
+      .setName("Duplicate guard")
+      .setDesc("Checks Google Drive folder contents before risky new uploads. Auto checks only when snapshot/root/recovery state is suspicious; Strict checks every new upload; Off is fastest but less safe.")
+      .addDropdown((dropdown) => dropdown
+        .addOption("auto", "Auto")
+        .addOption("strict", "Strict")
+        .addOption("off", "Off")
+        .setValue(this.plugin.settings.duplicateGuardMode || DEFAULT_SETTINGS.duplicateGuardMode)
+        .onChange(async (value) => {
+          this.plugin.settings.duplicateGuardMode = value;
           await this.plugin.saveSettings();
         }));
 
@@ -2842,6 +2991,12 @@ function normalizeRemoteState(value) {
 
 function basename(path) {
   return path.split("/").pop();
+}
+
+function parentPath(path) {
+  const parts = path.split("/");
+  parts.pop();
+  return parts.join("/");
 }
 
 function sameLocal(previous, current) {
