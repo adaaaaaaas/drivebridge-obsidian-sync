@@ -249,6 +249,7 @@ async function run() {
     plugin.app = { vault: { adapter } };
     const snapshot = { "note.md": { local: { size: 1, mtime: 1 }, remote: { id: "r", size: 1 } } };
     await plugin.saveSnapshot(snapshot);
+    assert.strictEqual(files.get(plugin.pluginDataPath("snapshot.json")).includes("\n"), false);
     assert.deepStrictEqual(JSON.parse(JSON.stringify(await plugin.loadSnapshot())), snapshot);
 
     readTransform = (value, target) => target.endsWith(".tmp")
@@ -259,11 +260,33 @@ async function run() {
     assert.deepStrictEqual(JSON.parse(JSON.stringify(await plugin.loadSnapshot())), normalizedSnapshot);
 
     readTransform = (value, target) => target.endsWith(".tmp")
-      ? JSON.stringify(JSON.parse(value))
+      ? JSON.stringify(JSON.parse(value), null, 2)
       : value;
     const reformattedSnapshot = { "note.md": { local: { size: 3, mtime: 3 }, remote: { id: "r", size: 3 } } };
     await plugin.saveSnapshot(reformattedSnapshot);
     assert.deepStrictEqual(JSON.parse(JSON.stringify(await plugin.loadSnapshot())), reformattedSnapshot);
+
+    let transientReadAttempts = 0;
+    readTransform = (value, target) => {
+      if (!target.endsWith(".tmp")) return value;
+      transientReadAttempts++;
+      return transientReadAttempts < 3 ? value.slice(0, -8) : value;
+    };
+    const retriedSnapshot = { "note.md": { local: { size: 4, mtime: 4 }, remote: { id: "r", size: 4 } } };
+    await plugin.saveSnapshot(retriedSnapshot);
+    assert.strictEqual(transientReadAttempts, 3);
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(await plugin.loadSnapshot())), retriedSnapshot);
+
+    const largeJson = JSON.stringify({ payload: "x".repeat(1225000) });
+    let largeReadAttempts = 0;
+    readTransform = (value, target) => {
+      if (!target.endsWith(".tmp")) return value;
+      largeReadAttempts++;
+      return largeReadAttempts === 1 ? value.slice(0, 1002892) : value;
+    };
+    await plugin.writePluginDataFileAtomic("large-test.json", "large-test.previous.json", largeJson);
+    assert.strictEqual(largeReadAttempts, 2);
+    assert.strictEqual(files.get(plugin.pluginDataPath("large-test.json")), largeJson);
 
     const savedBeforeMismatch = files.get(plugin.pluginDataPath("snapshot.json"));
     readTransform = (value, target) => target.endsWith(".tmp") ? "{\"different\":true}" : value;

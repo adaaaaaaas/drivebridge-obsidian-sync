@@ -2,6 +2,7 @@
 
 ## Latest change
 
+- 0.5.2: Compacts internal snapshot JSON and retries only transient atomic read-back mismatches, preventing large snapshots from failing on an immediate partial read while preserving corruption checks.
 - 0.5.1: Prevents atomic JSON verification from falsely failing on harmless BOM, line-ending, or formatting differences while still rejecting changed or invalid content.
 - 0.5.0: Adds lightweight snapshot safeguards, targeted content verification, exact-plan delete approvals, and a mobile-first BAS-style manual conflict review queue. Safe files continue syncing while conflicts wait for review.
 - 0.4.33: Adds Duplicate guard Auto/Strict/Off. Auto checks Drive folder contents only before risky new uploads, using per-folder caching to avoid per-file searches.

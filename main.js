@@ -87,6 +87,7 @@ const LOCAL_HASH_MAX_BYTES = 10 * 1024 * 1024;
 const LARGE_BINARY_CONFLICT_BYTES = 10 * 1024 * 1024;
 const BULK_TIMESTAMP_SLOT_MS = 60 * 1000;
 const BULK_TIMESTAMP_MIN_FILES = 30;
+const ATOMIC_VERIFY_RETRY_DELAYS_MS = [0, 50, 200, 750, 2000];
 const HASHED_LOCAL_EXTENSIONS = new Set([".md", ".txt", ".json", ".css", ".js", ".canvas"]);
 const LARGE_BINARY_EXTENSIONS = new Set([".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".mp4", ".mov", ".zip"]);
 const OBSIDIAN_SAFE_ALLOW_PATTERNS = [
@@ -1758,7 +1759,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
 
   async saveSnapshot(snapshot) {
     validateSnapshot(snapshot);
-    await this.writePluginDataFileAtomic(SNAPSHOT_FILE, SNAPSHOT_BACKUP_FILE, JSON.stringify(snapshot, null, 2));
+    await this.writePluginDataFileAtomic(SNAPSHOT_FILE, SNAPSHOT_BACKUP_FILE, JSON.stringify(snapshot));
   }
 
   async loadReviewQueue() {
@@ -1783,7 +1784,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
 
   async saveReviewQueue(queue) {
     const normalized = { version: 1, items: Array.isArray(queue.items) ? queue.items : [] };
-    await this.writePluginDataFileAtomic(REVIEW_QUEUE_FILE, REVIEW_QUEUE_BACKUP_FILE, JSON.stringify(normalized, null, 2));
+    await this.writePluginDataFileAtomic(REVIEW_QUEUE_FILE, REVIEW_QUEUE_BACKUP_FILE, JSON.stringify(normalized));
     this.reviewCount = normalized.items.length;
     this.clearSyncStatus();
   }
@@ -2410,12 +2411,31 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const backupPath = this.pluginDataPath(backupFilename);
     const tempPath = this.pluginDataPath(`${filename}.${randomId(8)}.tmp`);
     await this.app.vault.adapter.write(tempPath, content);
-    const verified = await this.app.vault.adapter.read(tempPath);
-    if (!atomicJsonContentEquivalent(content, verified)) {
+    let verified = "";
+    let verificationPassed = false;
+    let readFailed = false;
+    for (const delayMs of ATOMIC_VERIFY_RETRY_DELAYS_MS) {
+      if (delayMs) {
+        await sleep(delayMs);
+      }
+      try {
+        verified = await this.app.vault.adapter.read(tempPath);
+        readFailed = false;
+        if (atomicJsonContentEquivalent(content, verified)) {
+          verificationPassed = true;
+          break;
+        }
+      } catch (err) {
+        readFailed = true;
+      }
+    }
+    if (!verificationPassed) {
       await this.app.vault.adapter.remove(tempPath);
       throw new Error(
         `Atomic write verification failed for ${filename} ` +
-        `(expected ${content.length} characters, read ${verified.length}).`
+        `(expected ${content.length} characters, ` +
+        `${readFailed ? "final read failed" : `last read ${verified.length}`}, ` +
+        `${ATOMIC_VERIFY_RETRY_DELAYS_MS.length} attempts).`
       );
     }
     let movedCurrent = false;
