@@ -230,11 +230,12 @@ async function run() {
     const plugin = pluginInstance(PluginClass);
     const files = new Map();
     const folders = new Set(["", ".obsidian", ".obsidian/plugins", plugin.manifest.dir]);
+    let readTransform = (value) => value;
     const adapter = {
       exists: async (target) => files.has(target) || folders.has(target),
       read: async (target) => {
         if (!files.has(target)) throw new Error(`missing ${target}`);
-        return files.get(target);
+        return readTransform(files.get(target), target);
       },
       write: async (target, value) => { files.set(target, value); },
       remove: async (target) => { files.delete(target); },
@@ -249,6 +250,31 @@ async function run() {
     const snapshot = { "note.md": { local: { size: 1, mtime: 1 }, remote: { id: "r", size: 1 } } };
     await plugin.saveSnapshot(snapshot);
     assert.deepStrictEqual(JSON.parse(JSON.stringify(await plugin.loadSnapshot())), snapshot);
+
+    readTransform = (value, target) => target.endsWith(".tmp")
+      ? `\uFEFF${value.replace(/\n/g, "\r\n")}`
+      : value;
+    const normalizedSnapshot = { "note.md": { local: { size: 2, mtime: 2 }, remote: { id: "r", size: 2 } } };
+    await plugin.saveSnapshot(normalizedSnapshot);
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(await plugin.loadSnapshot())), normalizedSnapshot);
+
+    readTransform = (value, target) => target.endsWith(".tmp")
+      ? JSON.stringify(JSON.parse(value))
+      : value;
+    const reformattedSnapshot = { "note.md": { local: { size: 3, mtime: 3 }, remote: { id: "r", size: 3 } } };
+    await plugin.saveSnapshot(reformattedSnapshot);
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(await plugin.loadSnapshot())), reformattedSnapshot);
+
+    const savedBeforeMismatch = files.get(plugin.pluginDataPath("snapshot.json"));
+    readTransform = (value, target) => target.endsWith(".tmp") ? "{\"different\":true}" : value;
+    await assert.rejects(() => plugin.saveSnapshot(snapshot), /Atomic write verification failed/);
+    assert.strictEqual(files.get(plugin.pluginDataPath("snapshot.json")), savedBeforeMismatch);
+
+    readTransform = (value, target) => target.endsWith(".tmp") ? "{" : value;
+    await assert.rejects(() => plugin.saveSnapshot(snapshot), /Atomic write verification failed/);
+    assert.strictEqual(files.get(plugin.pluginDataPath("snapshot.json")), savedBeforeMismatch);
+
+    readTransform = (value) => value;
     files.set(plugin.pluginDataPath("snapshot.json"), "{");
     await assert.rejects(() => plugin.loadSnapshot(), /corrupted/);
   }

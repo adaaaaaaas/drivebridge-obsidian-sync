@@ -2411,9 +2411,12 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const tempPath = this.pluginDataPath(`${filename}.${randomId(8)}.tmp`);
     await this.app.vault.adapter.write(tempPath, content);
     const verified = await this.app.vault.adapter.read(tempPath);
-    if (verified !== content) {
+    if (!atomicJsonContentEquivalent(content, verified)) {
       await this.app.vault.adapter.remove(tempPath);
-      throw new Error(`Atomic write verification failed for ${filename}.`);
+      throw new Error(
+        `Atomic write verification failed for ${filename} ` +
+        `(expected ${content.length} characters, read ${verified.length}).`
+      );
     }
     let movedCurrent = false;
     try {
@@ -3718,6 +3721,41 @@ async function sha256Hex(data) {
   return Array.from(new Uint8Array(digest))
     .map((value) => value.toString(16).padStart(2, "0"))
     .join("");
+}
+
+function atomicJsonContentEquivalent(expected, actual) {
+  if (actual === expected) {
+    return true;
+  }
+  const normalizedExpected = normalizeAtomicJsonText(expected);
+  const normalizedActual = normalizeAtomicJsonText(actual);
+  if (normalizedActual === normalizedExpected) {
+    return true;
+  }
+  try {
+    return canonicalJsonString(JSON.parse(normalizedActual)) ===
+      canonicalJsonString(JSON.parse(normalizedExpected));
+  } catch (err) {
+    return false;
+  }
+}
+
+function normalizeAtomicJsonText(value) {
+  return String(value || "")
+    .replace(/^\uFEFF/, "")
+    .replace(/\r\n/g, "\n");
+}
+
+function canonicalJsonString(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalJsonString(item)).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => {
+      return `${JSON.stringify(key)}:${canonicalJsonString(value[key])}`;
+    }).join(",")}}`;
+  }
+  return JSON.stringify(value);
 }
 
 function assertSafeRemoteName(name) {
