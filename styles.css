@@ -75,3 +75,148 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
+
+.drivebridge-review-modal {
+  width: min(1000px, 92vw);
+  max-width: 100%;
+}
+
+.drivebridge-review-layout {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.8fr) minmax(0, 2fr);
+  gap: 12px;
+  max-height: min(72vh, 760px);
+}
+
+.drivebridge-review-list,
+.drivebridge-review-detail {
+  min-width: 0;
+  overflow: auto;
+}
+
+.drivebridge-review-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.drivebridge-review-item {
+  width: 100%;
+  min-height: 44px;
+  padding: 8px 10px;
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.drivebridge-review-item.is-selected {
+  border-color: var(--interactive-accent);
+  background: var(--background-modifier-hover);
+}
+
+.drivebridge-review-path {
+  color: var(--text-normal);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.drivebridge-review-compare {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.drivebridge-review-side {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-secondary);
+  overflow-wrap: anywhere;
+}
+
+.drivebridge-review-hash {
+  margin-top: 6px;
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  word-break: break-all;
+}
+
+.drivebridge-review-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.drivebridge-review-actions button {
+  min-height: 44px;
+  white-space: normal;
+}
+
+.drivebridge-settings textarea,
+.drivebridge-settings input,
+.drivebridge-settings select {
+  max-width: 100%;
+}
+
+@media (max-width: 600px) {
+  .drivebridge-progress-modal,
+  .drivebridge-review-modal {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .drivebridge-review-layout {
+    grid-template-columns: minmax(0, 1fr);
+    max-height: none;
+  }
+
+  .drivebridge-review-list {
+    max-height: 30vh;
+  }
+
+  .drivebridge-review-compare {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .drivebridge-review-actions {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    padding-bottom: max(12px, env(safe-area-inset-bottom));
+  }
+
+  .drivebridge-settings .setting-item {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .drivebridge-settings .setting-item-info,
+  .drivebridge-settings .setting-item-control {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .drivebridge-settings .setting-item-control {
+    align-items: stretch;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+
+  .drivebridge-settings input,
+  .drivebridge-settings textarea,
+  .drivebridge-settings select,
+  .drivebridge-settings button {
+    width: 100%;
+    min-height: 44px;
+    font-size: 16px;
+  }
+
+  .drivebridge-settings .drivebridge-status,
+  .drivebridge-progress-message {
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+  }
+}

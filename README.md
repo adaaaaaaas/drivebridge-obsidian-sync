@@ -2,6 +2,7 @@
 
 ## Latest change
 
+- 0.5.0: Adds lightweight snapshot safeguards, targeted content verification, exact-plan delete approvals, and a mobile-first BAS-style manual conflict review queue. Safe files continue syncing while conflicts wait for review.
 - 0.4.33: Adds Duplicate guard Auto/Strict/Off. Auto checks Drive folder contents only before risky new uploads, using per-folder caching to avoid per-file searches.
 - 0.4.32: Adds a manual remote snapshot repair action that full-scans Google Drive and rewrites only `remote_snapshot.json`.
 - 0.4.31: Updates the shared remote snapshot with current Drive metadata for remote changed-before/during-sync skips, without advancing the local sync baseline.
@@ -37,6 +38,15 @@
 - Sync errors now stay visible in the progress modal instead of disappearing after a short notice.
 - Error details include the action, vault path, error message, and time.
 - The same details are saved to `sync-journal.json` and shown in the DriveBridge settings summary.
+
+## Manual conflict review (0.5.0)
+
+- `Manual review` is the recommended conflict mode. Safe files keep syncing while conflicts wait in `review-queue.json`.
+- Open `Review sync conflicts` from the command palette, ribbon, or DriveBridge settings.
+- Each pending item shows Local and Google Drive metadata and offers `Use Local`, `Use Drive`, `Keep both`, or `Defer`.
+- DriveBridge rechecks both sides immediately before applying a review choice. A stale choice is rejected instead of overwriting newer content.
+- On iPhone/iPad, the review and settings layouts stack vertically with full-width touch controls; no desktop-only right-click or hover action is required.
+- Large ambiguous files are queued without automatic full-content hashing, keeping normal mobile sync lightweight.
 
 DriveBridge for Obsidian は、iCloud Drive を使わずに Obsidian vault と Google Drive を同期するためのコミュニティプラグインです。iPhone/iPad の Obsidian モバイルでも動くように、OS のローカル同期フォルダではなく Obsidian Vault API と Google Drive API を使います。
 
