@@ -1740,21 +1740,13 @@ module.exports = class DriveBridgePlugin extends Plugin {
   }
 
   async loadSnapshot() {
-    const path = this.pluginDataPath(SNAPSHOT_FILE);
-    const backupPath = this.pluginDataPath(SNAPSHOT_BACKUP_FILE);
-    const sourcePath = await this.app.vault.adapter.exists(path)
-      ? path
-      : await this.app.vault.adapter.exists(backupPath) ? backupPath : "";
-    if (!sourcePath) return {};
-    const text = await this.app.vault.adapter.read(sourcePath);
-    let snapshot;
-    try {
-      snapshot = JSON.parse(text);
-    } catch (err) {
-      throw new Error(`${SNAPSHOT_FILE} is corrupted. Sync stopped without resetting history.`);
-    }
-    validateSnapshot(snapshot);
-    return snapshot;
+    return this.loadPluginDataJsonWithBackup(
+      SNAPSHOT_FILE,
+      SNAPSHOT_BACKUP_FILE,
+      {},
+      validateSnapshot,
+      "Sync stopped without resetting history."
+    );
   }
 
   async saveSnapshot(snapshot) {
@@ -1763,23 +1755,13 @@ module.exports = class DriveBridgePlugin extends Plugin {
   }
 
   async loadReviewQueue() {
-    const path = this.pluginDataPath(REVIEW_QUEUE_FILE);
-    const backupPath = this.pluginDataPath(REVIEW_QUEUE_BACKUP_FILE);
-    const sourcePath = await this.app.vault.adapter.exists(path)
-      ? path
-      : await this.app.vault.adapter.exists(backupPath) ? backupPath : "";
-    if (!sourcePath) return { version: 1, items: [] };
-    const text = await this.app.vault.adapter.read(sourcePath);
-    let queue;
-    try {
-      queue = JSON.parse(text);
-    } catch (err) {
-      throw new Error(`${REVIEW_QUEUE_FILE} is corrupted. Conflict review stopped without discarding items.`);
-    }
-    if (!queue || queue.version !== 1 || !Array.isArray(queue.items)) {
-      throw new Error(`${REVIEW_QUEUE_FILE} has an unsupported format.`);
-    }
-    return queue;
+    return this.loadPluginDataJsonWithBackup(
+      REVIEW_QUEUE_FILE,
+      REVIEW_QUEUE_BACKUP_FILE,
+      { version: 1, items: [] },
+      validateReviewQueue,
+      "Conflict review stopped without discarding items."
+    );
   }
 
   async saveReviewQueue(queue) {
@@ -2405,11 +2387,49 @@ module.exports = class DriveBridgePlugin extends Plugin {
     }
   }
 
+  async loadPluginDataJsonWithBackup(filename, backupFilename, missingValue, validate, failureConsequence = "Operation stopped.") {
+    const candidates = [filename, backupFilename];
+    const failures = [];
+    for (const candidate of candidates) {
+      const path = this.pluginDataPath(candidate);
+      if (!(await this.app.vault.adapter.exists(path))) {
+        continue;
+      }
+      try {
+        const text = await this.app.vault.adapter.read(path);
+        const value = JSON.parse(text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text);
+        validate(value);
+        if (candidate === backupFilename && failures.length) {
+          const message = `${filename} is corrupted; using the verified ${backupFilename} backup. The damaged file was preserved.`;
+          console.warn(`[drivebridge-obsidian-sync] ${message}`);
+          this.pluginDataRecoveredFromBackup = this.pluginDataRecoveredFromBackup || new Set();
+          this.pluginDataRecoveredFromBackup.add(filename);
+          this.pluginDataRecoveryNotices = this.pluginDataRecoveryNotices || new Set();
+          if (!this.pluginDataRecoveryNotices.has(filename)) {
+            this.pluginDataRecoveryNotices.add(filename);
+            new Notice(`DriveBridge: ${message}`, 10000);
+          }
+        }
+        return value;
+      } catch (err) {
+        failures.push(`${candidate}: ${err && err.message ? err.message : String(err)}`);
+      }
+    }
+    if (!failures.length) {
+      return missingValue;
+    }
+    throw new Error(`${filename} is corrupted and no verified backup is available. ${failureConsequence} ${failures.join("; ")}`);
+  }
+
   async writePluginDataFileAtomic(filename, backupFilename, content) {
     await this.ensureAdapterFolderPath(this.pluginDataDir());
     const path = this.pluginDataPath(filename);
     const backupPath = this.pluginDataPath(backupFilename);
     const tempPath = this.pluginDataPath(`${filename}.${randomId(8)}.tmp`);
+    const recoveredFromBackup = Boolean(this.pluginDataRecoveredFromBackup && this.pluginDataRecoveredFromBackup.has(filename));
+    const corruptedPath = recoveredFromBackup
+      ? this.pluginDataPath(`${filename}.${Date.now()}.${randomId(6)}.corrupted`)
+      : "";
     await this.app.vault.adapter.write(tempPath, content);
     let verified = "";
     let verificationPassed = false;
@@ -2439,18 +2459,29 @@ module.exports = class DriveBridgePlugin extends Plugin {
       );
     }
     let movedCurrent = false;
+    let quarantinedCurrent = false;
     try {
       if (await this.app.vault.adapter.exists(path)) {
-        if (await this.app.vault.adapter.exists(backupPath)) {
-          await this.app.vault.adapter.remove(backupPath);
+        if (recoveredFromBackup) {
+          await this.app.vault.adapter.rename(path, corruptedPath);
+          quarantinedCurrent = true;
+        } else {
+          if (await this.app.vault.adapter.exists(backupPath)) {
+            await this.app.vault.adapter.remove(backupPath);
+          }
+          await this.app.vault.adapter.rename(path, backupPath);
+          movedCurrent = true;
         }
-        await this.app.vault.adapter.rename(path, backupPath);
-        movedCurrent = true;
       }
       await this.app.vault.adapter.rename(tempPath, path);
+      if (recoveredFromBackup) {
+        this.pluginDataRecoveredFromBackup.delete(filename);
+      }
     } catch (err) {
       if (!(await this.app.vault.adapter.exists(path)) && movedCurrent && await this.app.vault.adapter.exists(backupPath)) {
         await this.app.vault.adapter.rename(backupPath, path);
+      } else if (!(await this.app.vault.adapter.exists(path)) && quarantinedCurrent && await this.app.vault.adapter.exists(corruptedPath)) {
+        await this.app.vault.adapter.rename(corruptedPath, path);
       }
       if (await this.app.vault.adapter.exists(tempPath)) {
         await this.app.vault.adapter.remove(tempPath);
@@ -3522,6 +3553,29 @@ function validateSnapshot(snapshot) {
     }
     if (value.remote !== null && value.remote !== undefined && typeof value.remote !== "object") {
       throw new Error(`${SNAPSHOT_FILE} contains invalid remote metadata for ${path}.`);
+    }
+  }
+}
+
+function validateReviewQueue(queue) {
+  if (!queue || queue.version !== 1 || !Array.isArray(queue.items)) {
+    throw new Error(`${REVIEW_QUEUE_FILE} has an unsupported format.`);
+  }
+  const ids = new Set();
+  for (const [index, item] of queue.items.entries()) {
+    if (!item || typeof item !== "object" || Array.isArray(item) ||
+        typeof item.id !== "string" || !item.id || typeof item.path !== "string" || !item.path) {
+      throw new Error(`${REVIEW_QUEUE_FILE} contains an invalid item at index ${index}.`);
+    }
+    if (ids.has(item.id)) {
+      throw new Error(`${REVIEW_QUEUE_FILE} contains duplicate item id ${item.id}.`);
+    }
+    ids.add(item.id);
+    for (const side of ["local", "remote"]) {
+      if (item[side] !== null && item[side] !== undefined &&
+          (typeof item[side] !== "object" || Array.isArray(item[side]))) {
+        throw new Error(`${REVIEW_QUEUE_FILE} contains invalid ${side} metadata for ${item.path}.`);
+      }
     }
   }
 }

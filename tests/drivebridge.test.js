@@ -299,7 +299,34 @@ async function run() {
 
     readTransform = (value) => value;
     files.set(plugin.pluginDataPath("snapshot.json"), "{");
+    files.delete(plugin.pluginDataPath("snapshot.previous.json"));
     await assert.rejects(() => plugin.loadSnapshot(), /corrupted/);
+
+    const snapshotBackup = { "backup.md": { local: { size: 5, mtime: 5 }, remote: { id: "backup", size: 5 } } };
+    files.set(plugin.pluginDataPath("snapshot.previous.json"), JSON.stringify(snapshotBackup));
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(await plugin.loadSnapshot())), snapshotBackup);
+    assert.strictEqual(files.get(plugin.pluginDataPath("snapshot.json")), "{", "recovery must preserve the damaged primary for diagnosis");
+
+    files.set(plugin.pluginDataPath("review-queue.json"), "{");
+    const queueBackup = { version: 1, items: [{ id: "review-1", path: "conflict.md" }] };
+    files.set(plugin.pluginDataPath("review-queue.previous.json"), `\uFEFF${JSON.stringify(queueBackup)}`);
+    assert.deepStrictEqual(await plugin.loadReviewQueue(), queueBackup);
+    assert.strictEqual(files.get(plugin.pluginDataPath("review-queue.json")), "{", "review recovery must not overwrite the damaged primary");
+
+    files.set(plugin.pluginDataPath("review-queue.json"), JSON.stringify({ version: 1, items: [null] }));
+    assert.deepStrictEqual(await plugin.loadReviewQueue(), queueBackup, "structurally invalid JSON must also fall back");
+
+    const replacementQueue = { version: 1, items: [{ id: "review-2", path: "new-conflict.md" }] };
+    await plugin.saveReviewQueue(replacementQueue);
+    assert.deepStrictEqual(JSON.parse(files.get(plugin.pluginDataPath("review-queue.json"))), replacementQueue);
+    assert.deepStrictEqual(JSON.parse(files.get(plugin.pluginDataPath("review-queue.previous.json")).slice(1)), queueBackup,
+      "the verified recovery backup must not be replaced by the damaged primary");
+    assert.ok(Array.from(files.keys()).some((target) => target.endsWith(".corrupted")),
+      "the damaged primary must be quarantined for diagnosis after a successful replacement");
+
+    files.set(plugin.pluginDataPath("review-queue.json"), "{");
+    files.set(plugin.pluginDataPath("review-queue.previous.json"), "[]");
+    await assert.rejects(() => plugin.loadReviewQueue(), /no verified backup.*without discarding items/);
   }
 
   {
