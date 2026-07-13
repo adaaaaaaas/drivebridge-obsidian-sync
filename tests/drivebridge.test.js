@@ -74,7 +74,9 @@ function loadPlugin() {
         Notice: class {},
         requestUrl: async (request) => {
           requests.push(request);
-          return responses.shift() || { status: 200, text: "{}", json: {}, arrayBuffer: new ArrayBuffer(0), headers: {} };
+          const response = responses.shift();
+          if (response instanceof Error) throw response;
+          return response || { status: 200, text: "{}", json: {}, arrayBuffer: new ArrayBuffer(0), headers: {} };
         }
       };
     }
@@ -188,6 +190,245 @@ async function run() {
   {
     const { PluginClass } = loadPlugin();
     const plugin = pluginInstance(PluginClass);
+    let writes = 0;
+    plugin.writeRemoteSnapshotFile = async () => { writes++; };
+    plugin.mergeRemoteDeleteTombstones = (previous) => previous;
+    const result = await plugin.saveRemoteSnapshot("root", {
+      "same.md": { id: "same", size: 2, md5Checksum: "abc" }
+    }, {}, {}, {});
+    assert.strictEqual(result.written, false);
+    assert.strictEqual(writes, 0, "unchanged sync must not query or rewrite remote_snapshot.json");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    const calls = [];
+    plugin.driveFetch = async (url) => {
+      calls.push(url);
+      const count = Number(new URL(url).searchParams.get("count"));
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ ids: Array.from({ length: count }, (_, index) => `id-${calls.length}-${index}`) })
+      };
+    };
+    const ids = await plugin.reserveDriveIds(1001);
+    assert.strictEqual(ids.length, 1001);
+    assert.strictEqual(calls.length, 2, "Drive IDs must be reserved in batches, not per file");
+    assert.match(calls[0], /count=1000/);
+    assert.match(calls[1], /count=1/);
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    let reserveCount = 0;
+    plugin.reserveDriveIds = async (count) => {
+      reserveCount = count;
+      return Array.from({ length: count }, (_, index) => `reserved-${index}`);
+    };
+    let journal;
+    plugin.writeOperationJournal = async (value) => { journal = value; plugin.operationJournalCache = value; };
+    const plan = { entries: [
+      { path: "new-a.md", action: "upload" },
+      { path: "new-b.md", action: "upload" },
+      { path: "existing.md", action: "upload" },
+      { path: "same.md", action: "adopt" }
+    ] };
+    await plugin.prepareOperationJournal("run-1", plan, {
+      local: {
+        "new-a.md": { size: 1 },
+        "new-b.md": { size: 1 },
+        "existing.md": { size: 1 }
+      },
+      remote: { "existing.md": { id: "existing" } }
+    });
+    assert.strictEqual(reserveCount, 2, "only create operations need reserved IDs");
+    assert.strictEqual(journal.version, 2);
+    assert.strictEqual(journal.operations["new-a.md"].reservedRemoteId, "reserved-0");
+    assert.strictEqual(journal.operations["existing.md"].reservedRemoteId, "");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    const bytes = new TextEncoder().encode("reserved upload").buffer;
+    plugin.localPathExists = async () => true;
+    plugin.localInfoByPath = async () => ({ path: "note.md", size: bytes.byteLength, mtime: 1 });
+    plugin.readLocalBinary = async () => bytes;
+    plugin.ensureRemoteParent = async () => "parent-1";
+    let requests = 0;
+    plugin.driveFetch = async () => {
+      requests++;
+      const error = new Error("response lost");
+      error.code = "DRIVEBRIDGE_NETWORK_ERROR";
+      throw error;
+    };
+    let reconciliations = 0;
+    plugin.reconcileReservedUpload = async (_path, id, expected) => {
+      reconciliations++;
+      assert.strictEqual(id, "reserved-1");
+      assert.strictEqual(expected.parentId, "parent-1");
+      assert.ok(expected.md5Checksum);
+      return { id, name: "note.md", size: bytes.byteLength, modifiedTime: "now", md5Checksum: expected.md5Checksum, parentId: "parent-1" };
+    };
+    const uploaded = await plugin.uploadLocalFile("note.md", "root", null, { reservedRemoteId: "reserved-1" });
+    assert.strictEqual(uploaded.id, "reserved-1");
+    assert.strictEqual(requests, 1);
+    assert.strictEqual(reconciliations, 1, "ambiguous POST must be reconciled by reserved ID");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    const base = {
+      "ours.md": { id: "ours-old", size: 1, md5Checksum: "a" }
+    };
+    const latest = {
+      "ours.md": { id: "ours-old", size: 1, md5Checksum: "a" },
+      "theirs.md": { id: "theirs", size: 2, md5Checksum: "b" }
+    };
+    const merged = plugin.mergeRemoteSnapshotMutationSet(base, latest, {
+      "ours.md": { id: "ours-new", size: 3, md5Checksum: "c" }
+    });
+    assert.strictEqual(merged["ours.md"].id, "ours-new");
+    assert.strictEqual(merged["theirs.md"].id, "theirs", "unrelated concurrent changes must survive merge");
+    assert.throws(() => plugin.mergeRemoteSnapshotMutationSet(base, {
+      "ours.md": { id: "theirs-edit", size: 4, md5Checksum: "d" }
+    }, {
+      "ours.md": { id: "ours-new", size: 3, md5Checksum: "c" }
+    }), /conflicts at ours\.md/);
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    const base = { "ours.md": { id: "old", size: 1, md5Checksum: "a" } };
+    plugin.driveFetch = async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ files: [{ id: "snapshot", modifiedTime: "new-generation" }] })
+    });
+    plugin.loadRemoteSnapshotById = async () => ({
+      files: Object.assign({}, base, { "theirs.md": { id: "theirs", size: 2, md5Checksum: "b" } }),
+      deleted: {}
+    });
+    let writtenContent;
+    plugin.uploadTextContent = async (_name, _root, content) => {
+      writtenContent = JSON.parse(content);
+      return { id: "snapshot", modifiedTime: "written" };
+    };
+    plugin.reconcileRemoteSnapshotCommit = async () => ({ id: "snapshot", modifiedTime: "verified" });
+    plugin.mergeRemoteDeleteTombstones = (previous) => previous;
+    const result = await plugin.writeRemoteSnapshotFile("root", {
+      "ours.md": { id: "new", size: 3, md5Checksum: "c" }
+    }, {}, {
+      runId: "run",
+      expectedSnapshotFileId: "snapshot",
+      expectedSnapshotModifiedTime: "old-generation",
+      baseFiles: base,
+      mutations: { "ours.md": { id: "new", size: 3, md5Checksum: "c" } },
+      newDeleted: {}
+    });
+    assert.strictEqual(result.mergedConflict, true);
+    assert.strictEqual(writtenContent.files["ours.md"].id, "new");
+    assert.strictEqual(writtenContent.files["theirs.md"].id, "theirs");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass, { remoteSnapshotProtocolVersion: 2 });
+    const responses = [
+      { files: [{ id: "snapshot", modifiedTime: "now" }] },
+      { version: 1, files: {}, deleted: {} }
+    ];
+    plugin.driveFetch = async () => {
+      const value = responses.shift();
+      return { ok: true, status: 200, text: async () => JSON.stringify(value) };
+    };
+    await assert.rejects(
+      () => plugin.loadRemoteSnapshotFile("root"),
+      /downgraded by an older DriveBridge device/
+    );
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    const journal = {
+      version: 1,
+      runId: "old-run",
+      status: "completed_with_errors",
+      operations: {
+        "note.md": {
+          runId: "old-run",
+          path: "note.md",
+          action: "upload",
+          status: "failed",
+          localBefore: { size: 4 }
+        }
+      }
+    };
+    plugin.findRemoteFileByExactName = async () => ({
+      id: "already-created",
+      name: "note.md",
+      size: 4,
+      md5Checksum: "abcd",
+      parentId: "root"
+    });
+    plugin.localPathExists = async () => true;
+    plugin.localInfoByPath = async () => ({ path: "note.md", size: 4, mtime: 1 });
+    plugin.localMd5ByPath = async () => "abcd";
+    plugin.writeOperationJournal = async (value) => {
+      plugin.operationJournalCache = value;
+      plugin.operationJournalDirty = false;
+    };
+    const context = { rootFolderId: "root", remote: {}, remoteDeleted: {} };
+    await plugin.reconcileRecoveryContext({ journal }, context);
+    assert.strictEqual(context.remote["note.md"].id, "already-created");
+    assert.strictEqual(context.recoveredRemoteMutations["note.md"].id, "already-created");
+    assert.strictEqual(journal.operations["note.md"].status, "done");
+    assert.strictEqual(journal.operations["note.md"].phase, "remote_verified");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    const remoteBefore = { id: "deleted-id", path: "gone.md", size: 7, md5Checksum: "dead" };
+    const journal = {
+      version: 2,
+      runId: "delete-run",
+      status: "commit_pending",
+      operations: {
+        "gone.md": {
+          path: "gone.md",
+          action: "deleteRemote",
+          status: "in_progress",
+          remoteBefore
+        }
+      }
+    };
+    plugin.remoteInfoById = async () => null;
+    plugin.writeOperationJournal = async (value) => {
+      plugin.operationJournalCache = value;
+      plugin.operationJournalDirty = false;
+    };
+    const context = {
+      rootFolderId: "root",
+      remote: { "gone.md": remoteBefore },
+      remoteDeleted: {}
+    };
+    await plugin.reconcileRecoveryContext({ journal }, context);
+    assert.strictEqual(context.remote["gone.md"], undefined);
+    assert.strictEqual(context.recoveredRemoteMutations["gone.md"], null);
+    assert.ok(context.recoveredRemoteDeleted["gone.md"]);
+    assert.strictEqual(journal.operations["gone.md"].status, "done");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
     plugin.assertLocalUnchangedSincePlan = async () => {};
     plugin.assertRemoteUnchangedSincePlan = async () => {};
     plugin.hasSameContent = async () => {
@@ -223,6 +464,31 @@ async function run() {
     const response = await plugin.driveFetch("https://example.test/create", { method: "POST" });
     assert.strictEqual(response.status, 503);
     assert.strictEqual(requests.length, 1, "POST must not be blindly retried");
+  }
+
+  {
+    const { PluginClass, requests, responses } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    plugin.ensureAccessToken = async () => {};
+    responses.push(
+      new Error("offline"),
+      { status: 200, text: "{}", json: {}, arrayBuffer: new ArrayBuffer(0), headers: {} }
+    );
+    const response = await plugin.driveFetch("https://example.test/read");
+    assert.strictEqual(response.status, 200);
+    assert.strictEqual(requests.length, 2, "idempotent reads should retry transient network failures");
+  }
+
+  {
+    const { PluginClass, requests, responses } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    plugin.ensureAccessToken = async () => {};
+    responses.push(new Error("offline"));
+    await assert.rejects(
+      () => plugin.driveFetch("https://example.test/create", { method: "POST" }),
+      (error) => error.code === "DRIVEBRIDGE_NETWORK_ERROR"
+    );
+    assert.strictEqual(requests.length, 1, "ambiguous POST must be reconciled by its caller, not blindly retried");
   }
 
   {
@@ -287,6 +553,24 @@ async function run() {
     await plugin.writePluginDataFileAtomic("large-test.json", "large-test.previous.json", largeJson);
     assert.strictEqual(largeReadAttempts, 2);
     assert.strictEqual(files.get(plugin.pluginDataPath("large-test.json")), largeJson);
+
+    readTransform = (value) => value;
+    const operationJournal1 = {
+      version: 2,
+      runId: "journal-run",
+      status: "running",
+      operations: {
+        "note.md": { path: "note.md", action: "upload", status: "pending" }
+      }
+    };
+    const operationJournal2 = JSON.parse(JSON.stringify(operationJournal1));
+    operationJournal2.status = "commit_pending";
+    await plugin.writeOperationJournal(operationJournal1);
+    await plugin.writeOperationJournal(operationJournal2);
+    assert.strictEqual((await plugin.readOperationJournal()).status, "commit_pending");
+    files.set(plugin.pluginDataPath("operation-journal.json"), "{");
+    assert.strictEqual((await plugin.readOperationJournal()).status, "running",
+      "a corrupted operation journal must fall back to its atomic previous generation");
 
     const savedBeforeMismatch = files.get(plugin.pluginDataPath("snapshot.json"));
     readTransform = (value, target) => target.endsWith(".tmp") ? "{\"different\":true}" : value;

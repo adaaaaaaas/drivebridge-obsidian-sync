@@ -2,6 +2,7 @@
 
 ## Latest change
 
+- 0.5.4: Makes new-file uploads recoverable with batched pre-generated Drive IDs and an atomic operation journal. Lost POST responses are reconciled by ID instead of re-uploading, legacy duplicate errors are reconciled by exact path and checksum during Recovery, and shared remote snapshot changes are merged only when its generation changed. Unchanged syncs now skip the remote snapshot query/write entirely; per-file GETs and extra hashes remain failure/Recovery-only. The sync summary reports Drive request and snapshot-write counters.
 - 0.5.3: Recovers a corrupted local review queue or snapshot from its verified previous-generation backup, quarantines the damaged primary on the next successful save without replacing the known-good backup, and still stops if neither copy validates.
 - 0.5.2: Compacts internal snapshot JSON and retries only transient atomic read-back mismatches, preventing large snapshots from failing on an immediate partial read while preserving corruption checks.
 - 0.5.1: Prevents atomic JSON verification from falsely failing on harmless BOM, line-ending, or formatting differences while still rejecting changed or invalid content.
@@ -50,6 +51,15 @@
 - DriveBridge rechecks both sides immediately before applying a review choice. A stale choice is rejected instead of overwriting newer content.
 - On iPhone/iPad, the review and settings layouts stack vertically with full-width touch controls; no desktop-only right-click or hover action is required.
 - Large ambiguous files are queued without automatic full-content hashing, keeping normal mobile sync lightweight.
+
+## Recovery and performance behavior (0.5.4)
+
+- New file IDs are reserved in batches of up to 1000 and written to `operation-journal.json` before any upload mutation.
+- A normal successful upload has no follow-up GET and no extra local MD5 pass. Targeted ID/path lookup and hashing run only after an ambiguous network result or during Recovery.
+- A no-change sync does not query or rewrite `remote_snapshot.json` at commit time.
+- If another device changed `remote_snapshot.json` after this device scanned it, DriveBridge downloads that latest snapshot and merges only this run's verified path mutations. A same-path concurrent edit stops for Recovery/manual review.
+- The local `snapshot.json` is committed after the shared remote snapshot. `commit_pending` and failed journals are recoverable after a crash or network disconnect.
+- Update DriveBridge on every device before resuming multi-device sync. After a device has observed protocol v2, a later v1 snapshot is treated as an older-client downgrade and sync stops instead of overwriting it.
 
 DriveBridge for Obsidian は、iCloud Drive を使わずに Obsidian vault と Google Drive を同期するためのコミュニティプラグインです。iPhone/iPad の Obsidian モバイルでも動くように、OS のローカル同期フォルダではなく Obsidian Vault API と Google Drive API を使います。
 

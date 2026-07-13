@@ -56,6 +56,7 @@ const DEFAULT_SETTINGS = {
   recoveryPlanPreviewSafe: false,
   lastSyncAt: 0,
   lastRemoteSnapshotAt: 0,
+  remoteSnapshotProtocolVersion: 0,
   lastSyncHadErrors: false,
   duplicateGuardRootChanged: false,
   duplicateGuardAfterRebuild: false,
@@ -76,12 +77,14 @@ const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
 const SNAPSHOT_FILE = "snapshot.json";
 const JOURNAL_FILE = "sync-journal.json";
 const OPERATION_JOURNAL_FILE = "operation-journal.json";
+const OPERATION_JOURNAL_BACKUP_FILE = "operation-journal.previous.json";
 const REMOTE_SNAPSHOT_FILE = "remote_snapshot.json";
 const REVIEW_QUEUE_FILE = "review-queue.json";
 const SNAPSHOT_BACKUP_FILE = "snapshot.previous.json";
 const REVIEW_QUEUE_BACKUP_FILE = "review-queue.previous.json";
 const REMOTE_DELETE_TOMBSTONE_RETENTION_MS = 20 * 24 * 60 * 60 * 1000;
 const MAX_RETRY_ATTEMPTS = 4;
+const DRIVE_ID_BATCH_SIZE = 1000;
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 const LOCAL_HASH_MAX_BYTES = 10 * 1024 * 1024;
 const LARGE_BINARY_CONFLICT_BYTES = 10 * 1024 * 1024;
@@ -267,6 +270,14 @@ module.exports = class DriveBridgePlugin extends Plugin {
     this.skipChangedFilesDuringSync = true;
     this.folderCache = new Map();
     this.remoteChildCache = new Map();
+    this.syncMetrics = {
+      driveRequests: 0,
+      idReservationRequests: 0,
+      recoveryLookups: 0,
+      remoteSnapshotWrites: 0,
+      remoteSnapshotWriteSkipped: 0,
+      remoteSnapshotConflictMerges: 0
+    };
     const started = Date.now();
     try {
       const recovery = await this.checkInterruptedSync();
@@ -289,6 +300,9 @@ module.exports = class DriveBridgePlugin extends Plugin {
         new Notice(dryRun ? "DriveBridge preview started." : "DriveBridge sync started. Avoid editing notes until it completes.");
       }
       const context = await this.buildSyncContext();
+      if (recoveryResume) {
+        await this.reconcileRecoveryContext(recovery, context);
+      }
       const plan = await this.buildSyncPlan(context);
       context.planDigest = planDigest(plan, context);
       context.newUploadParentPathCounts = this.newUploadParentPathCounts(plan, context);
@@ -332,21 +346,41 @@ module.exports = class DriveBridgePlugin extends Plugin {
         this.assertResumePlanSafe(plan);
       }
       await this.writeJournal({ startedAt: new Date().toISOString(), dryRun, plan });
-      const runId = `${formatTimestamp(new Date(started))}-${randomId(6)}`;
-      await this.initializeOperationJournal(runId, plan, context);
+      const hasOperationWork = recoveryResume || plan.entries.some((entry) => this.shouldJournalOperation(entry));
+      const runId = hasOperationWork
+        ? (recoveryResume && recovery.runId
+          ? recovery.runId
+          : `${formatTimestamp(new Date(started))}-${randomId(6)}`)
+        : "";
+      if (hasOperationWork) {
+        await this.prepareOperationJournal(runId, plan, context, recoveryResume ? recovery.journal : null);
+      }
       const resumeDonePaths = recoveryResume ? this.recoveryDonePaths(recovery) : new Set();
       const executed = await this.executePlan(context, plan, runId, { skipDonePaths: resumeDonePaths });
-      await this.saveSnapshot(executed.nextSnapshot);
+      if (hasOperationWork) {
+        await this.markOperationJournalCommitPending(runId, executed);
+      }
       if (!dryRun) {
-        await this.saveRemoteSnapshot(
+        const remoteSnapshotResult = await this.saveRemoteSnapshot(
           context.rootFolderId,
-          context.remote,
+          context.remoteBase || context.remote,
           context.remoteDeleted,
-          executed.remoteDeleted,
-          Object.assign({}, executed.remoteMutations, executed.remoteSnapshotUpdates)
+          Object.assign({}, context.recoveredRemoteDeleted || {}, executed.remoteDeleted),
+          Object.assign({}, context.recoveredRemoteMutations || {}, executed.remoteMutations, executed.remoteSnapshotUpdates),
+          {
+            runId,
+            expectedSnapshotFileId: context.remoteSnapshotFileId || "",
+            expectedSnapshotModifiedTime: context.remoteSnapshotModifiedTime || "",
+            forceWrite: Boolean(context.remoteSnapshotMissing)
+          }
         );
+        if (hasOperationWork) {
+          await this.updateOperationJournalSnapshotCommit(runId, remoteSnapshotResult);
+        }
+        await this.saveSnapshot(executed.nextSnapshot);
         await this.reconcileReviewQueue(plan, executed.reviewItems);
       }
+      executed.performance = Object.assign({}, this.syncMetrics);
       await this.writeJournal({
         startedAt: new Date(started).toISOString(),
         finishedAt: new Date().toISOString(),
@@ -354,9 +388,12 @@ module.exports = class DriveBridgePlugin extends Plugin {
         stats: executed.stats,
         errors: executed.errors,
         skippedChanged: executed.skippedChanged,
-        skippedSafe: executed.skippedSafe
+        skippedSafe: executed.skippedSafe,
+        performance: executed.performance
       });
-      await this.markOperationJournalComplete(runId, executed);
+      if (hasOperationWork) {
+        await this.markOperationJournalComplete(runId, executed);
+      }
       this.settings.allowFirstRealSync = false;
       this.settings.approvedFirstSyncDigest = "";
       this.settings.allowLargeDeleteOnce = false;
@@ -439,6 +476,8 @@ module.exports = class DriveBridgePlugin extends Plugin {
       remote: remoteState.files,
       remoteDeleted: remoteState.deleted,
       remoteSnapshotAt: remoteState.snapshotAt || 0,
+      remoteSnapshotFileId: remoteState.snapshotFileId || "",
+      remoteSnapshotModifiedTime: remoteState.snapshotModifiedTime || "",
       remoteSnapshotFromFullScan: Boolean(remoteState.fromFullScan),
       remoteSnapshotMissing: Boolean(remoteState.snapshotMissing)
     };
@@ -927,8 +966,13 @@ module.exports = class DriveBridgePlugin extends Plugin {
       const entryBytes = this.progressBytesForEntry(entry, context);
       try {
         await this.updateOperation(runId, entry, "in_progress", context);
-        await this.executeEntry(entry, context, nextSnapshot, stats, remoteDeleted, remoteMutations, reviewItems);
-        await this.updateOperation(runId, entry, "done", context);
+        await this.executeEntry(entry, context, nextSnapshot, stats, remoteDeleted, remoteMutations, reviewItems, runId);
+        await this.updateOperation(runId, entry, "done", context, null, {
+          phase: "remote_verified",
+          remoteResult: Object.prototype.hasOwnProperty.call(remoteMutations, entry.path)
+            ? remoteMutations[entry.path]
+            : undefined
+        });
       } catch (err) {
         if (this.shouldSkipChangedDuringSync(err)) {
           skippedChanged.push(this.skipRecord(entry, err));
@@ -1036,7 +1080,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     });
   }
 
-  async executeEntry(entry, context, nextSnapshot, stats, remoteDeleted, remoteMutations, reviewItems) {
+  async executeEntry(entry, context, nextSnapshot, stats, remoteDeleted, remoteMutations, reviewItems, runId = "") {
     const path = entry.path;
     const localItem = context.local[path];
     const remoteItem = context.remote[path];
@@ -1071,7 +1115,14 @@ module.exports = class DriveBridgePlugin extends Plugin {
       }
       const uploadStartLocal = await this.localInfoByPath(path);
       const uploaded = await this.uploadLocalFile(path, context.rootFolderId, remoteItem, {
-        duplicateGuard: this.shouldUseDuplicateGuard(context, entry, remoteItem)
+        duplicateGuard: this.shouldUseDuplicateGuard(context, entry, remoteItem),
+        reservedRemoteId: this.reservedRemoteIdForOperation(runId, path),
+        operationId: this.operationIdForPath(runId, path),
+        onPrepared: async (prepared) => {
+          await this.updateOperation(runId, entry, "in_progress", context, null, Object.assign({
+            phase: "request_sent"
+          }, prepared));
+        }
       });
       const localAfter = await this.localInfoByPath(path);
       if (!sameLocalStrict(uploadStartLocal, localAfter)) {
@@ -1236,19 +1287,40 @@ module.exports = class DriveBridgePlugin extends Plugin {
     await this.ensureAccessToken();
     const headers = new Headers(options.headers || {});
     headers.set("Authorization", `Bearer ${this.settings.accessToken}`);
-    const res = await customFetch(url, Object.assign({}, options, { headers }));
+    const method = String(options.method || "GET").toUpperCase();
+    const retrySafe = method !== "POST";
+    let res;
+    try {
+      if (this.syncMetrics) {
+        this.syncMetrics.driveRequests++;
+      }
+      res = await customFetch(url, Object.assign({}, options, { headers }));
+    } catch (cause) {
+      if (retrySafe && attempt < MAX_RETRY_ATTEMPTS) {
+        await sleep(this.retryDelayMs(attempt));
+        return this.driveFetch(url, options, attempt + 1);
+      }
+      const error = new Error(`Google Drive network request failed (${method}): ${cause && cause.message ? cause.message : String(cause)}`);
+      error.code = "DRIVEBRIDGE_NETWORK_ERROR";
+      error.method = method;
+      error.cause = cause;
+      throw error;
+    }
     if (res.status === 401 && this.settings.refreshToken && attempt === 1) {
       this.settings.tokenExpiresAt = 0;
       await this.ensureAccessToken();
       return this.driveFetch(url, options, attempt + 1);
     }
-    const method = String(options.method || "GET").toUpperCase();
-    const retrySafe = method !== "POST";
     if (retrySafe && RETRYABLE_STATUS.has(res.status) && attempt < MAX_RETRY_ATTEMPTS) {
-      await sleep(500 * Math.pow(2, attempt - 1));
+      await sleep(this.retryDelayMs(attempt));
       return this.driveFetch(url, options, attempt + 1);
     }
     return res;
+  }
+
+  retryDelayMs(attempt) {
+    const base = 500 * Math.pow(2, Math.max(0, attempt - 1));
+    return Math.round(base * (0.8 + Math.random() * 0.4));
   }
 
   async ensureRootFolder() {
@@ -1272,14 +1344,26 @@ module.exports = class DriveBridgePlugin extends Plugin {
       await this.saveSettings();
       return this.settings.rootFolderId;
     }
-    const created = await parseJsonResponse(await this.driveFetch(`${DRIVE_API}/files?fields=id,name`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name,
-        mimeType: "application/vnd.google-apps.folder"
-      })
-    }));
+    let created;
+    try {
+      created = await parseJsonResponse(await this.driveFetch(`${DRIVE_API}/files?fields=id,name`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name,
+          mimeType: "application/vnd.google-apps.folder"
+        })
+      }));
+    } catch (err) {
+      if (!this.isAmbiguousCreateError(err)) {
+        throw err;
+      }
+      const reconciled = await parseJsonResponse(await this.driveFetch(`${DRIVE_API}/files?${params}`));
+      if (!reconciled.files || reconciled.files.length !== 1) {
+        throw err;
+      }
+      created = reconciled.files[0];
+    }
     this.settings.rootFolderId = created.id;
     this.settings.duplicateGuardRootChanged = true;
     await this.saveSettings();
@@ -1341,17 +1425,39 @@ module.exports = class DriveBridgePlugin extends Plugin {
         if (res.ok) {
           const content = await res.text();
           const parsed = JSON.parse(content);
+          const protocolVersion = Number(parsed && parsed.version || 1);
+          if (protocolVersion > 2) {
+            const error = new Error(`Unsupported ${REMOTE_SNAPSHOT_FILE} protocol version ${protocolVersion}. Update DriveBridge before syncing.`);
+            error.code = "DRIVEBRIDGE_REMOTE_SNAPSHOT_VERSION";
+            throw error;
+          }
+          if (Number(this.settings.remoteSnapshotProtocolVersion || 0) >= 2 && protocolVersion < 2) {
+            const error = new Error(`${REMOTE_SNAPSHOT_FILE} was downgraded by an older DriveBridge device. Update all devices, then rebuild the remote snapshot.`);
+            error.code = "DRIVEBRIDGE_REMOTE_SNAPSHOT_DOWNGRADE";
+            throw error;
+          }
+          if (protocolVersion >= 2 && Number(this.settings.remoteSnapshotProtocolVersion || 0) < 2) {
+            this.settings.remoteSnapshotProtocolVersion = 2;
+            await this.saveSettings();
+          }
           this.settings.lastRemoteSnapshotAt = Date.parse(data.files[0].modifiedTime || "") || Date.now();
           const normalized = normalizeRemoteState(parsed);
           normalized.snapshotAt = Date.parse(parsed && parsed.generatedAt || "") ||
             Date.parse(data.files[0].modifiedTime || "") ||
             0;
+          normalized.snapshotFileId = snapId;
+          normalized.snapshotModifiedTime = data.files[0].modifiedTime || "";
+          normalized.snapshotCommitId = parsed && parsed.commitId || "";
           normalized.fromFullScan = false;
           normalized.snapshotMissing = false;
           return normalized;
         }
       }
     } catch (err) {
+      if (err && (err.code === "DRIVEBRIDGE_REMOTE_SNAPSHOT_VERSION" ||
+          err.code === "DRIVEBRIDGE_REMOTE_SNAPSHOT_DOWNGRADE")) {
+        throw err;
+      }
       console.warn(`[drivebridge-obsidian-sync] Failed to load ${REMOTE_SNAPSHOT_FILE}, falling back to full scan`, err);
     }
     return null;
@@ -1419,17 +1525,67 @@ module.exports = class DriveBridgePlugin extends Plugin {
         await this.ensureNoRemoteNameCollision(parentId, metadata.name, parentPath(path));
       }
       metadata.parents = [parentId];
+      if (options.reservedRemoteId) {
+        metadata.id = options.reservedRemoteId;
+      }
+      if (options.operationId) {
+        metadata.appProperties = { drivebridgeOperationId: options.operationId };
+      }
+    }
+    if (options.onPrepared) {
+      await options.onPrepared({
+        reservedRemoteId: options.reservedRemoteId || "",
+        expectedName: metadata.name,
+        expectedParentId: parentId,
+        expectedSize: Number(localItem.size || 0)
+      });
     }
     const boundary = `drivebridge-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const body = makeMultipartBody(boundary, metadata, data, getMimeType(path));
     const url = existingRemote
       ? `${DRIVE_UPLOAD_API}/files/${existingRemote.id}?uploadType=multipart&fields=id,name,size,modifiedTime,md5Checksum`
       : `${DRIVE_UPLOAD_API}/files?uploadType=multipart&fields=id,name,size,modifiedTime,md5Checksum`;
-    const uploaded = await parseJsonResponse(await this.driveFetch(url, {
+    const request = async () => parseJsonResponse(await this.driveFetch(url, {
       method: existingRemote ? "PATCH" : "POST",
       headers: { "Content-Type": `multipart/related; boundary=${boundary}` },
       body
     }));
+    let uploaded;
+    try {
+      uploaded = await request();
+    } catch (err) {
+      if (existingRemote || !options.reservedRemoteId || !this.isAmbiguousCreateError(err)) {
+        throw err;
+      }
+      const expectedMd5 = md5Hex(data);
+      uploaded = await this.reconcileReservedUpload(path, options.reservedRemoteId, {
+        name: metadata.name,
+        parentId,
+        size: Number(localItem.size || 0),
+        md5Checksum: expectedMd5
+      });
+      if (!uploaded && (err.code === "DRIVEBRIDGE_NETWORK_ERROR" || RETRYABLE_STATUS.has(err.status))) {
+        try {
+          uploaded = await request();
+        } catch (retryError) {
+          if (!this.isAmbiguousCreateError(retryError)) {
+            throw retryError;
+          }
+          uploaded = await this.reconcileReservedUpload(path, options.reservedRemoteId, {
+            name: metadata.name,
+            parentId,
+            size: Number(localItem.size || 0),
+            md5Checksum: expectedMd5
+          });
+          if (!uploaded) {
+            throw retryError;
+          }
+        }
+      }
+      if (!uploaded) {
+        throw err;
+      }
+    }
     return {
       id: uploaded.id,
       path,
@@ -1438,6 +1594,55 @@ module.exports = class DriveBridgePlugin extends Plugin {
       md5Checksum: uploaded.md5Checksum || "",
       parentId: existingRemote && existingRemote.parentId ? existingRemote.parentId : parentId
     };
+  }
+
+  isAmbiguousCreateError(err) {
+    return Boolean(err && (
+      err.code === "DRIVEBRIDGE_NETWORK_ERROR" ||
+      err.status === 409 ||
+      RETRYABLE_STATUS.has(err.status)
+    ));
+  }
+
+  async reconcileReservedUpload(path, reservedRemoteId, expected) {
+    const remote = await this.remoteInfoById(path, reservedRemoteId);
+    if (!remote) {
+      return null;
+    }
+    const matches = remote.name === expected.name &&
+      remote.parentId === expected.parentId &&
+      Number(remote.size || 0) === Number(expected.size || 0) &&
+      Boolean(remote.md5Checksum) &&
+      remote.md5Checksum.toLowerCase() === expected.md5Checksum.toLowerCase();
+    if (!matches) {
+      const error = new Error(`Reserved Google Drive ID exists but does not match the planned upload: ${path}`);
+      error.code = "DRIVEBRIDGE_RESERVED_ID_MISMATCH";
+      throw error;
+    }
+    return remote;
+  }
+
+  async reserveDriveIds(count) {
+    const ids = [];
+    let remaining = Math.max(0, Number(count) || 0);
+    while (remaining > 0) {
+      const batchSize = Math.min(DRIVE_ID_BATCH_SIZE, remaining);
+      const params = new URLSearchParams({
+        count: String(batchSize),
+        space: "drive",
+        type: "files"
+      });
+      const data = await parseJsonResponse(await this.driveFetch(`${DRIVE_API}/files/generateIds?${params}`));
+      if (this.syncMetrics) {
+        this.syncMetrics.idReservationRequests++;
+      }
+      if (!Array.isArray(data.ids) || data.ids.length !== batchSize) {
+        throw new Error(`Google Drive returned ${Array.isArray(data.ids) ? data.ids.length : 0} reserved IDs; expected ${batchSize}.`);
+      }
+      ids.push(...data.ids);
+      remaining -= batchSize;
+    }
+    return ids;
   }
 
   async ensureNoRemoteNameCollision(parentId, name, folderPath) {
@@ -1538,17 +1743,66 @@ module.exports = class DriveBridgePlugin extends Plugin {
     return data.files && data.files.length ? data.files[0] : null;
   }
 
+  async findRemoteParentReadOnly(path, rootFolderId) {
+    const parts = path.split("/").slice(0, -1);
+    let parentId = rootFolderId;
+    for (const part of parts) {
+      const cacheKey = `${parentId}/${part}`;
+      if (this.folderCache.has(cacheKey)) {
+        parentId = this.folderCache.get(cacheKey);
+        continue;
+      }
+      const folder = await this.findRemoteFolder(parentId, part);
+      if (!folder) {
+        return null;
+      }
+      parentId = folder.id;
+      this.folderCache.set(cacheKey, parentId);
+    }
+    return parentId;
+  }
+
+  async findRemoteFileByExactName(path, rootFolderId) {
+    const parentId = await this.findRemoteParentReadOnly(path, rootFolderId);
+    if (!parentId) {
+      return null;
+    }
+    const params = new URLSearchParams({
+      q: `'${parentId}' in parents and name='${escapeDriveQuery(basename(path))}' and trashed=false`,
+      fields: "files(id,name,size,modifiedTime,md5Checksum,parents,mimeType,trashed)",
+      spaces: "drive"
+    });
+    const data = await parseJsonResponse(await this.driveFetch(`${DRIVE_API}/files?${params}`));
+    const files = (data.files || []).filter((file) =>
+      !String(file.mimeType || "").startsWith("application/vnd.google-apps.")
+    );
+    if (files.length > 1) {
+      throw new Error(`Multiple Google Drive files named "${basename(path)}" exist under "${parentPath(path) || "/"}". Rename duplicates before recovery.`);
+    }
+    return files.length ? remoteInfo(path, files[0]) : null;
+  }
+
   async createRemoteFolder(parentId, name) {
-    const data = await parseJsonResponse(await this.driveFetch(`${DRIVE_API}/files?fields=id,name`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name,
-        parents: [parentId],
-        mimeType: "application/vnd.google-apps.folder"
-      })
-    }));
-    return data.id;
+    try {
+      const data = await parseJsonResponse(await this.driveFetch(`${DRIVE_API}/files?fields=id,name`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name,
+          parents: [parentId],
+          mimeType: "application/vnd.google-apps.folder"
+        })
+      }));
+      return data.id;
+    } catch (err) {
+      if (this.isAmbiguousCreateError(err)) {
+        const reconciled = await this.findRemoteFolder(parentId, name);
+        if (reconciled) {
+          return reconciled.id;
+        }
+      }
+      throw err;
+    }
   }
 
   async downloadRemoteFile(path, remoteItem, options = {}) {
@@ -1665,28 +1919,31 @@ module.exports = class DriveBridgePlugin extends Plugin {
     }
   }
 
-  async uploadTextContent(filename, rootFolderId, content, existingId) {
+  async uploadTextContent(filename, rootFolderId, content, existingId, options = {}) {
     const boundary = `drivebridge-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const metadata = { name: filename, mimeType: "application/json" };
     if (!existingId) {
       metadata.parents = [rootFolderId];
+    }
+    if (options.commitId) {
+      metadata.appProperties = { drivebridgeCommitId: options.commitId };
     }
     let bodyText = `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n`;
     bodyText += `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${content}\r\n`;
     bodyText += `--${boundary}--\r\n`;
 
     const url = existingId
-      ? `${DRIVE_UPLOAD_API}/files/${existingId}?uploadType=multipart&fields=id,name`
-      : `${DRIVE_UPLOAD_API}/files?uploadType=multipart&fields=id,name`;
+      ? `${DRIVE_UPLOAD_API}/files/${existingId}?uploadType=multipart&fields=id,name,modifiedTime,appProperties`
+      : `${DRIVE_UPLOAD_API}/files?uploadType=multipart&fields=id,name,modifiedTime,appProperties`;
     const res = await parseJsonResponse(await this.driveFetch(url, {
       method: existingId ? "PATCH" : "POST",
       headers: { "Content-Type": `multipart/related; boundary=${boundary}` },
       body: bodyText
     }));
-    return res.id;
+    return res;
   }
 
-  async saveRemoteSnapshot(rootFolderId, currentRemote, previousDeleted = {}, newDeleted = {}, remoteSnapshotUpdates = {}) {
+  async saveRemoteSnapshot(rootFolderId, currentRemote, previousDeleted = {}, newDeleted = {}, remoteSnapshotUpdates = {}, options = {}) {
     const remoteState = Object.assign({}, currentRemote || {});
     for (const [path, remote] of Object.entries(remoteSnapshotUpdates || {})) {
       if (remote) {
@@ -1696,20 +1953,25 @@ module.exports = class DriveBridgePlugin extends Plugin {
       }
     }
     const deleted = this.mergeRemoteDeleteTombstones(previousDeleted, newDeleted, remoteState);
-    await this.writeRemoteSnapshotFile(rootFolderId, remoteState, deleted);
+    if (!options.forceWrite &&
+        canonicalJsonString(currentRemote || {}) === canonicalJsonString(remoteState) &&
+        canonicalJsonString(previousDeleted || {}) === canonicalJsonString(deleted)) {
+      if (this.syncMetrics) {
+        this.syncMetrics.remoteSnapshotWriteSkipped++;
+      }
+      return { written: false, mergedConflict: false };
+    }
+    return this.writeRemoteSnapshotFile(rootFolderId, remoteState, deleted, Object.assign({}, options, {
+      baseFiles: currentRemote || {},
+      mutations: remoteSnapshotUpdates || {},
+      newDeleted: newDeleted || {}
+    }));
   }
 
-  async writeRemoteSnapshotFile(rootFolderId, files, deleted = {}) {
-    const content = JSON.stringify({
-      version: 1,
-      generatedAt: new Date().toISOString(),
-      files,
-      deleted
-    }, null, 2);
-
+  async writeRemoteSnapshotFile(rootFolderId, files, deleted = {}, options = {}) {
     const params = new URLSearchParams({
       q: `'${rootFolderId}' in parents and name='${REMOTE_SNAPSHOT_FILE}' and trashed=false`,
-      fields: "files(id)",
+      fields: "files(id,modifiedTime,appProperties)",
       orderBy: "modifiedTime desc",
       spaces: "drive"
     });
@@ -1717,9 +1979,124 @@ module.exports = class DriveBridgePlugin extends Plugin {
     if (data.files && data.files.length > 1) {
       console.warn(`[drivebridge-obsidian-sync] Multiple ${REMOTE_SNAPSHOT_FILE} files exist; updating the newest visible file.`);
     }
-    const existingId = data.files && data.files.length ? data.files[0].id : null;
-    await this.uploadTextContent(REMOTE_SNAPSHOT_FILE, rootFolderId, content, existingId);
+    const existing = data.files && data.files.length ? data.files[0] : null;
+    const existingId = existing ? existing.id : null;
+    let mergedConflict = false;
+    if (existing && options.expectedSnapshotFileId &&
+        (existing.id !== options.expectedSnapshotFileId ||
+         existing.modifiedTime !== options.expectedSnapshotModifiedTime)) {
+      const latest = await this.loadRemoteSnapshotById(existing.id, existing.modifiedTime);
+      files = this.mergeRemoteSnapshotMutationSet(options.baseFiles || {}, latest.files, options.mutations || {});
+      deleted = this.mergeRemoteDeleteTombstones(latest.deleted || {}, options.newDeleted || {}, files);
+      mergedConflict = true;
+    }
+    const commitId = `${options.runId || "rebuild"}-${randomId(8)}`;
+    const content = JSON.stringify({
+      version: 2,
+      commitId,
+      generatedAt: new Date().toISOString(),
+      files,
+      deleted
+    });
+    let uploaded;
+    try {
+      uploaded = await this.uploadTextContent(REMOTE_SNAPSHOT_FILE, rootFolderId, content, existingId, { commitId });
+    } catch (err) {
+      if (!this.isAmbiguousCreateError(err)) {
+        throw err;
+      }
+      uploaded = await this.reconcileRemoteSnapshotCommit(rootFolderId, commitId);
+      if (!uploaded) {
+        throw err;
+      }
+    }
+    if (mergedConflict) {
+      const verified = await this.reconcileRemoteSnapshotCommit(rootFolderId, commitId);
+      if (!verified) {
+        const error = new Error(`Concurrent ${REMOTE_SNAPSHOT_FILE} writer replaced the merged commit. Run Recovery to merge again.`);
+        error.code = "DRIVEBRIDGE_REMOTE_SNAPSHOT_REPLACED";
+        throw error;
+      }
+      uploaded = Object.assign({}, uploaded, verified);
+    }
+    this.settings.remoteSnapshotProtocolVersion = 2;
+    if (this.syncMetrics) {
+      this.syncMetrics.remoteSnapshotWrites++;
+      if (mergedConflict) {
+        this.syncMetrics.remoteSnapshotConflictMerges++;
+      }
+    }
     this.settings.lastRemoteSnapshotAt = Date.now();
+    return {
+      written: true,
+      mergedConflict,
+      fileId: uploaded.id || existingId || "",
+      modifiedTime: uploaded.modifiedTime || "",
+      commitId
+    };
+  }
+
+  async reconcileRemoteSnapshotCommit(rootFolderId, commitId) {
+    const params = new URLSearchParams({
+      q: `'${rootFolderId}' in parents and name='${REMOTE_SNAPSHOT_FILE}' and trashed=false`,
+      fields: "files(id,modifiedTime,appProperties)",
+      orderBy: "modifiedTime desc",
+      spaces: "drive"
+    });
+    const data = await parseJsonResponse(await this.driveFetch(`${DRIVE_API}/files?${params}`));
+    for (const file of data.files || []) {
+      if (file.appProperties && file.appProperties.drivebridgeCommitId === commitId) {
+        return file;
+      }
+      try {
+        const res = await this.driveFetch(`${DRIVE_API}/files/${file.id}?alt=media`);
+        if (res.ok) {
+          const parsed = JSON.parse(await res.text());
+          if (parsed && parsed.commitId === commitId) {
+            return file;
+          }
+        }
+      } catch (readError) {
+        console.warn(`[drivebridge-obsidian-sync] Could not verify ambiguous ${REMOTE_SNAPSHOT_FILE} commit`, readError);
+      }
+    }
+    return null;
+  }
+
+  async loadRemoteSnapshotById(fileId, modifiedTime = "") {
+    const res = await this.driveFetch(`${DRIVE_API}/files/${fileId}?alt=media`);
+    if (!res.ok) {
+      await parseJsonResponse(res);
+    }
+    const parsed = JSON.parse(await res.text());
+    const normalized = normalizeRemoteState(parsed);
+    normalized.snapshotFileId = fileId;
+    normalized.snapshotModifiedTime = modifiedTime;
+    return normalized;
+  }
+
+  mergeRemoteSnapshotMutationSet(baseFiles, latestFiles, mutations) {
+    const merged = Object.assign({}, latestFiles || {});
+    for (const [path, mutation] of Object.entries(mutations || {})) {
+      const base = baseFiles && baseFiles[path] || null;
+      const latest = latestFiles && latestFiles[path] || null;
+      const latestUnchanged = (!base && !latest) ||
+        (base && latest && base.id === latest.id && sameRemoteContent(base, latest));
+      const alreadyApplied = mutation
+        ? latest && latest.id === mutation.id && sameRemoteContent(latest, mutation)
+        : !latest;
+      if (!latestUnchanged && !alreadyApplied) {
+        const error = new Error(`Concurrent remote snapshot change conflicts at ${path}. Recovery/manual review is required.`);
+        error.code = "DRIVEBRIDGE_REMOTE_SNAPSHOT_CONFLICT";
+        throw error;
+      }
+      if (mutation) {
+        merged[path] = mutation;
+      } else {
+        delete merged[path];
+      }
+    }
+    return merged;
   }
 
   async ensureLocalParent(path) {
@@ -1904,20 +2281,26 @@ module.exports = class DriveBridgePlugin extends Plugin {
   }
 
   async readOperationJournal() {
-    try {
-      const text = await this.app.vault.adapter.read(this.pluginDataPath(OPERATION_JOURNAL_FILE));
-      return JSON.parse(text);
-    } catch (err) {
-      return null;
-    }
+    return this.loadPluginDataJsonWithBackup(
+      OPERATION_JOURNAL_FILE,
+      OPERATION_JOURNAL_BACKUP_FILE,
+      null,
+      validateOperationJournal,
+      "Recovery journal could not be read."
+    );
   }
 
   async writeOperationJournal(journal) {
+    validateOperationJournal(journal);
     this.operationJournalCache = journal;
     this.operationJournalDirty = false;
     this.operationJournalDirtyCount = 0;
     this.operationJournalLastFlushAt = Date.now();
-    await this.writePluginDataFile(OPERATION_JOURNAL_FILE, JSON.stringify(journal, null, 2));
+    await this.writePluginDataFileAtomic(
+      OPERATION_JOURNAL_FILE,
+      OPERATION_JOURNAL_BACKUP_FILE,
+      JSON.stringify(journal)
+    );
   }
 
   markOperationJournalDirty() {
@@ -1945,36 +2328,83 @@ module.exports = class DriveBridgePlugin extends Plugin {
   }
 
   async initializeOperationJournal(runId, plan, context) {
+    return this.prepareOperationJournal(runId, plan, context, null);
+  }
+
+  async prepareOperationJournal(runId, plan, context, existingJournal = null) {
+    const previousOperations = existingJournal && existingJournal.runId === runId
+      ? existingJournal.operations || {}
+      : {};
+    const needsReservedId = plan.entries.filter((entry) => {
+      const previous = previousOperations[entry.path];
+      return this.shouldJournalOperation(entry) &&
+        entry.action === "upload" &&
+        !context.remote[entry.path] &&
+        !(previous && previous.reservedRemoteId);
+    });
+    const reservedIds = await this.reserveDriveIds(needsReservedId.length);
+    const reservedByPath = new Map(needsReservedId.map((entry, index) => [entry.path, reservedIds[index]]));
     const operations = {};
     for (const entry of plan.entries) {
       if (!this.shouldJournalOperation(entry)) {
         continue;
       }
-      operations[entry.path] = {
+      const previous = previousOperations[entry.path] && previousOperations[entry.path].action === entry.action
+        ? previousOperations[entry.path]
+        : null;
+      operations[entry.path] = Object.assign({}, previous || {}, {
         runId,
+        operationId: previous && previous.operationId
+          ? previous.operationId
+          : `${runId}-${randomId(8)}`,
         path: entry.path,
         action: entry.action,
-        status: "pending",
+        fromPath: entry.fromPath || (previous && previous.fromPath) || "",
+        status: previous && previous.status === "done" ? "done" : "pending",
+        phase: previous && previous.phase ? previous.phase : "prepared",
         reason: entry.reason || "",
         localBefore: context.local[entry.path] || null,
-        remoteBefore: context.remote[entry.path] || null,
+        remoteBefore: context.remote[entry.path] || (entry.fromPath ? context.remote[entry.fromPath] : null) || null,
+        reservedRemoteId: previous && previous.reservedRemoteId
+          ? previous.reservedRemoteId
+          : reservedByPath.get(entry.path) || "",
         tempPath: this.partialDownloadPath(entry.path),
-        startedAt: "",
-        completedAt: "",
-        error: null
-      };
+        startedAt: previous && previous.startedAt || "",
+        completedAt: previous && previous.completedAt || "",
+        error: previous && previous.error || null
+      });
     }
     await this.writeOperationJournal({
-      version: 1,
+      version: 2,
       runId,
-      startedAt: new Date().toISOString(),
+      startedAt: existingJournal && existingJournal.startedAt || new Date().toISOString(),
       completedAt: "",
       status: "running",
+      expectedRemoteSnapshot: {
+        fileId: context.remoteSnapshotFileId || "",
+        modifiedTime: context.remoteSnapshotModifiedTime || ""
+      },
       operations
     });
   }
 
-  async updateOperation(runId, entry, status, context, err) {
+  reservedRemoteIdForOperation(runId, path) {
+    const journal = this.operationJournalCache;
+    const operation = journal && journal.runId === runId && journal.operations
+      ? journal.operations[path]
+      : null;
+    return operation && operation.reservedRemoteId || "";
+  }
+
+  operationIdForPath(runId, path) {
+    const journal = this.operationJournalCache;
+    const operation = journal && journal.runId === runId && journal.operations
+      ? journal.operations[path]
+      : null;
+    return operation && operation.operationId || "";
+  }
+
+  async updateOperation(runId, entry, status, context, err, details = {}) {
     if (!runId || !entry || !entry.path) {
       return;
     }
@@ -1990,11 +2420,17 @@ module.exports = class DriveBridgePlugin extends Plugin {
       runId,
       path: entry.path,
       action: entry.action,
+      fromPath: entry.fromPath || "",
       localBefore: context.local[entry.path] || null,
-      remoteBefore: context.remote[entry.path] || null,
+      remoteBefore: context.remote[entry.path] || (entry.fromPath ? context.remote[entry.fromPath] : null) || null,
       tempPath: this.partialDownloadPath(entry.path)
     };
     current.status = status;
+    for (const [key, value] of Object.entries(details || {})) {
+      if (value !== undefined) {
+        current[key] = value;
+      }
+    }
     if (status === "in_progress") {
       current.startedAt = current.startedAt || new Date().toISOString();
     }
@@ -2007,6 +2443,8 @@ module.exports = class DriveBridgePlugin extends Plugin {
         code: err.code || "",
         time: new Date().toISOString()
       };
+    } else if (status === "done") {
+      current.error = null;
     }
     journal.operations[entry.path] = current;
     this.markOperationJournalDirty();
@@ -2025,7 +2463,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     this.operationJournalCache = journal;
     journal.completedAt = new Date().toISOString();
     journal.status = executed.errors.length
-      ? "completed_with_errors"
+      ? "recovery_required"
       : (executed.skippedChanged.length || executed.skippedSafe.length || executed.reviewItems.length)
         ? "completed_incomplete"
         : "completed";
@@ -2034,19 +2472,154 @@ module.exports = class DriveBridgePlugin extends Plugin {
     await this.flushOperationJournal(true);
   }
 
+  async markOperationJournalCommitPending(runId, executed) {
+    const journal = this.operationJournalCache || await this.readOperationJournal();
+    if (!journal || journal.runId !== runId) {
+      return;
+    }
+    this.operationJournalCache = journal;
+    journal.status = "commit_pending";
+    journal.commitPendingAt = new Date().toISOString();
+    journal.commitSummary = {
+      remoteMutationPaths: Object.keys(executed.remoteMutations || {}),
+      remoteSnapshotUpdatePaths: Object.keys(executed.remoteSnapshotUpdates || {}),
+      remoteDeletePaths: Object.keys(executed.remoteDeleted || {})
+    };
+    this.markOperationJournalDirty();
+    await this.flushOperationJournal(true);
+  }
+
+  async updateOperationJournalSnapshotCommit(runId, result) {
+    const journal = this.operationJournalCache || await this.readOperationJournal();
+    if (!journal || journal.runId !== runId) {
+      return;
+    }
+    this.operationJournalCache = journal;
+    journal.remoteSnapshotCommit = Object.assign({ committedAt: new Date().toISOString() }, result || {});
+    this.markOperationJournalDirty();
+    await this.flushOperationJournal(true);
+  }
+
   async checkInterruptedSync() {
     const journal = await this.readOperationJournal();
     const partials = await this.findPartialDownloads();
-    const inProgress = journal && journal.status === "running"
+    const recoveryStatuses = new Set(["running", "commit_pending", "recovery_required", "completed_with_errors"]);
+    const inProgress = journal && recoveryStatuses.has(journal.status)
       ? Object.values(journal.operations || {}).filter((operation) => operation.status === "in_progress")
       : [];
-    const journalRunning = Boolean(journal && journal.status === "running");
+    const journalRunning = Boolean(journal && recoveryStatuses.has(journal.status));
     return {
       interrupted: journalRunning || partials.length > 0,
       runId: journal && journal.runId ? journal.runId : "",
       journal,
       inProgress,
       partials
+    };
+  }
+
+  async reconcileRecoveryContext(recovery, context) {
+    const journal = recovery && recovery.journal;
+    if (!journal) {
+      return;
+    }
+    this.operationJournalCache = journal;
+    context.remoteBase = Object.assign({}, context.remote);
+    context.recoveredRemoteMutations = {};
+    context.recoveredRemoteDeleted = {};
+    for (const operation of Object.values(journal.operations || {})) {
+      if (!operation) {
+        continue;
+      }
+      if (operation.action === "deleteRemote") {
+        const plannedRemote = operation.remoteBefore || null;
+        if (!context.remote[operation.path] || !plannedRemote || !plannedRemote.id) {
+          continue;
+        }
+        if (this.syncMetrics) {
+          this.syncMetrics.recoveryLookups++;
+        }
+        const current = await this.remoteInfoById(operation.path, plannedRemote.id);
+        if (!current) {
+          delete context.remote[operation.path];
+          context.recoveredRemoteMutations[operation.path] = null;
+          context.recoveredRemoteDeleted[operation.path] = this.remoteDeleteTombstone(plannedRemote);
+          this.markRecoveredOperation(operation, null, true);
+        } else {
+          context.remote[operation.path] = current;
+        }
+        continue;
+      }
+      if (operation.action === "moveRemote") {
+        const fromPath = operation.fromPath || "";
+        const plannedRemote = operation.remoteBefore || null;
+        if (!fromPath || !plannedRemote || !plannedRemote.id ||
+            (context.remote[operation.path] && context.remote[operation.path].id === plannedRemote.id)) {
+          continue;
+        }
+        if (this.syncMetrics) {
+          this.syncMetrics.recoveryLookups++;
+        }
+        const current = await this.remoteInfoById(operation.path, plannedRemote.id);
+        const expectedParentId = await this.findRemoteParentReadOnly(operation.path, context.rootFolderId);
+        if (current && expectedParentId && current.name === basename(operation.path) && current.parentId === expectedParentId) {
+          delete context.remote[fromPath];
+          context.remote[operation.path] = current;
+          context.recoveredRemoteMutations[fromPath] = null;
+          context.recoveredRemoteMutations[operation.path] = current;
+          this.markRecoveredOperation(operation, current, true);
+        }
+        continue;
+      }
+      if (operation.action !== "upload") {
+        continue;
+      }
+      const knownRemote = context.remote[operation.path];
+      const knownId = operation.reservedRemoteId ||
+        (operation.remoteResult && operation.remoteResult.id) ||
+        (operation.remoteBefore && operation.remoteBefore.id) || "";
+      if (knownRemote && knownId && operation.remoteResult && knownRemote.id === knownId &&
+          sameRemoteContent(knownRemote, operation.remoteResult)) {
+        continue;
+      }
+      let remote = null;
+      if (this.syncMetrics) {
+        this.syncMetrics.recoveryLookups++;
+      }
+      if (knownId) {
+        remote = await this.remoteInfoById(operation.path, knownId);
+      } else {
+        remote = await this.findRemoteFileByExactName(operation.path, context.rootFolderId);
+      }
+      if (!remote) {
+        continue;
+      }
+      context.remote[operation.path] = remote;
+      context.recoveredRemoteMutations[operation.path] = remote;
+      let contentMatches = false;
+      if (await this.localPathExists(operation.path) && remote.md5Checksum) {
+        const currentLocal = await this.localInfoByPath(operation.path);
+        if (Number(currentLocal.size || 0) !== Number(remote.size || 0)) {
+          this.markRecoveredOperation(operation, remote, false);
+          continue;
+        }
+        const localMd5 = await this.localMd5ByPath(operation.path);
+        contentMatches = localMd5 === remote.md5Checksum.toLowerCase();
+      }
+      this.markRecoveredOperation(operation, remote, contentMatches);
+    }
+    this.markOperationJournalDirty();
+    await this.flushOperationJournal(true);
+  }
+
+  markRecoveredOperation(operation, remote, success) {
+    operation.remoteResult = remote;
+    operation.phase = success ? "remote_verified" : "review_required";
+    operation.status = success ? "done" : "failed";
+    operation.completedAt = success ? new Date().toISOString() : operation.completedAt || "";
+    operation.error = success ? null : {
+      message: "The observed Google Drive result differs from the planned operation and needs review.",
+      code: "DRIVEBRIDGE_RECOVERY_CONTENT_MISMATCH",
+      time: new Date().toISOString()
     };
   }
 
@@ -2186,7 +2759,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       }
     }
     const journal = await this.readOperationJournal();
-    if (journal && journal.status === "running") {
+    if (journal && ["running", "commit_pending", "recovery_required", "completed_with_errors"].includes(journal.status)) {
       journal.status = "discarded";
       journal.completedAt = new Date().toISOString();
       await this.writeOperationJournal(journal);
@@ -2762,6 +3335,16 @@ module.exports = class DriveBridgePlugin extends Plugin {
       `Skipped: ${executed.stats.skip}`,
       `Errors: ${executed.errors.length}`
     ];
+    if (executed.performance) {
+      lines.push(
+        `Drive API requests: ${executed.performance.driveRequests}`,
+        `Reserved-ID batch requests: ${executed.performance.idReservationRequests}`,
+        `Recovery-only lookups: ${executed.performance.recoveryLookups}`,
+        `Remote snapshot writes: ${executed.performance.remoteSnapshotWrites}`,
+        `Remote snapshot writes skipped: ${executed.performance.remoteSnapshotWriteSkipped}`,
+        `Remote snapshot conflict merges: ${executed.performance.remoteSnapshotConflictMerges}`
+      );
+    }
     if (executed.skippedChanged && executed.skippedChanged.length) {
       lines.push("", "Skipped because files changed before/during sync:", ...this.formatSkipLines(executed.skippedChanged, 20));
       lines.push("", `Full latest run details are saved in ${JOURNAL_FILE}.`);
@@ -3451,7 +4034,10 @@ async function parseJsonResponse(res) {
   }
   if (!res.ok) {
     const detail = data.error_description || (data.error && data.error.message) || data.error || res.statusText;
-    throw new Error(`HTTP ${res.status}: ${detail}`);
+    const error = new Error(`HTTP ${res.status}: ${detail}`);
+    error.status = res.status;
+    error.responseData = data;
+    throw error;
   }
   return data;
 }
@@ -3482,6 +4068,7 @@ function statsFromEntries(entries) {
 function remoteInfo(path, file) {
   return {
     id: file.id,
+    name: file.name || basename(path),
     path,
     size: Number(file.size || 0),
     modifiedTime: file.modifiedTime,
@@ -3553,6 +4140,21 @@ function validateSnapshot(snapshot) {
     }
     if (value.remote !== null && value.remote !== undefined && typeof value.remote !== "object") {
       throw new Error(`${SNAPSHOT_FILE} contains invalid remote metadata for ${path}.`);
+    }
+  }
+}
+
+function validateOperationJournal(journal) {
+  if (!journal || typeof journal !== "object" || Array.isArray(journal) ||
+      ![1, 2].includes(Number(journal.version)) ||
+      typeof journal.runId !== "string" || !journal.runId ||
+      !journal.operations || typeof journal.operations !== "object" || Array.isArray(journal.operations)) {
+    throw new Error(`${OPERATION_JOURNAL_FILE} has an unsupported format.`);
+  }
+  for (const [path, operation] of Object.entries(journal.operations)) {
+    if (!path || !operation || typeof operation !== "object" || Array.isArray(operation) ||
+        operation.path !== path || typeof operation.action !== "string") {
+      throw new Error(`${OPERATION_JOURNAL_FILE} contains an invalid operation for ${path || "(empty path)"}.`);
     }
   }
 }
