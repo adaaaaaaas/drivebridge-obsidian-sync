@@ -145,6 +145,8 @@ module.exports = class DriveBridgePlugin extends Plugin {
       await this.saveData(this.settings);
     }
     this.syncing = false;
+    this.activeOperation = "";
+    this.remoteIndexRepairPending = false;
     this.folderCache = new Map();
     this.progressModal = null;
     this.progressCloseTimer = null;
@@ -280,6 +282,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       return;
     }
     this.syncing = true;
+    this.activeOperation = "sync";
     this.syncUiQuiet = quiet;
     this.skipChangedFilesDuringSync = true;
     this.folderCache = new Map();
@@ -339,6 +342,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       }
 
       if (dryRun) {
+        await this.reconcileReviewQueue(plan, this.reviewItemsForPlan(plan, context));
         this.settings.lastPreviewDigest = context.planDigest;
         this.settings.lastSyncSummary = summary;
         await this.saveSettings();
@@ -474,9 +478,11 @@ module.exports = class DriveBridgePlugin extends Plugin {
       this.remoteChildCache = new Map();
       this.folderCache = new Map();
       this.syncing = false;
+      this.activeOperation = "";
       this.syncUiQuiet = false;
       this.skipChangedFilesDuringSync = false;
       this.clearSyncStatus();
+      this.startPendingRemoteIndexRepair();
     }
   }
 
@@ -515,11 +521,24 @@ module.exports = class DriveBridgePlugin extends Plugin {
 
   async rebuildRemoteSnapshotFromDrive() {
     if (this.syncing) {
-      new Notice("DriveBridge is already running.");
+      if (this.activeOperation === "repair") {
+        new Notice("DriveBridge remote index Repair is already running.");
+        return;
+      }
+      this.remoteIndexRepairPending = true;
+      this.showProgressModal([
+        "REPAIR REMOTE INDEX — QUEUED",
+        "A Normal/automatic sync is finishing first.",
+        "Repair will start automatically as soon as that operation releases DriveBridge.",
+        "Do not press Normal sync again. Keep Obsidian open."
+      ].join("\n"));
+      new Notice("DriveBridge Repair queued. It will start automatically after the current Normal sync finishes.", 12000);
       return;
     }
     const started = Date.now();
     this.syncing = true;
+    this.activeOperation = "repair";
+    this.remoteIndexRepairPending = false;
     try {
       this.updateSyncProgress({
         phase: "REPAIR REMOTE INDEX",
@@ -563,6 +582,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       console.error("[drivebridge-obsidian-sync]", err);
     } finally {
       this.syncing = false;
+      this.activeOperation = "";
       this.clearSyncStatus();
     }
   }
@@ -630,8 +650,18 @@ module.exports = class DriveBridgePlugin extends Plugin {
       return plan;
     } finally {
       this.syncing = false;
+      this.activeOperation = "";
       this.clearSyncStatus();
     }
+  }
+
+  startPendingRemoteIndexRepair() {
+    if (!this.remoteIndexRepairPending || this.syncing) return;
+    window.setTimeout(() => {
+      if (this.remoteIndexRepairPending && !this.syncing) {
+        this.rebuildRemoteSnapshotFromDrive();
+      }
+    }, 0);
   }
 
   async applyDuplicateRepairPlan() {
@@ -2610,6 +2640,16 @@ module.exports = class DriveBridgePlugin extends Plugin {
     };
   }
 
+  reviewItemsForPlan(plan, context) {
+    return (plan.entries || [])
+      .filter((entry) => entry.action === "conflict")
+      .map((entry) => this.reviewItemFrom(
+        entry,
+        context.local && context.local[entry.path] || null,
+        context.remote && context.remote[entry.path] || null
+      ));
+  }
+
   async reconcileReviewQueue(plan, reviewItems) {
     const existing = await this.loadReviewQueue();
     const conflictPaths = new Set((plan.entries || [])
@@ -3938,13 +3978,15 @@ class DriveBridgeProgressModal extends Modal {
     this.progressEl = null;
     this.progressTextEl = null;
     this.onClosed = null;
+    this.titleEl = null;
+    this.footerEl = null;
   }
 
   onOpen() {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("drivebridge-progress-modal");
-    contentEl.createEl("h2", { text: "DriveBridge is running" });
+    this.titleEl = contentEl.createEl("h2", { text: this.titleForMessage(this.message) });
     this.progressEl = contentEl.createEl("progress", {
       cls: "drivebridge-progress-bar"
     });
@@ -3955,8 +3997,8 @@ class DriveBridgeProgressModal extends Modal {
       text: this.message || "Starting...",
       cls: "drivebridge-progress-message"
     });
-    contentEl.createEl("p", {
-      text: "Keep Obsidian open and avoid editing notes until this finishes.",
+    this.footerEl = contentEl.createEl("p", {
+      text: this.footerForMessage(this.message),
       cls: "drivebridge-muted"
     });
     this.updateProgressElements();
@@ -3978,7 +4020,32 @@ class DriveBridgeProgressModal extends Modal {
     if (this.statusEl) {
       this.statusEl.setText(message);
     }
+    if (this.titleEl) {
+      this.titleEl.setText(this.titleForMessage(message));
+    }
+    if (this.footerEl) {
+      this.footerEl.setText(this.footerForMessage(message));
+    }
     this.updateProgressElements();
+  }
+
+  titleForMessage(message) {
+    const text = String(message || "");
+    if (text.includes("REPAIR REMOTE INDEX — QUEUED")) return "Repair is queued";
+    if (text.includes("REPAIR REMOTE INDEX — COMPLETE")) return "Repair complete";
+    if (text.includes("REPAIR REMOTE INDEX — STOPPED")) return "Repair stopped";
+    if (text.includes("REPAIR REMOTE INDEX") || text.includes("DriveBridge REPAIR")) return "Repair remote index";
+    if (text.includes("failed") || text.includes("Error:")) return "Normal sync stopped";
+    return "Normal sync is running";
+  }
+
+  footerForMessage(message) {
+    const text = String(message || "");
+    if (text.includes("QUEUED")) return "Repair will start automatically; keep Obsidian open.";
+    if (text.includes("COMPLETE")) return "Repair finished. You may continue with Normal Preview.";
+    if (text.includes("STOPPED")) return "Resolve the displayed cause before retrying Repair.";
+    if (text.includes("REPAIR REMOTE INDEX")) return "Keep Obsidian open. This is metadata Repair, not a normal backup.";
+    return "Keep Obsidian open and avoid editing notes until this finishes.";
   }
 
   updateProgressElements() {

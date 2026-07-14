@@ -1007,6 +1007,42 @@ async function run() {
     assert.match(failure, /duplicate name/);
   }
 
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    plugin.syncing = true;
+    plugin.activeOperation = "sync";
+    let queuedMessage = "";
+    plugin.showProgressModal = (message) => { queuedMessage = message; };
+    await plugin.rebuildRemoteSnapshotFromDrive();
+    assert.strictEqual(plugin.remoteIndexRepairPending, true, "Repair click during Normal sync must be queued, not dropped");
+    assert.match(queuedMessage, /REPAIR REMOTE INDEX — QUEUED/);
+    plugin.syncing = false;
+    let starts = 0;
+    plugin.rebuildRemoteSnapshotFromDrive = async () => { starts++; plugin.remoteIndexRepairPending = false; };
+    plugin.startPendingRemoteIndexRepair();
+    assert.strictEqual(starts, 1, "queued Repair must start automatically after Normal sync releases DriveBridge");
+    const source = fs.readFileSync(path.join(__dirname, "..", "main.js"), "utf8");
+    assert.match(source, /this\.skipChangedFilesDuringSync = false;\s+this\.clearSyncStatus\(\);\s+this\.startPendingRemoteIndexRepair\(\);/,
+      "Normal sync finally must trigger the queued Repair starter");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    const context = {
+      local: { "conflict.md": { path: "conflict.md", size: 3, mtime: 10 } },
+      remote: { "conflict.md": { path: "conflict.md", id: "remote-1", size: 4, modifiedTime: "2026-01-01T00:00:00Z" } }
+    };
+    const items = plugin.reviewItemsForPlan({ entries: [
+      { path: "upload.md", action: "upload" },
+      { path: "conflict.md", action: "conflict", reason: "changed on both sides" }
+    ] }, context);
+    assert.strictEqual(items.length, 1, "Preview must create review items only for planned conflicts");
+    assert.strictEqual(items[0].path, "conflict.md");
+    assert.strictEqual(items[0].remote.id, "remote-1");
+  }
+
   console.log("DriveBridge tests passed");
 }
 
