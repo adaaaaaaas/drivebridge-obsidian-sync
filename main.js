@@ -181,7 +181,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     });
     this.addCommand({
       id: "drivebridge-rebuild-remote-snapshot",
-      name: "Rebuild remote snapshot from Google Drive",
+      name: "Repair remote index (not a normal sync)",
       callback: () => this.rebuildRemoteSnapshotFromDrive()
     });
     this.addCommand({
@@ -522,11 +522,12 @@ module.exports = class DriveBridgePlugin extends Plugin {
     this.syncing = true;
     try {
       this.updateSyncProgress({
-        phase: "Repair",
+        phase: "REPAIR REMOTE INDEX",
         current: 0,
         total: 0,
-        message: "Scanning Google Drive to rebuild remote snapshot..."
+        message: "Repair mode is scanning Google Drive metadata. This is not a normal file sync or backup. No local note content is being uploaded or downloaded."
       });
+      new Notice("DriveBridge REPAIR started. This rebuilds the remote index; it is not a normal sync or backup.", 10000);
       await this.ensureAccessToken();
       const rootFolderId = await this.ensureRootFolder();
       let previousDeleted = {};
@@ -541,29 +542,56 @@ module.exports = class DriveBridgePlugin extends Plugin {
       const preservedDeleted = this.mergeRemoteDeleteTombstones(previousDeleted, {}, files);
       await this.writeRemoteSnapshotFile(rootFolderId, files, preservedDeleted);
       const count = Object.keys(files).length;
-      this.settings.lastSyncSummary = [
-        `Remote snapshot rebuilt in ${((Date.now() - started) / 1000).toFixed(1)}s`,
-        `DriveBridge version: ${this.manifest.version}`,
-        `Remote files indexed: ${count}`,
-        "Local files changed: 0",
-        `Local ${SNAPSHOT_FILE} changed: no`,
-        `Remote delete tombstones preserved: ${Object.keys(preservedDeleted).length}`
-      ].join("\n");
+      this.settings.lastSyncSummary = this.formatRemoteIndexRepairSuccess(
+        count,
+        Object.keys(preservedDeleted).length,
+        Date.now() - started
+      );
       this.settings.duplicateGuardAfterRebuild = true;
       this.settings.lastSyncHadErrors = false;
       await this.saveSettings();
-      new Notice(`DriveBridge rebuilt remote snapshot from ${count} Google Drive file(s).`, 10000);
+      new Notice(`DriveBridge REPAIR COMPLETE: indexed ${count} Drive file(s). Next, run Normal Preview and Normal sync.`, 12000);
+      this.showProgressModal(this.settings.lastSyncSummary);
+      this.scheduleProgressModalClose(6000);
     } catch (err) {
       const failure = this.errorRecord({ path: REMOTE_SNAPSHOT_FILE, action: "rebuildRemoteSnapshot" }, err);
-      this.settings.lastSyncSummary = this.formatFatalErrorSummary(failure, Date.now() - started);
+      this.settings.lastSyncSummary = this.formatRemoteIndexRepairFailure(failure, Date.now() - started);
       this.settings.lastSyncHadErrors = true;
       await this.saveSettings();
-      new Notice(`DriveBridge remote snapshot rebuild failed: ${failure.message}`, 10000);
+      new Notice(`DriveBridge REPAIR STOPPED: ${failure.message}. Normal sync was not run.`, 15000);
+      this.showProgressModal(this.settings.lastSyncSummary);
       console.error("[drivebridge-obsidian-sync]", err);
     } finally {
       this.syncing = false;
       this.clearSyncStatus();
     }
+  }
+
+  formatRemoteIndexRepairSuccess(count, preservedTombstones, elapsedMs) {
+    return [
+      "REPAIR REMOTE INDEX — COMPLETE",
+      "Operation type: metadata index repair (not Normal sync / not a file backup)",
+      `Elapsed: ${(elapsedMs / 1000).toFixed(1)}s`,
+      `DriveBridge version: ${this.manifest.version}`,
+      `Remote files indexed: ${count}`,
+      `Delete tombstones preserved: ${preservedTombstones}`,
+      "Local notes uploaded/downloaded: 0",
+      `Local ${SNAPSHOT_FILE} changed: no`,
+      "Next: run Normal Preview, then Normal sync."
+    ].join("\n");
+  }
+
+  formatRemoteIndexRepairFailure(failure, elapsedMs) {
+    return [
+      "REPAIR REMOTE INDEX — STOPPED WITH ERROR",
+      "Operation type: metadata index repair (not Normal sync / not a file backup)",
+      `Elapsed: ${(elapsedMs / 1000).toFixed(1)}s`,
+      `Stopped at: ${failure.path || REMOTE_SNAPSHOT_FILE}`,
+      `Reason: ${failure.message || "Unknown error"}`,
+      "Result: the repaired remote index was not completed.",
+      "Normal sync was not run. Drive files were not automatically deleted by this failed repair.",
+      "Next: resolve the displayed cause, run Repair again, and wait for REPAIR COMPLETE before Normal Preview/Normal sync."
+    ].join("\n");
   }
 
   async scanDuplicateRepairPlan() {
@@ -4379,10 +4407,10 @@ class DriveBridgeSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName("Remote snapshot repair")
-      .setDesc(`Full-scan Google Drive and rewrite only ${REMOTE_SNAPSHOT_FILE}. Local files and ${SNAPSHOT_FILE} are not changed. Fresh delete tombstones are preserved.`)
+      .setName("Repair remote index — not Normal sync")
+      .setDesc(`Use only when DriveBridge asks for index repair. This full-scans Google Drive metadata and rewrites ${REMOTE_SNAPSHOT_FILE}; it does not upload/download normal note files and is not the regular backup button. Wait for REPAIR COMPLETE before running Normal Preview and Normal sync.`)
       .addButton((button) => button
-        .setButtonText("Rebuild remote snapshot")
+        .setButtonText("Start index repair")
         .onClick(async () => {
           await runUiAction(() => this.plugin.rebuildRemoteSnapshotFromDrive());
           this.display();

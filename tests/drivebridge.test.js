@@ -993,6 +993,20 @@ async function run() {
     assert.strictEqual(files["same.md"].id, "old", "repair preview keeps a deterministic first candidate without mutating Drive");
   }
 
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    plugin.manifest = { version: "0.5.6" };
+    const success = plugin.formatRemoteIndexRepairSuccess(42, 3, 1250);
+    assert.match(success, /REPAIR REMOTE INDEX — COMPLETE/);
+    assert.match(success, /not Normal sync \/ not a file backup/);
+    assert.match(success, /Next: run Normal Preview, then Normal sync/);
+    const failure = plugin.formatRemoteIndexRepairFailure({ path: "remote_snapshot.json", message: "duplicate name" }, 2500);
+    assert.match(failure, /REPAIR REMOTE INDEX — STOPPED WITH ERROR/);
+    assert.match(failure, /Normal sync was not run/);
+    assert.match(failure, /duplicate name/);
+  }
+
   console.log("DriveBridge tests passed");
 }
 
