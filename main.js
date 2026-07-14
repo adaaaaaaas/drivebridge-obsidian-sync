@@ -66,7 +66,8 @@ const DEFAULT_SETTINGS = {
   lastPreviewDigest: "",
   approvedFirstSyncDigest: "",
   allowLargeDeleteOnce: false,
-  approvedDeletePlanDigest: ""
+  approvedDeletePlanDigest: "",
+  deviceId: ""
 };
 
 const DRIVE_API = "https://www.googleapis.com/drive/v3";
@@ -82,6 +83,8 @@ const REMOTE_SNAPSHOT_FILE = "remote_snapshot.json";
 const REVIEW_QUEUE_FILE = "review-queue.json";
 const SNAPSHOT_BACKUP_FILE = "snapshot.previous.json";
 const REVIEW_QUEUE_BACKUP_FILE = "review-queue.previous.json";
+const REPAIR_PLAN_FILE = "repair-plan.json";
+const RUNTIME_EPOCH_KEY = "__drivebridgeRuntimeEpoch";
 const REMOTE_DELETE_TOMBSTONE_RETENTION_MS = 20 * 24 * 60 * 60 * 1000;
 const MAX_RETRY_ATTEMPTS = 4;
 const DRIVE_ID_BATCH_SIZE = 1000;
@@ -128,7 +131,14 @@ const OBSIDIAN_ALWAYS_EXCLUDE_PATTERNS = [
 
 module.exports = class DriveBridgePlugin extends Plugin {
   async onload() {
+    const runtimeHost = typeof globalThis !== "undefined" ? globalThis : window;
+    runtimeHost[RUNTIME_EPOCH_KEY] = `${Date.now()}-${randomId(8)}`;
+    this.runtimeEpoch = runtimeHost[RUNTIME_EPOCH_KEY];
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    if (!this.settings.deviceId) {
+      this.settings.deviceId = `device-${randomId(16)}`;
+      await this.saveData(this.settings);
+    }
     if (!this.settings.manualReviewMigrationDone) {
       this.settings.conflictAction = "manualReview";
       this.settings.manualReviewMigrationDone = true;
@@ -190,11 +200,15 @@ module.exports = class DriveBridgePlugin extends Plugin {
     }
     this.clearSyncStatus();
     if (this.settings.autoSyncOnStartup) {
-      this.app.workspace.onLayoutReady(() => this.syncNow({ dryRun: this.settings.dryRunDefault, quiet: true }));
+      this.app.workspace.onLayoutReady(() => {
+        if (this.isCurrentRuntime()) this.syncNow({ dryRun: this.settings.dryRunDefault, quiet: true });
+      });
     }
     if (this.settings.autoSyncIntervalMinutes > 0) {
       this.registerInterval(window.setInterval(
-        () => this.syncNow({ dryRun: this.settings.dryRunDefault, quiet: true }),
+        () => {
+          if (this.isCurrentRuntime()) this.syncNow({ dryRun: this.settings.dryRunDefault, quiet: true });
+        },
         this.settings.autoSyncIntervalMinutes * 60 * 1000
       ));
     }
@@ -274,6 +288,9 @@ module.exports = class DriveBridgePlugin extends Plugin {
       driveRequests: 0,
       idReservationRequests: 0,
       recoveryLookups: 0,
+      duplicateGuardPreflightParents: 0,
+      duplicateGuardPostflightParents: 0,
+      duplicateGuardSelfHealed: 0,
       remoteSnapshotWrites: 0,
       remoteSnapshotWriteSkipped: 0,
       remoteSnapshotConflictMerges: 0
@@ -483,6 +500,19 @@ module.exports = class DriveBridgePlugin extends Plugin {
     };
   }
 
+  isCurrentRuntime() {
+    const runtimeHost = typeof globalThis !== "undefined" ? globalThis : window;
+    return !this.runtimeEpoch || runtimeHost[RUNTIME_EPOCH_KEY] === this.runtimeEpoch;
+  }
+
+  assertCurrentRuntime() {
+    if (!this.isCurrentRuntime()) {
+      const error = new Error("A newer DriveBridge runtime replaced this instance. The stale callback stopped before changing Google Drive.");
+      error.code = "DRIVEBRIDGE_STALE_RUNTIME";
+      throw error;
+    }
+  }
+
   async rebuildRemoteSnapshotFromDrive() {
     if (this.syncing) {
       new Notice("DriveBridge is already running.");
@@ -530,6 +560,93 @@ module.exports = class DriveBridgePlugin extends Plugin {
       await this.saveSettings();
       new Notice(`DriveBridge remote snapshot rebuild failed: ${failure.message}`, 10000);
       console.error("[drivebridge-obsidian-sync]", err);
+    } finally {
+      this.syncing = false;
+      this.clearSyncStatus();
+    }
+  }
+
+  async scanDuplicateRepairPlan() {
+    if (this.syncing) throw new Error("DriveBridge is already running.");
+    this.syncing = true;
+    try {
+      this.assertCurrentRuntime();
+      await this.ensureAccessToken();
+      const rootFolderId = await this.ensureRootFolder();
+      const files = {};
+      const duplicateGroups = [];
+      await this.scanRemoteFolder(rootFolderId, "", files, { duplicateGroups, continueOnDuplicate: true });
+      const groups = duplicateGroups.map((group) => {
+        const candidates = group.candidates.slice().sort(compareRemoteCreationOrder);
+        const filesOnly = candidates.every((item) => item.mimeType !== "application/vnd.google-apps.folder");
+        const safe = filesOnly && candidates.length >= 2 && candidates.every((item) => sameDriveContentExact(candidates[0], item));
+        return {
+          key: md5Hex(new TextEncoder().encode(`${group.parentId}\n${group.path}\n${group.mimeType}`).buffer),
+          path: group.path,
+          parentId: group.parentId,
+          mimeType: group.mimeType,
+          candidates,
+          canonicalId: safe ? candidates[0].id : "",
+          extraIds: safe ? candidates.slice(1).map((item) => item.id) : [],
+          safe,
+          reason: safe ? "same size and non-empty MD5" : "different content, missing MD5, or folder duplicate"
+        };
+      });
+      const plan = { version: 1, rootFolderId, createdAt: new Date().toISOString(), groups };
+      plan.digest = md5Hex(new TextEncoder().encode(JSON.stringify(plan)).buffer);
+      await this.writePluginDataFile(REPAIR_PLAN_FILE, JSON.stringify(plan, null, 2));
+      await this.enqueueDuplicateRepairReviews(groups.filter((group) => !group.safe));
+      this.settings.lastRecoverySummary = `Duplicate repair preview\nGroups: ${groups.length}\nSafe to isolate: ${groups.filter((g) => g.safe).length}\nManual review: ${groups.filter((g) => !g.safe).length}\nPlan digest: ${plan.digest}`;
+      await this.saveSettings();
+      new Notice(`DriveBridge found ${groups.length} duplicate group(s). Review the preview before Apply.`, 10000);
+      return plan;
+    } finally {
+      this.syncing = false;
+      this.clearSyncStatus();
+    }
+  }
+
+  async applyDuplicateRepairPlan() {
+    if (this.syncing) throw new Error("DriveBridge is already running.");
+    this.syncing = true;
+    try {
+      this.assertCurrentRuntime();
+      const plan = await this.readPluginDataJson(REPAIR_PLAN_FILE);
+      if (!plan || plan.version !== 1 || !plan.digest) throw new Error("Run duplicate repair Preview before Apply.");
+      const claimedDigest = plan.digest;
+      const unsignedPlan = Object.assign({}, plan);
+      delete unsignedPlan.digest;
+      if (md5Hex(new TextEncoder().encode(JSON.stringify(unsignedPlan)).buffer) !== claimedDigest) {
+        throw new Error("The duplicate repair plan changed after Preview. Preview again.");
+      }
+      await this.ensureAccessToken();
+      const rootFolderId = await this.ensureRootFolder();
+      if (rootFolderId !== plan.rootFolderId) throw new Error("The DriveBridge root changed after Preview. Preview again.");
+      let isolated = 0;
+      for (const group of plan.groups.filter((item) => item.safe)) {
+        const current = await this.findRemoteItemsByExactName(group.parentId, basename(group.path), group.mimeType);
+        const currentIds = current.map((item) => item.id).sort();
+        const plannedIds = group.candidates.map((item) => item.id).sort();
+        if (JSON.stringify(currentIds) !== JSON.stringify(plannedIds) || !current.every((item) => sameDriveContentExact(current[0], item))) {
+          throw new Error(`Duplicate group changed after Preview: ${group.path}. Nothing further was isolated.`);
+        }
+        for (const id of group.extraIds) {
+          this.assertCurrentRuntime();
+          await this.trashRemote(id);
+          isolated++;
+        }
+      }
+      const files = {};
+      const remaining = [];
+      await this.scanRemoteFolder(rootFolderId, "", files, { duplicateGroups: remaining, continueOnDuplicate: true });
+      if (!remaining.length) {
+        const previousRemoteState = await this.loadRemoteSnapshotFile(rootFolderId);
+        const preservedDeleted = this.mergeRemoteDeleteTombstones(previousRemoteState && previousRemoteState.deleted || {}, {}, files);
+        await this.writeRemoteSnapshotFile(rootFolderId, files, preservedDeleted);
+      }
+      this.settings.lastRecoverySummary = `Duplicate repair Apply\nItems isolated to Drive trash: ${isolated}\nRemaining duplicate groups: ${remaining.length}${remaining.length ? "\nResolve Manual Review items, then Preview again." : "\nRemote snapshot rebuilt."}`;
+      await this.saveSettings();
+      return { isolated, remaining: remaining.length };
     } finally {
       this.syncing = false;
       this.clearSyncStatus();
@@ -893,23 +1010,24 @@ module.exports = class DriveBridgePlugin extends Plugin {
     if (mode === "off") {
       return false;
     }
-    if (mode === "strict") {
-      return true;
+    return true;
+  }
+
+  shouldRefreshDuplicateGuardPreflight() {
+    return (this.settings.duplicateGuardMode || DEFAULT_SETTINGS.duplicateGuardMode) === "strict";
+  }
+
+  shouldUseExactNameDuplicateGuard(context, entry, existingRemote) {
+    if (existingRemote || !entry || entry.action !== "upload") {
+      return false;
     }
-    const snapshotEmpty = Object.keys(context.snapshot || {}).length === 0;
+    const mode = this.settings.duplicateGuardMode || DEFAULT_SETTINGS.duplicateGuardMode;
+    if (mode !== "auto") {
+      return false;
+    }
     const parent = parentPath(entry.path);
     const parentCounts = context.newUploadParentPathCounts || {};
-    return Boolean(
-      context.remoteSnapshotMissing ||
-      context.remoteSnapshotFromFullScan ||
-      !context.remoteSnapshotAt ||
-      snapshotEmpty ||
-      this.settings.lastSyncHadErrors ||
-      this.settings.duplicateGuardRootChanged ||
-      this.settings.duplicateGuardAfterRebuild ||
-      this.duplicateGuardFolderPathSet().has(parent || "/") ||
-      (parentCounts[parent] || 0) > 1
-    );
+    return Number(parentCounts[parent] || 1) <= 1;
   }
 
   duplicateGuardFolderPathSet() {
@@ -1014,6 +1132,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
         });
       }
     }
+    await this.verifyCreatedUploadDuplicates(context, orderedEntries, nextSnapshot, remoteMutations, runId);
     await this.flushOperationJournal(true);
     return { nextSnapshot, stats, errors, skippedChanged, skippedSafe, remoteDeleted, remoteSnapshotUpdates, remoteMutations, reviewItems, processed, total: orderedEntries.length, processedBytes, totalBytes };
   }
@@ -1116,8 +1235,11 @@ module.exports = class DriveBridgePlugin extends Plugin {
       const uploadStartLocal = await this.localInfoByPath(path);
       const uploaded = await this.uploadLocalFile(path, context.rootFolderId, remoteItem, {
         duplicateGuard: this.shouldUseDuplicateGuard(context, entry, remoteItem),
+        duplicateGuardRefresh: this.shouldRefreshDuplicateGuardPreflight(),
+        duplicateGuardExactName: this.shouldUseExactNameDuplicateGuard(context, entry, remoteItem),
         reservedRemoteId: this.reservedRemoteIdForOperation(runId, path),
         operationId: this.operationIdForPath(runId, path),
+        runId,
         onPrepared: async (prepared) => {
           await this.updateOperation(runId, entry, "in_progress", context, null, Object.assign({
             phase: "request_sent"
@@ -1288,6 +1410,10 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const headers = new Headers(options.headers || {});
     headers.set("Authorization", `Bearer ${this.settings.accessToken}`);
     const method = String(options.method || "GET").toUpperCase();
+    if (["POST", "PATCH", "PUT", "DELETE"].includes(method) &&
+        (url.startsWith(DRIVE_API) || url.startsWith(DRIVE_UPLOAD_API))) {
+      this.assertCurrentRuntime();
+    }
     const retrySafe = method !== "POST";
     let res;
     try {
@@ -1469,13 +1595,13 @@ module.exports = class DriveBridgePlugin extends Plugin {
     return remoteSnapshotAt > 0 && lastSyncAt > 0 && remoteSnapshotAt > lastSyncAt + 2000;
   }
 
-  async scanRemoteFolder(folderId, prefix, result) {
+  async scanRemoteFolder(folderId, prefix, result, options = {}) {
     let pageToken = "";
-    const seenNames = new Set();
+    const seenNames = new Map();
     do {
       const params = new URLSearchParams({
         q: `'${folderId}' in parents and trashed=false`,
-        fields: "nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum,parents)",
+        fields: "nextPageToken,files(id,name,mimeType,size,createdTime,modifiedTime,md5Checksum,parents,appProperties)",
         pageSize: "1000",
         spaces: "drive"
       });
@@ -1490,13 +1616,23 @@ module.exports = class DriveBridgePlugin extends Plugin {
         }
         if (seenNames.has(file.name)) {
           const folderPath = prefix || "/";
-          throw new Error(`Duplicate Google Drive item name "${file.name}" under "${folderPath}". Rename duplicates before syncing.`);
+          if (!options.continueOnDuplicate) {
+            throw new Error(`Duplicate Google Drive item name "${file.name}" under "${folderPath}". Rename duplicates before syncing.`);
+          }
+          const previous = seenNames.get(file.name);
+          let group = (options.duplicateGroups || []).find((item) => item.parentId === folderId && item.name === file.name);
+          if (!group) {
+            group = { parentId: folderId, name: file.name, path: prefix ? `${prefix}/${file.name}` : file.name, mimeType: file.mimeType, candidates: [previous] };
+            options.duplicateGroups.push(group);
+          }
+          group.candidates.push(file);
+          continue;
         }
-        seenNames.add(file.name);
+        seenNames.set(file.name, file);
         const path = prefix ? `${prefix}/${file.name}` : file.name;
         if (file.mimeType === "application/vnd.google-apps.folder") {
           if (this.shouldScanRemoteFolder(path)) {
-            await this.scanRemoteFolder(file.id, path, result);
+            await this.scanRemoteFolder(file.id, path, result, options);
           }
         } else if (!file.mimeType.startsWith("application/vnd.google-apps.")) {
           if (this.isExcluded(path)) {
@@ -1522,14 +1658,20 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const metadata = { name: basename(path) };
     if (!existingRemote) {
       if (options.duplicateGuard) {
-        await this.ensureNoRemoteNameCollision(parentId, metadata.name, parentPath(path));
+        if (options.duplicateGuardExactName) {
+          await this.ensureNoExactRemoteNameCollision(parentId, metadata.name, parentPath(path));
+        } else {
+          await this.ensureNoRemoteNameCollision(parentId, metadata.name, parentPath(path), {
+            refresh: Boolean(options.duplicateGuardRefresh)
+          });
+        }
       }
       metadata.parents = [parentId];
       if (options.reservedRemoteId) {
         metadata.id = options.reservedRemoteId;
       }
       if (options.operationId) {
-        metadata.appProperties = { drivebridgeOperationId: options.operationId };
+        metadata.appProperties = this.provenanceProperties(options.operationId || "", options.runId || "");
       }
     }
     if (options.onPrepared) {
@@ -1586,14 +1728,19 @@ module.exports = class DriveBridgePlugin extends Plugin {
         throw err;
       }
     }
-    return {
+    const result = {
       id: uploaded.id,
+      name: uploaded.name || metadata.name,
       path,
       size: Number(uploaded.size || localItem.size),
       modifiedTime: uploaded.modifiedTime,
       md5Checksum: uploaded.md5Checksum || "",
       parentId: existingRemote && existingRemote.parentId ? existingRemote.parentId : parentId
     };
+    if (!existingRemote) {
+      this.rememberRemoteChild(parentId, result);
+    }
+    return result;
   }
 
   isAmbiguousCreateError(err) {
@@ -1645,8 +1792,45 @@ module.exports = class DriveBridgePlugin extends Plugin {
     return ids;
   }
 
-  async ensureNoRemoteNameCollision(parentId, name, folderPath) {
-    const names = await this.remoteChildNames(parentId, folderPath);
+  async ensureNoExactRemoteNameCollision(parentId, name, folderPath) {
+    const files = await this.remoteFilesByExactName(parentId, name);
+    if (this.syncMetrics) {
+      this.syncMetrics.duplicateGuardPreflightParents++;
+    }
+    if (files.length) {
+      this.rememberDuplicateGuardFolder(folderPath);
+      const displayFolder = folderPath || "/";
+      throw new Error(`Google Drive item "${name}" already exists under "${displayFolder}". Rename duplicates or rebuild after cleanup before uploading.`);
+    }
+  }
+
+  async remoteFilesByExactName(parentId, name) {
+    const files = [];
+    let pageToken = "";
+    do {
+      const params = new URLSearchParams({
+        q: `'${parentId}' in parents and name='${escapeDriveQuery(name)}' and trashed=false`,
+        fields: "nextPageToken,files(id,name,size,createdTime,modifiedTime,md5Checksum,parents,mimeType)",
+        pageSize: "1000",
+        spaces: "drive"
+      });
+      if (pageToken) {
+        params.set("pageToken", pageToken);
+      }
+      const data = await parseJsonResponse(await this.driveFetch(`${DRIVE_API}/files?${params}`));
+      for (const file of data.files || []) {
+        assertSafeRemoteName(file.name);
+        files.push(Object.assign({}, file, {
+          parentId: file.parents && file.parents[0] ? file.parents[0] : parentId
+        }));
+      }
+      pageToken = data.nextPageToken || "";
+    } while (pageToken);
+    return files;
+  }
+
+  async ensureNoRemoteNameCollision(parentId, name, folderPath, options = {}) {
+    const names = await this.remoteChildNames(parentId, folderPath, options);
     if (names.has(name)) {
       this.rememberDuplicateGuardFolder(folderPath);
       const displayFolder = folderPath || "/";
@@ -1654,16 +1838,35 @@ module.exports = class DriveBridgePlugin extends Plugin {
     }
   }
 
-  async remoteChildNames(parentId, folderPath) {
-    if (this.remoteChildCache.has(parentId)) {
+  async remoteChildNames(parentId, folderPath, options = {}) {
+    const children = await this.remoteChildren(parentId, folderPath, Object.assign({}, options, {
+      purpose: "preflight"
+    }));
+    const names = new Set();
+    for (const file of children) {
+      if (names.has(file.name)) {
+        this.rememberDuplicateGuardFolder(folderPath);
+        const displayFolder = folderPath || "/";
+        throw new Error(`Duplicate Google Drive item name "${file.name}" under "${displayFolder}". Rename duplicates before syncing.`);
+      }
+      names.add(file.name);
+    }
+    return names;
+  }
+
+  async remoteChildren(parentId, folderPath, options = {}) {
+    if (!this.remoteChildCache) {
+      this.remoteChildCache = new Map();
+    }
+    if (!options.refresh && this.remoteChildCache.has(parentId)) {
       return this.remoteChildCache.get(parentId);
     }
-    const names = new Set();
+    const children = [];
     let pageToken = "";
     do {
       const params = new URLSearchParams({
         q: `'${parentId}' in parents and trashed=false`,
-        fields: "nextPageToken,files(id,name,mimeType)",
+        fields: "nextPageToken,files(id,name,size,createdTime,modifiedTime,md5Checksum,parents,mimeType)",
         pageSize: "1000",
         spaces: "drive"
       });
@@ -1676,17 +1879,168 @@ module.exports = class DriveBridgePlugin extends Plugin {
         if (file.name === REMOTE_SNAPSHOT_FILE && !folderPath) {
           continue;
         }
-        if (names.has(file.name)) {
-          this.rememberDuplicateGuardFolder(folderPath);
-          const displayFolder = folderPath || "/";
-          throw new Error(`Duplicate Google Drive item name "${file.name}" under "${displayFolder}". Rename duplicates before syncing.`);
-        }
-        names.add(file.name);
+        children.push(Object.assign({}, file, {
+          parentId: file.parents && file.parents[0] ? file.parents[0] : parentId
+        }));
       }
       pageToken = data.nextPageToken || "";
     } while (pageToken);
-    this.remoteChildCache.set(parentId, names);
-    return names;
+    this.remoteChildCache.set(parentId, children);
+    if (options.purpose === "preflight" && this.syncMetrics) {
+      this.syncMetrics.duplicateGuardPreflightParents++;
+    }
+    return children;
+  }
+
+  rememberRemoteChild(parentId, remoteItem) {
+    if (!this.remoteChildCache || !this.remoteChildCache.has(parentId) || !remoteItem) {
+      return;
+    }
+    const children = this.remoteChildCache.get(parentId).filter((file) => file.id !== remoteItem.id);
+    children.push(Object.assign({}, remoteItem, {
+      name: remoteItem.name || basename(remoteItem.path || ""),
+      parentId
+    }));
+    this.remoteChildCache.set(parentId, children);
+  }
+
+  async verifyCreatedUploadDuplicates(context, entries, nextSnapshot, remoteMutations, runId = "") {
+    const mode = this.settings.duplicateGuardMode || DEFAULT_SETTINGS.duplicateGuardMode;
+    if (mode === "off") {
+      return;
+    }
+    const groups = new Map();
+    for (const entry of entries || []) {
+      const uploaded = entry && entry.action === "upload" && !context.remote[entry.path]
+        ? remoteMutations[entry.path]
+        : null;
+      if (!uploaded || !uploaded.id || !uploaded.parentId) {
+        continue;
+      }
+      if (!groups.has(uploaded.parentId)) {
+        groups.set(uploaded.parentId, []);
+      }
+      groups.get(uploaded.parentId).push({ entry, uploaded });
+    }
+    for (const [parentId, uploads] of groups.entries()) {
+      const folderPath = parentPath(uploads[0].entry.path);
+      if (this.syncMetrics) {
+        this.syncMetrics.duplicateGuardPostflightParents++;
+      }
+      const exactNamePostflight = mode === "auto" && uploads.length === 1;
+      let children = exactNamePostflight
+        ? await this.remoteFilesByExactName(parentId, basename(uploads[0].entry.path))
+        : await this.remoteChildren(parentId, folderPath, { refresh: true, purpose: "postflight" });
+      for (const record of uploads) {
+        let matches = this.remoteFilesWithName(children, basename(record.entry.path));
+        if (!matches.length) {
+          await sleep(250);
+          children = exactNamePostflight
+            ? await this.remoteFilesByExactName(parentId, basename(record.entry.path))
+            : await this.remoteChildren(parentId, folderPath, { refresh: true, purpose: "postflight_visibility_retry" });
+          matches = this.remoteFilesWithName(children, basename(record.entry.path));
+          if (!matches.length) {
+            const error = new Error(`The new Google Drive item "${basename(record.entry.path)}" was not visible during duplicate verification. The snapshot was not committed; use Recovery to reverify reserved ID ${record.uploaded.id}.`);
+            error.code = "DRIVEBRIDGE_DUPLICATE_POSTFLIGHT_INCONCLUSIVE";
+            throw error;
+          }
+        }
+        if (matches.length === 1 && matches[0].id === record.uploaded.id) {
+          continue;
+        }
+        matches = matches.map((file) => file.id === record.uploaded.id
+          ? Object.assign({}, file, record.uploaded)
+          : file);
+        if (!matches.some((file) => file.id === record.uploaded.id)) {
+          matches = matches.concat([record.uploaded]);
+        }
+        const reconciliation = await this.reconcileCreatedUploadDuplicate(
+          record.entry.path,
+          record.uploaded,
+          matches,
+          parentId,
+          context,
+          nextSnapshot,
+          remoteMutations,
+          runId
+        );
+        if (reconciliation === "wait") {
+          await sleep(250);
+          children = exactNamePostflight
+            ? await this.remoteFilesByExactName(parentId, basename(record.entry.path))
+            : await this.remoteChildren(parentId, folderPath, { refresh: true, purpose: "postflight_retry" });
+          matches = this.remoteFilesWithName(children, basename(record.entry.path));
+          if (matches.length === 1 && matches[0].id === record.uploaded.id) {
+            continue;
+          }
+          matches = matches.map((file) => file.id === record.uploaded.id
+            ? Object.assign({}, file, record.uploaded)
+            : file);
+          if (!matches.some((file) => file.id === record.uploaded.id)) {
+            matches = matches.concat([record.uploaded]);
+          }
+          await this.reconcileCreatedUploadDuplicate(
+            record.entry.path,
+            record.uploaded,
+            matches,
+            parentId,
+            context,
+            nextSnapshot,
+            remoteMutations,
+            runId,
+            { allowWait: false }
+          );
+        }
+      }
+    }
+  }
+
+  remoteFilesWithName(children, name) {
+    return (children || []).filter((file) => file.name === name);
+  }
+
+  async reconcileCreatedUploadDuplicate(path, uploaded, matches, parentId, context, nextSnapshot, remoteMutations, runId, options = {}) {
+    const uploadedFile = matches.find((file) => file.id === uploaded.id);
+    const canonical = matches.slice().sort(compareRemoteCreationOrder)[0];
+    const allSameContent = matches.every((file) => sameDriveContentExact(canonical, file));
+    if (uploadedFile && matches.length === 2 && allSameContent && canonical.id !== uploaded.id) {
+      await this.trashRemote(uploaded.id);
+      this.forgetRemoteChild(parentId, uploaded.id);
+      const canonicalRemote = remoteInfo(path, Object.assign({}, canonical, { parentId }));
+      remoteMutations[path] = canonicalRemote;
+      const localSnapshot = nextSnapshot[path] && nextSnapshot[path].local
+        ? nextSnapshot[path].local
+        : context.local[path];
+      nextSnapshot[path] = this.snapshotFrom(localSnapshot, canonicalRemote);
+      this.rememberDuplicateGuardFolder(parentPath(path));
+      if (this.syncMetrics) {
+        this.syncMetrics.duplicateGuardSelfHealed++;
+      }
+      await this.updateOperation(runId, { path, action: "upload" }, "done", context, null, {
+        phase: "remote_verified",
+        remoteResult: canonicalRemote,
+        reservedRemoteId: "",
+        duplicateSelfHealed: true,
+        trashedRemoteId: uploaded.id
+      });
+      return "healed";
+    }
+    if (uploadedFile && allSameContent && canonical.id === uploaded.id && options.allowWait !== false) {
+      return "wait";
+    }
+    const error = new Error(`Duplicate Google Drive item "${basename(path)}" under "${parentPath(path) || "/"}" has different content or could not be safely reconciled. No duplicate was deleted.`);
+    error.code = "DRIVEBRIDGE_DUPLICATE_POSTFLIGHT";
+    throw error;
+  }
+
+  forgetRemoteChild(parentId, remoteId) {
+    if (!this.remoteChildCache || !this.remoteChildCache.has(parentId)) {
+      return;
+    }
+    this.remoteChildCache.set(
+      parentId,
+      this.remoteChildCache.get(parentId).filter((file) => file.id !== remoteId)
+    );
   }
 
   async moveRemoteFile(oldPath, newPath, remoteItem, rootFolderId) {
@@ -1724,7 +2078,11 @@ module.exports = class DriveBridgePlugin extends Plugin {
         continue;
       }
       const folder = await this.findRemoteFolder(parentId, part);
-      parentId = folder ? folder.id : await this.createRemoteFolder(parentId, part);
+      parentId = folder ? folder.id : await this.createRemoteFolder(parentId, part, {
+        reservedId: this.reservedFolderIdForPrefix(prefix),
+        runId: this.operationJournalCache && this.operationJournalCache.runId || "",
+        operationId: `folder-${prefix}`
+      });
       this.folderCache.set(cacheKey, parentId);
     }
     return parentId;
@@ -1741,6 +2099,22 @@ module.exports = class DriveBridgePlugin extends Plugin {
       throw new Error(`Multiple Google Drive folders named "${name}" are visible under the same parent. Rename duplicates before syncing.`);
     }
     return data.files && data.files.length ? data.files[0] : null;
+  }
+
+  reservedFolderIdForPrefix(prefix) {
+    const journal = this.operationJournalCache;
+    return journal && journal.folderReservations && journal.folderReservations[prefix] || "";
+  }
+
+  async findRemoteItemsByExactName(parentId, name, mimeType = "") {
+    const mimeClause = mimeType ? ` and mimeType='${escapeDriveQuery(mimeType)}'` : "";
+    const params = new URLSearchParams({
+      q: `'${parentId}' in parents and name='${escapeDriveQuery(name)}' and trashed=false${mimeClause}`,
+      fields: "files(id,name,createdTime,size,modifiedTime,md5Checksum,parents,mimeType,appProperties)",
+      spaces: "drive"
+    });
+    const data = await parseJsonResponse(await this.driveFetch(`${DRIVE_API}/files?${params}`));
+    return data.files || [];
   }
 
   async findRemoteParentReadOnly(path, rootFolderId) {
@@ -1763,9 +2137,17 @@ module.exports = class DriveBridgePlugin extends Plugin {
   }
 
   async findRemoteFileByExactName(path, rootFolderId) {
+    const files = await this.findRemoteFileCandidates(path, rootFolderId);
+    if (files.length > 1) {
+      throw new Error(`Multiple Google Drive files named "${basename(path)}" exist under "${parentPath(path) || "/"}". Rename duplicates before recovery.`);
+    }
+    return files.length ? remoteInfo(path, files[0]) : null;
+  }
+
+  async findRemoteFileCandidates(path, rootFolderId) {
     const parentId = await this.findRemoteParentReadOnly(path, rootFolderId);
     if (!parentId) {
-      return null;
+      return [];
     }
     const params = new URLSearchParams({
       q: `'${parentId}' in parents and name='${escapeDriveQuery(basename(path))}' and trashed=false`,
@@ -1776,23 +2158,28 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const files = (data.files || []).filter((file) =>
       !String(file.mimeType || "").startsWith("application/vnd.google-apps.")
     );
-    if (files.length > 1) {
-      throw new Error(`Multiple Google Drive files named "${basename(path)}" exist under "${parentPath(path) || "/"}". Rename duplicates before recovery.`);
-    }
-    return files.length ? remoteInfo(path, files[0]) : null;
+    return files;
   }
 
-  async createRemoteFolder(parentId, name) {
+  async createRemoteFolder(parentId, name, options = {}) {
+    this.assertCurrentRuntime();
+    const reservedId = options.reservedId || "";
     try {
       const data = await parseJsonResponse(await this.driveFetch(`${DRIVE_API}/files?fields=id,name`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          ...(reservedId ? { id: reservedId } : {}),
           name,
           parents: [parentId],
-          mimeType: "application/vnd.google-apps.folder"
+          mimeType: "application/vnd.google-apps.folder",
+          appProperties: this.provenanceProperties(options.operationId || "", options.runId || "")
         })
       }));
+      const candidates = await this.findRemoteItemsByExactName(parentId, name, "application/vnd.google-apps.folder");
+      if (candidates.length > 1) {
+        throw new Error(`Folder create collision for "${name}". No folder was auto-merged; use duplicate repair.`);
+      }
       return data.id;
     } catch (err) {
       if (this.isAmbiguousCreateError(err)) {
@@ -1803,6 +2190,15 @@ module.exports = class DriveBridgePlugin extends Plugin {
       }
       throw err;
     }
+  }
+
+  provenanceProperties(operationId = "", runId = "") {
+    return {
+      drivebridgeOperationId: operationId || "",
+      drivebridgeRunId: runId || "",
+      drivebridgeDeviceId: this.settings.deviceId || "",
+      drivebridgeProtocolVersion: "2"
+    };
   }
 
   async downloadRemoteFile(path, remoteItem, options = {}) {
@@ -2148,6 +2544,29 @@ module.exports = class DriveBridgePlugin extends Plugin {
     this.clearSyncStatus();
   }
 
+  async enqueueDuplicateRepairReviews(groups) {
+    if (!groups.length) return;
+    const queue = await this.loadReviewQueue();
+    const byId = new Map(queue.items.map((item) => [item.id, item]));
+    const now = new Date().toISOString();
+    for (const group of groups) {
+      const id = `duplicate-${group.key}`;
+      byId.set(id, {
+        id,
+        type: "duplicateRepair",
+        path: group.path,
+        reason: group.reason,
+        local: null,
+        remote: group.candidates[0] ? remoteInfo(group.path, group.candidates[0]) : null,
+        remoteCandidates: group.candidates,
+        createdAt: byId.get(id) && byId.get(id).createdAt || now,
+        updatedAt: now,
+        status: "pending"
+      });
+    }
+    await this.saveReviewQueue({ version: 1, items: Array.from(byId.values()) });
+  }
+
   reviewItemFrom(entry, localItem, remoteItem) {
     const id = reviewIdentityKey(entry.path, localItem, remoteItem);
     const now = new Date().toISOString();
@@ -2171,6 +2590,10 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const incomingById = new Map((reviewItems || []).map((item) => [item.id, item]));
     const nextById = new Map();
     for (const item of existing.items) {
+      if (item.type === "duplicateRepair") {
+        nextById.set(item.id, item);
+        continue;
+      }
       if (!conflictPaths.has(item.path)) {
         continue;
       }
@@ -2342,8 +2765,18 @@ module.exports = class DriveBridgePlugin extends Plugin {
         !context.remote[entry.path] &&
         !(previous && previous.reservedRemoteId);
     });
-    const reservedIds = await this.reserveDriveIds(needsReservedId.length);
+    const folderPrefixes = Array.from(new Set(needsReservedId.flatMap((entry) => {
+      const parts = entry.path.split("/").slice(0, -1);
+      return parts.map((_, index) => parts.slice(0, index + 1).join("/"));
+    })));
+    const previousFolderReservations = existingJournal && existingJournal.folderReservations || {};
+    const missingFolderPrefixes = folderPrefixes.filter((prefix) => !previousFolderReservations[prefix]);
+    const reservedIds = await this.reserveDriveIds(needsReservedId.length + missingFolderPrefixes.length);
     const reservedByPath = new Map(needsReservedId.map((entry, index) => [entry.path, reservedIds[index]]));
+    const folderReservations = Object.assign({}, previousFolderReservations);
+    missingFolderPrefixes.forEach((prefix, index) => {
+      folderReservations[prefix] = reservedIds[needsReservedId.length + index];
+    });
     const operations = {};
     for (const entry of plan.entries) {
       if (!this.shouldJournalOperation(entry)) {
@@ -2384,6 +2817,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
         fileId: context.remoteSnapshotFileId || "",
         modifiedTime: context.remoteSnapshotModifiedTime || ""
       },
+      folderReservations,
       operations
     });
   }
@@ -2587,8 +3021,30 @@ module.exports = class DriveBridgePlugin extends Plugin {
       }
       if (knownId) {
         remote = await this.remoteInfoById(operation.path, knownId);
-      } else {
+      } else if (Object.prototype.hasOwnProperty.call(this, "findRemoteFileByExactName")) {
+        // Preserve an injected adapter/test seam while production uses candidate-aware recovery below.
         remote = await this.findRemoteFileByExactName(operation.path, context.rootFolderId);
+      } else {
+        const candidates = await this.findRemoteFileCandidates(operation.path, context.rootFolderId);
+        if (candidates.length > 1) {
+          const ordered = candidates.slice().sort(compareRemoteCreationOrder);
+          const sameContent = ordered.every((candidate) => sameDriveContentExact(ordered[0], candidate));
+          await this.enqueueDuplicateRepairReviews([{
+            key: md5Hex(new TextEncoder().encode(`${operation.path}\n${ordered.map((item) => item.id).join(",")}`).buffer),
+            path: operation.path,
+            candidates: ordered,
+            reason: sameContent
+              ? "Recovery found multiple byte-identical candidates; Repair must isolate extras before snapshot commit"
+              : "Recovery found multiple different or unverifiable candidates"
+          }]);
+          if (!sameContent) {
+            this.markRecoveredOperation(operation, null, false);
+            continue;
+          }
+          remote = remoteInfo(operation.path, ordered[0]);
+        } else {
+          remote = candidates.length ? remoteInfo(operation.path, candidates[0]) : null;
+        }
       }
       if (!remote) {
         continue;
@@ -2958,6 +3414,13 @@ module.exports = class DriveBridgePlugin extends Plugin {
       await this.ensureAdapterFolderPath(this.pluginDataDir());
       await this.app.vault.adapter.write(path, content);
     }
+  }
+
+  async readPluginDataJson(filename) {
+    const path = this.pluginDataPath(filename);
+    if (!(await this.app.vault.adapter.exists(path))) return null;
+    const text = await this.app.vault.adapter.read(path);
+    return JSON.parse(text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text);
   }
 
   async loadPluginDataJsonWithBackup(filename, backupFilename, missingValue, validate, failureConsequence = "Operation stopped.") {
@@ -3340,6 +3803,9 @@ module.exports = class DriveBridgePlugin extends Plugin {
         `Drive API requests: ${executed.performance.driveRequests}`,
         `Reserved-ID batch requests: ${executed.performance.idReservationRequests}`,
         `Recovery-only lookups: ${executed.performance.recoveryLookups}`,
+        `Duplicate guard preflight parents: ${executed.performance.duplicateGuardPreflightParents || 0}`,
+        `Duplicate guard postflight parents: ${executed.performance.duplicateGuardPostflightParents || 0}`,
+        `Duplicate creates self-healed: ${executed.performance.duplicateGuardSelfHealed || 0}`,
         `Remote snapshot writes: ${executed.performance.remoteSnapshotWrites}`,
         `Remote snapshot writes skipped: ${executed.performance.remoteSnapshotWriteSkipped}`,
         `Remote snapshot conflict merges: ${executed.performance.remoteSnapshotConflictMerges}`
@@ -3566,6 +4032,16 @@ class DriveBridgeConflictReviewModal extends Modal {
     const compare = detail.createDiv({ cls: "drivebridge-review-compare" });
     this.renderSide(compare, "Local", selected.local);
     this.renderSide(compare, "Google Drive", selected.remote);
+    if (selected.type === "duplicateRepair") {
+      detail.createEl("p", {
+        text: `${(selected.remoteCandidates || []).length} Drive candidates. Automatic selection is disabled because content or folder identity is ambiguous. Use Duplicate-aware repair Preview again after renaming or reviewing the candidates in Google Drive.`,
+        cls: "drivebridge-muted"
+      });
+      const deferOnly = detail.createDiv({ cls: "drivebridge-review-actions" });
+      const defer = deferOnly.createEl("button", { text: "Defer" });
+      defer.addEventListener("click", () => this.close());
+      return;
+    }
     detail.createEl("p", {
       text: "The version not chosen as canonical is saved as a conflict backup.",
       cls: "drivebridge-muted"
@@ -3770,7 +4246,7 @@ class DriveBridgeSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Duplicate guard")
-      .setDesc("Checks Google Drive folder contents before risky new uploads. Auto checks only when snapshot/root/recovery state is suspicious; Strict checks every new upload; Off is fastest but less safe.")
+      .setDesc("Auto protects only new Drive creates: a lone create uses small exact-name pre/post checks, while batches share parent scans. Strict refreshes the parent before every create. Existing-file updates and unchanged syncs add no guard requests; Off is fastest but less safe.")
       .addDropdown((dropdown) => dropdown
         .addOption("auto", "Auto")
         .addOption("strict", "Strict")
@@ -3909,6 +4385,23 @@ class DriveBridgeSettingTab extends PluginSettingTab {
         .setButtonText("Rebuild remote snapshot")
         .onClick(async () => {
           await runUiAction(() => this.plugin.rebuildRemoteSnapshotFromDrive());
+          this.display();
+        }));
+
+    new Setting(containerEl)
+      .setName("Duplicate-aware repair")
+      .setDesc("Preview scans Google Drive only when requested. Apply moves only byte-identical extra files to Drive trash; ambiguous files and folders go to Manual Review.")
+      .addButton((button) => button
+        .setButtonText("1. Preview duplicates")
+        .onClick(async () => {
+          await runUiAction(() => this.plugin.scanDuplicateRepairPlan());
+          this.display();
+        }))
+      .addButton((button) => button
+        .setButtonText("2. Apply safe repair")
+        .setWarning()
+        .onClick(async () => {
+          await runUiAction(() => this.plugin.applyDuplicateRepairPlan());
           this.display();
         }));
 
@@ -4115,6 +4608,25 @@ function sameRemote(previous, current) {
     previous.size === current.size &&
     previous.modifiedTime === current.modifiedTime &&
     (previous.md5Checksum || "") === (current.md5Checksum || "");
+}
+
+function compareRemoteCreationOrder(left, right) {
+  const leftTime = Date.parse(left && left.createdTime || "");
+  const rightTime = Date.parse(right && right.createdTime || "");
+  const normalizedLeft = Number.isFinite(leftTime) ? leftTime : Number.MAX_SAFE_INTEGER;
+  const normalizedRight = Number.isFinite(rightTime) ? rightTime : Number.MAX_SAFE_INTEGER;
+  if (normalizedLeft !== normalizedRight) {
+    return normalizedLeft - normalizedRight;
+  }
+  return String(left && left.id || "").localeCompare(String(right && right.id || ""));
+}
+
+function sameDriveContentExact(left, right) {
+  const leftMd5 = String(left && left.md5Checksum || "").toLowerCase();
+  const rightMd5 = String(right && right.md5Checksum || "").toLowerCase();
+  return Boolean(leftMd5) &&
+    leftMd5 === rightMd5 &&
+    Number(left && left.size || 0) === Number(right && right.size || 0);
 }
 
 function sameLocalStrict(previous, current) {

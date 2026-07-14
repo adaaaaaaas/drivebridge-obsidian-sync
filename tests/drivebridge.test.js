@@ -725,6 +725,274 @@ async function run() {
     assert.strictEqual(modal.queue.items.length, 0, "review modal refresh must render an empty queue without runtime errors");
   }
 
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass, {
+      duplicateGuardMode: "auto",
+      lastSyncHadErrors: false,
+      duplicateGuardRootChanged: false,
+      duplicateGuardAfterRebuild: false,
+      duplicateGuardFolderPaths: ""
+    });
+    const context = {
+      snapshot: { "existing.md": { remote: { id: "existing" } } },
+      remoteSnapshotAt: 1,
+      remoteSnapshotMissing: false,
+      remoteSnapshotFromFullScan: false,
+      newUploadParentPathCounts: { folder: 1 }
+    };
+    assert.strictEqual(
+      plugin.shouldUseDuplicateGuard(context, { path: "folder/new.md", action: "upload" }, null),
+      true,
+      "Auto must guard every new Drive create, even in a healthy-looking single-upload sync"
+    );
+    assert.strictEqual(
+      plugin.shouldUseDuplicateGuard(context, { path: "folder/existing.md", action: "upload" }, { id: "existing" }),
+      false,
+      "updates to a known Drive ID must not pay the create preflight cost"
+    );
+    assert.strictEqual(
+      plugin.shouldUseExactNameDuplicateGuard(context, { path: "folder/new.md", action: "upload" }, null),
+      true,
+      "a lone Auto create must use the small exact-name query instead of listing a large parent"
+    );
+    context.newUploadParentPathCounts.folder = 2;
+    assert.strictEqual(
+      plugin.shouldUseExactNameDuplicateGuard(context, { path: "folder/new.md", action: "upload" }, null),
+      false,
+      "multiple Auto creates in one parent must share one parent scan"
+    );
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass, { duplicateGuardMode: "auto" });
+    plugin.remoteChildCache = new Map();
+    plugin.syncMetrics = { duplicateGuardPreflightParents: 0 };
+    let requests = 0;
+    plugin.driveFetch = async () => {
+      requests++;
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ files: [{ id: "old", name: "old.md", mimeType: "text/markdown" }] })
+      };
+    };
+    await plugin.ensureNoRemoteNameCollision("parent", "new-a.md", "folder");
+    await plugin.ensureNoRemoteNameCollision("parent", "new-b.md", "folder");
+    assert.strictEqual(requests, 1, "Auto preflight must be shared by every new upload in the same parent");
+    assert.strictEqual(plugin.syncMetrics.duplicateGuardPreflightParents, 1);
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass, { duplicateGuardMode: "auto" });
+    plugin.syncMetrics = { duplicateGuardPreflightParents: 0 };
+    let exactQueries = 0;
+    plugin.remoteFilesByExactName = async () => { exactQueries++; return []; };
+    await plugin.ensureNoExactRemoteNameCollision("parent", "new.md", "folder");
+    assert.strictEqual(exactQueries, 1);
+    assert.strictEqual(plugin.syncMetrics.duplicateGuardPreflightParents, 1);
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass, { duplicateGuardMode: "auto" });
+    plugin.syncMetrics = { duplicateGuardPostflightParents: 0, duplicateGuardSelfHealed: 0 };
+    const oldFile = {
+      id: "old-id",
+      name: "same.md",
+      size: "4",
+      md5Checksum: "abcd",
+      createdTime: "2026-07-09T00:00:00.000Z",
+      modifiedTime: "2026-07-09T00:00:00.000Z",
+      mimeType: "text/markdown",
+      parents: ["parent"]
+    };
+    const newFile = Object.assign({}, oldFile, {
+      id: "new-id",
+      createdTime: "2026-07-10T00:00:00.000Z",
+      modifiedTime: "2026-07-10T00:00:00.000Z"
+    });
+    let listCalls = 0;
+    plugin.remoteFilesByExactName = async () => {
+      listCalls++;
+      return [oldFile, newFile];
+    };
+    const trashed = [];
+    plugin.trashRemote = async (id) => { trashed.push(id); };
+    let operationDetails;
+    plugin.updateOperation = async (_runId, _entry, _status, _context, _error, details) => {
+      operationDetails = details;
+    };
+    const context = { remote: {}, local: { "folder/same.md": { size: 4, mtime: 1 } } };
+    const entries = [{ path: "folder/same.md", action: "upload" }];
+    const nextSnapshot = {
+      "folder/same.md": plugin.snapshotFrom(context.local["folder/same.md"], {
+        id: "new-id", size: 4, md5Checksum: "abcd", modifiedTime: newFile.modifiedTime, parentId: "parent"
+      })
+    };
+    const remoteMutations = {
+      "folder/same.md": { id: "new-id", name: "same.md", size: 4, md5Checksum: "abcd", modifiedTime: newFile.modifiedTime, parentId: "parent" }
+    };
+    await plugin.verifyCreatedUploadDuplicates(context, entries, nextSnapshot, remoteMutations, "run-1");
+    assert.deepStrictEqual(trashed, ["new-id"], "only this run's later exact duplicate may be trashed");
+    assert.strictEqual(remoteMutations["folder/same.md"].id, "old-id");
+    assert.strictEqual(nextSnapshot["folder/same.md"].remote.id, "old-id");
+    assert.strictEqual(listCalls, 1, "postflight is batched once per parent");
+    assert.strictEqual(plugin.syncMetrics.duplicateGuardPostflightParents, 1);
+    assert.strictEqual(plugin.syncMetrics.duplicateGuardSelfHealed, 1);
+    assert.strictEqual(operationDetails.remoteResult.id, "old-id");
+    assert.strictEqual(operationDetails.reservedRemoteId, "", "Recovery must prefer the adopted canonical ID over the trashed reserved ID");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass, { duplicateGuardMode: "auto" });
+    plugin.syncMetrics = { duplicateGuardPostflightParents: 0, duplicateGuardSelfHealed: 0 };
+    plugin.remoteFilesByExactName = async () => [{
+      id: "old-id", name: "same.md", size: "4", md5Checksum: "old", createdTime: "2026-07-09T00:00:00.000Z", mimeType: "text/markdown", parents: ["parent"]
+    }, {
+      id: "new-id", name: "same.md", size: "4", md5Checksum: "new", createdTime: "2026-07-10T00:00:00.000Z", mimeType: "text/markdown", parents: ["parent"]
+    }];
+    let trashed = false;
+    plugin.trashRemote = async () => { trashed = true; };
+    const context = { remote: {}, local: { "folder/same.md": { size: 4, mtime: 1 } } };
+    const entries = [{ path: "folder/same.md", action: "upload" }];
+    const nextSnapshot = { "folder/same.md": plugin.snapshotFrom(context.local["folder/same.md"], {
+      id: "new-id", size: 4, md5Checksum: "new", parentId: "parent"
+    }) };
+    const remoteMutations = { "folder/same.md": {
+      id: "new-id", name: "same.md", size: 4, md5Checksum: "new", parentId: "parent"
+    } };
+    await assert.rejects(
+      () => plugin.verifyCreatedUploadDuplicates(context, entries, nextSnapshot, remoteMutations, "run-1"),
+      /different content|could not be safely reconciled/
+    );
+    assert.strictEqual(trashed, false, "different-content duplicates must never be auto-trashed");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass, { duplicateGuardMode: "auto" });
+    let trashed = false;
+    plugin.trashRemote = async () => { trashed = true; };
+    const same = { name: "same.md", size: "4", md5Checksum: "same", mimeType: "text/markdown" };
+    const matches = [
+      Object.assign({ id: "old-a", createdTime: "2026-07-08T00:00:00.000Z" }, same),
+      Object.assign({ id: "old-b", createdTime: "2026-07-09T00:00:00.000Z" }, same),
+      Object.assign({ id: "new", createdTime: "2026-07-10T00:00:00.000Z" }, same)
+    ];
+    await assert.rejects(
+      () => plugin.reconcileCreatedUploadDuplicate(
+        "folder/same.md",
+        { id: "new", size: 4, md5Checksum: "same", parentId: "parent" },
+        matches,
+        "parent",
+        { local: { "folder/same.md": { size: 4, mtime: 1 } } },
+        {},
+        {},
+        "run-1"
+      ),
+      /could not be safely reconciled/
+    );
+    assert.strictEqual(trashed, false, "more than one pre-existing candidate is ambiguous and must not be auto-trashed");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass, { duplicateGuardMode: "auto" });
+    plugin.syncMetrics = { duplicateGuardPostflightParents: 0, duplicateGuardSelfHealed: 0 };
+    let queries = 0;
+    plugin.remoteFilesByExactName = async () => { queries++; return []; };
+    await assert.rejects(
+      () => plugin.verifyCreatedUploadDuplicates(
+        { remote: {}, local: { "folder/new.md": { size: 1, mtime: 1 } } },
+        [{ path: "folder/new.md", action: "upload" }],
+        {},
+        { "folder/new.md": { id: "reserved", name: "new.md", size: 1, md5Checksum: "a", parentId: "parent" } },
+        "run-1"
+      ),
+      /not visible during duplicate verification/
+    );
+    assert.strictEqual(queries, 2, "an inconclusive postflight gets one collision-only visibility retry");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass, { duplicateGuardMode: "auto" });
+    plugin.syncMetrics = { duplicateGuardPostflightParents: 0, duplicateGuardSelfHealed: 0 };
+    let listCalls = 0;
+    plugin.remoteChildren = async () => {
+      listCalls++;
+      return [{ id: "a", name: "a.md", size: "1", md5Checksum: "a", mimeType: "text/markdown" },
+        { id: "b", name: "b.md", size: "1", md5Checksum: "b", mimeType: "text/markdown" }];
+    };
+    const context = { remote: {}, local: {} };
+    const entries = [{ path: "folder/a.md", action: "upload" }, { path: "folder/b.md", action: "upload" }];
+    const remoteMutations = {
+      "folder/a.md": { id: "a", name: "a.md", size: 1, md5Checksum: "a", parentId: "parent" },
+      "folder/b.md": { id: "b", name: "b.md", size: 1, md5Checksum: "b", parentId: "parent" }
+    };
+    await plugin.verifyCreatedUploadDuplicates(context, entries, {}, remoteMutations, "run-1");
+    assert.strictEqual(listCalls, 1, "all creates in one parent must share one postflight list request");
+    assert.strictEqual(plugin.syncMetrics.duplicateGuardPostflightParents, 1);
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    let verified = false;
+    let flushedAfterVerification = false;
+    let guardRequests = 0;
+    const verifyCreatedUploadDuplicates = plugin.verifyCreatedUploadDuplicates.bind(plugin);
+    plugin.verifyCreatedUploadDuplicates = async (...args) => {
+      verified = true;
+      return verifyCreatedUploadDuplicates(...args);
+    };
+    plugin.remoteChildren = async () => { guardRequests++; return []; };
+    plugin.flushOperationJournal = async () => { flushedAfterVerification = verified; };
+    await plugin.executePlan({ snapshot: {}, local: {}, remote: {} }, { entries: [] }, "");
+    assert.strictEqual(verified, true, "executePlan must run duplicate postflight before returning");
+    assert.strictEqual(flushedAfterVerification, true, "operation journal must flush after postflight reconciliation");
+    assert.strictEqual(guardRequests, 0, "an unchanged sync must not make duplicate-guard Drive requests");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass, { deviceId: "device-test" });
+    plugin.runtimeEpoch = "old-runtime";
+    globalThis.__drivebridgeRuntimeEpoch = "new-runtime";
+    assert.throws(() => plugin.assertCurrentRuntime(), /newer DriveBridge runtime/);
+    plugin.runtimeEpoch = "";
+    assert.doesNotThrow(() => plugin.assertCurrentRuntime());
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(plugin.provenanceProperties("op-1", "run-1"))), {
+      drivebridgeOperationId: "op-1",
+      drivebridgeRunId: "run-1",
+      drivebridgeDeviceId: "device-test",
+      drivebridgeProtocolVersion: "2"
+    });
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    const pages = [{
+      files: [
+        { id: "old", name: "same.md", mimeType: "text/markdown", size: "4", createdTime: "2026-01-01T00:00:00Z", md5Checksum: "abcd", parents: ["root"] },
+        { id: "new", name: "same.md", mimeType: "text/markdown", size: "4", createdTime: "2026-01-02T00:00:00Z", md5Checksum: "abcd", parents: ["root"] }
+      ]
+    }];
+    plugin.driveFetch = async () => ({ ok: true, status: 200, text: async () => JSON.stringify(pages.shift()) });
+    plugin.isExcluded = () => false;
+    const groups = [];
+    const files = {};
+    await plugin.scanRemoteFolder("root", "", files, { duplicateGroups: groups, continueOnDuplicate: true });
+    assert.strictEqual(groups.length, 1);
+    assert.strictEqual(groups[0].candidates.length, 2);
+    assert.strictEqual(files["same.md"].id, "old", "repair preview keeps a deterministic first candidate without mutating Drive");
+  }
+
   console.log("DriveBridge tests passed");
 }
 
