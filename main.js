@@ -591,6 +591,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     return [
       "REPAIR REMOTE INDEX — COMPLETE",
       "Operation type: metadata index repair (not Normal sync / not a file backup)",
+      `Completed at: ${formatLogDateTime(new Date())}`,
       `Elapsed: ${(elapsedMs / 1000).toFixed(1)}s`,
       `DriveBridge version: ${this.manifest.version}`,
       `Remote files indexed: ${count}`,
@@ -605,8 +606,9 @@ module.exports = class DriveBridgePlugin extends Plugin {
     return [
       "REPAIR REMOTE INDEX — STOPPED WITH ERROR",
       "Operation type: metadata index repair (not Normal sync / not a file backup)",
+      `Stopped at: ${formatLogDateTime(new Date())}`,
       `Elapsed: ${(elapsedMs / 1000).toFixed(1)}s`,
-      `Stopped at: ${failure.path || REMOTE_SNAPSHOT_FILE}`,
+      `Stopped while processing: ${failure.path || REMOTE_SNAPSHOT_FILE}`,
       `Reason: ${failure.message || "Unknown error"}`,
       "Result: the repaired remote index was not completed.",
       "Normal sync was not run. Drive files were not automatically deleted by this failed repair.",
@@ -3826,6 +3828,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const lines = [
       dryRun ? "Preview only. No files changed." : "Planned real sync.",
       `DriveBridge version: ${this.manifest.version}`,
+      `${dryRun ? "Completed" : "Planned"} at: ${formatLogDateTime(new Date())}`,
       `Elapsed: ${(elapsedMs / 1000).toFixed(1)}s`,
       `Mode: ${this.settings.syncMode}`,
       `Conflict handling: ${this.settings.conflictAction || DEFAULT_SETTINGS.conflictAction}`,
@@ -3854,6 +3857,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const lines = [
       `${incomplete ? "Completed with pending items" : "Completed"} in ${(elapsedMs / 1000).toFixed(1)}s`,
       `DriveBridge version: ${this.manifest.version}`,
+      `Completed at: ${formatLogDateTime(new Date())}`,
       `Data processed: ${formatBytes(executed.processedBytes || 0)} / ${formatBytes(executed.totalBytes || 0)}`,
       `Uploaded: ${executed.stats.upload}`,
       `Downloaded: ${executed.stats.download}`,
@@ -3904,6 +3908,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
   formatFatalErrorSummary(error, elapsedMs) {
     return [
       `Failed after ${(elapsedMs / 1000).toFixed(1)}s`,
+      `Stopped at: ${formatLogDateTime(new Date())}`,
       "",
       "Error details:",
       ...this.formatErrorLines([error], 1),
@@ -5164,6 +5169,24 @@ function formatTimestamp(date) {
     pad(date.getMinutes()),
     pad(date.getSeconds())
   ].join("");
+}
+
+function formatLogDateTime(date) {
+  const pad = (value) => String(value).padStart(2, "0");
+  const offsetMinutes = -date.getTimezoneOffset();
+  const offsetSign = offsetMinutes >= 0 ? "+" : "-";
+  const absoluteOffset = Math.abs(offsetMinutes);
+  const offsetHours = pad(Math.floor(absoluteOffset / 60));
+  const offsetRemainder = pad(absoluteOffset % 60);
+  return [
+    date.getFullYear(),
+    pad(date.getMonth() + 1),
+    pad(date.getDate())
+  ].join("-") + " " + [
+    pad(date.getHours()),
+    pad(date.getMinutes()),
+    pad(date.getSeconds())
+  ].join(":") + ` (UTC${offsetSign}${offsetHours}:${offsetRemainder})`;
 }
 
 function sleep(ms) {

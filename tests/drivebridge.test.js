@@ -997,12 +997,18 @@ async function run() {
     const { PluginClass } = loadPlugin();
     const plugin = pluginInstance(PluginClass);
     plugin.manifest = { version: "0.5.6" };
+    const plan = { stats: { upload: 0, download: 0, moveRemote: 0, conflict: 0, adopt: 0, deleteLocal: 0, deleteRemote: 0, skip: 0 }, entries: [] };
+    const preview = plugin.formatPlanSummary(plan, true, 500);
+    assert.match(preview, /Completed at: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \(UTC[+-]\d{2}:\d{2}\)/);
     const success = plugin.formatRemoteIndexRepairSuccess(42, 3, 1250);
     assert.match(success, /REPAIR REMOTE INDEX — COMPLETE/);
     assert.match(success, /not Normal sync \/ not a file backup/);
+    assert.match(success, /Completed at: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \(UTC[+-]\d{2}:\d{2}\)/);
     assert.match(success, /Next: run Normal Preview, then Normal sync/);
     const failure = plugin.formatRemoteIndexRepairFailure({ path: "remote_snapshot.json", message: "duplicate name" }, 2500);
     assert.match(failure, /REPAIR REMOTE INDEX — STOPPED WITH ERROR/);
+    assert.match(failure, /Stopped at: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \(UTC[+-]\d{2}:\d{2}\)/);
+    assert.match(failure, /Stopped while processing: remote_snapshot\.json/);
     assert.match(failure, /Normal sync was not run/);
     assert.match(failure, /duplicate name/);
   }
