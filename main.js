@@ -302,7 +302,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     try {
       const recovery = await this.checkInterruptedSync();
       if (recovery.interrupted && !dryRun && !recoveryResume) {
-        const message = `Previous DriveBridge sync appears interrupted. Run Preview first or use recovery actions. In-progress: ${recovery.inProgress.length}, partial files: ${recovery.partials.length}.`;
+        const message = this.formatInterruptedSyncMessage(recovery);
         this.settings.lastRecoverySummary = message;
         this.settings.lastSyncSummary = message;
         await this.saveSettings();
@@ -333,12 +333,12 @@ module.exports = class DriveBridgePlugin extends Plugin {
         this.settings.recoveryPlanPreviewRunId = recovery.runId;
         this.settings.recoveryPlanPreviewAt = Date.now();
         this.settings.recoveryPlanPreviewSafe = unsafeResumeActions.length === 0;
-        this.settings.lastRecoverySummary = [
+        this.settings.lastRecoverySummary = withDisplayLogTime([
           "Normal Preview completed after recovery preview.",
           unsafeResumeActions.length
             ? `Resume safe operations is blocked because Preview includes ${unsafeResumeActions.length} conflict/delete action(s).`
             : "Resume safe operations is now available."
-        ].join("\n");
+        ].join("\n"));
       }
 
       if (dryRun) {
@@ -646,7 +646,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       plan.digest = md5Hex(new TextEncoder().encode(JSON.stringify(plan)).buffer);
       await this.writePluginDataFile(REPAIR_PLAN_FILE, JSON.stringify(plan, null, 2));
       await this.enqueueDuplicateRepairReviews(groups.filter((group) => !group.safe));
-      this.settings.lastRecoverySummary = `Duplicate repair preview\nGroups: ${groups.length}\nSafe to isolate: ${groups.filter((g) => g.safe).length}\nManual review: ${groups.filter((g) => !g.safe).length}\nPlan digest: ${plan.digest}`;
+      this.settings.lastRecoverySummary = withDisplayLogTime(`Duplicate repair preview\nGroups: ${groups.length}\nSafe to isolate: ${groups.filter((g) => g.safe).length}\nManual review: ${groups.filter((g) => !g.safe).length}\nPlan digest: ${plan.digest}`);
       await this.saveSettings();
       new Notice(`DriveBridge found ${groups.length} duplicate group(s). Review the preview before Apply.`, 10000);
       return plan;
@@ -704,7 +704,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
         const preservedDeleted = this.mergeRemoteDeleteTombstones(previousRemoteState && previousRemoteState.deleted || {}, {}, files);
         await this.writeRemoteSnapshotFile(rootFolderId, files, preservedDeleted);
       }
-      this.settings.lastRecoverySummary = `Duplicate repair Apply\nItems isolated to Drive trash: ${isolated}\nRemaining duplicate groups: ${remaining.length}${remaining.length ? "\nResolve Manual Review items, then Preview again." : "\nRemote snapshot rebuilt."}`;
+      this.settings.lastRecoverySummary = withDisplayLogTime(`Duplicate repair Apply\nItems isolated to Drive trash: ${isolated}\nRemaining duplicate groups: ${remaining.length}${remaining.length ? "\nResolve Manual Review items, then Preview again." : "\nRemote snapshot rebuilt."}`);
       await this.saveSettings();
       return { isolated, remaining: remaining.length };
     } finally {
@@ -2752,7 +2752,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
         items: queue.items.filter((candidate) => candidate.id !== item.id)
       });
       this.settings.lastSyncStatus = this.reviewCount ? "completed_incomplete" : "completed";
-      this.settings.lastSyncSummary = `Conflict resolved: ${item.path}\nRemaining reviews: ${this.reviewCount}`;
+      this.settings.lastSyncSummary = withDisplayLogTime(`Conflict resolved: ${item.path}\nRemaining reviews: ${this.reviewCount}`);
       await this.saveSettings();
       new Notice(`DriveBridge conflict resolved: ${item.path}`);
     } finally {
@@ -3008,17 +3008,43 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const journal = await this.readOperationJournal();
     const partials = await this.findPartialDownloads();
     const recoveryStatuses = new Set(["running", "commit_pending", "recovery_required", "completed_with_errors"]);
-    const inProgress = journal && recoveryStatuses.has(journal.status)
-      ? Object.values(journal.operations || {}).filter((operation) => operation.status === "in_progress")
+    const operations = journal && recoveryStatuses.has(journal.status)
+      ? Object.values(journal.operations || {})
       : [];
+    const inProgress = operations.filter((operation) => operation.status === "in_progress");
+    const pending = operations.filter((operation) => operation.status === "pending");
+    const done = operations.filter((operation) => operation.status === "done");
+    const failed = operations.filter((operation) => operation.status === "failed");
     const journalRunning = Boolean(journal && recoveryStatuses.has(journal.status));
     return {
       interrupted: journalRunning || partials.length > 0,
       runId: journal && journal.runId ? journal.runId : "",
       journal,
       inProgress,
+      pending,
+      done,
+      failed,
+      lastActivityAt: latestJournalActivityAt(journal),
       partials
     };
+  }
+
+  formatInterruptedSyncMessage(recovery) {
+    const lines = [
+      "Previous DriveBridge sync appears interrupted. Run Preview first or use recovery actions.",
+      `Journal status: ${recovery && recovery.journal && recovery.journal.status || "none"}`,
+      `Done: ${recovery && recovery.done ? recovery.done.length : 0}`,
+      `Pending: ${recovery && recovery.pending ? recovery.pending.length : 0}`,
+      `In-progress: ${recovery && recovery.inProgress ? recovery.inProgress.length : 0}`,
+      `Failed: ${recovery && recovery.failed ? recovery.failed.length : 0}`,
+      `Partial files: ${recovery && recovery.partials ? recovery.partials.length : 0}`
+    ];
+    if (recovery && recovery.lastActivityAt) {
+      lines.push(`Stopped at: ${formatLogDateTime(new Date(recovery.lastActivityAt))}`);
+    } else {
+      lines.push(`Detected at: ${formatLogDateTime(new Date())}`);
+    }
+    return lines.join("\n");
   }
 
   async reconcileRecoveryContext(recovery, context) {
@@ -3172,7 +3198,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     this.settings.recoveryPlanPreviewRunId = "";
     this.settings.recoveryPlanPreviewAt = 0;
     this.settings.recoveryPlanPreviewSafe = false;
-    this.settings.lastRecoverySummary = [
+    this.settings.lastRecoverySummary = withDisplayLogTime([
       "Recovery preview",
       `Run ID: ${recovery.runId || "none"}`,
       `Interrupted: ${recovery.interrupted ? "yes" : "no"}`,
@@ -3183,7 +3209,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       `Partial/replacement files: ${recovery.partials.length}`,
       `Resume gate: ${safe ? "recovery preview passed; run normal Preview next" : "blocked"}`,
       ...(blockers.length ? ["", "Blockers:", ...blockers.map((item) => `- ${item}`)] : [])
-    ].join("\n");
+    ].join("\n"));
     this.settings.lastSyncSummary = this.settings.lastRecoverySummary;
     await this.saveSettings();
     new Notice(safe ? "Recovery preview passed. Run normal Preview next." : "Recovery preview found blockers.", 10000);
@@ -3295,7 +3321,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     this.settings.recoveryPlanPreviewRunId = "";
     this.settings.recoveryPlanPreviewAt = 0;
     this.settings.recoveryPlanPreviewSafe = false;
-    this.settings.lastRecoverySummary = `Discarded ${partials.length} DriveBridge partial/replacement file(s). Run Preview before syncing.`;
+    this.settings.lastRecoverySummary = withDisplayLogTime(`Discarded ${partials.length} DriveBridge partial/replacement file(s). Run Preview before syncing.`);
     this.settings.lastSyncSummary = this.settings.lastRecoverySummary;
     await this.saveSettings();
     new Notice(this.settings.lastRecoverySummary, 10000);
@@ -3920,6 +3946,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
   formatErrorModalMessage(title, errors) {
     return [
       title,
+      `Logged at: ${formatLogDateTime(new Date())}`,
       "",
       ...this.formatErrorLines(errors, 3),
       "",
@@ -5187,6 +5214,33 @@ function formatLogDateTime(date) {
     pad(date.getMinutes()),
     pad(date.getSeconds())
   ].join(":") + ` (UTC${offsetSign}${offsetHours}:${offsetRemainder})`;
+}
+
+function withDisplayLogTime(message, label = "Completed at", date = new Date()) {
+  const text = String(message || "");
+  if (/^(?:Completed|Stopped|Planned|Logged|Detected) at:/m.test(text)) {
+    return text;
+  }
+  return `${text}\n${label}: ${formatLogDateTime(date)}`;
+}
+
+function latestJournalActivityAt(journal) {
+  if (!journal) {
+    return "";
+  }
+  const timestamps = [journal.startedAt, journal.completedAt];
+  for (const operation of Object.values(journal.operations || {})) {
+    timestamps.push(
+      operation.startedAt,
+      operation.completedAt,
+      operation.error && operation.error.time
+    );
+  }
+  const times = timestamps
+    .filter(Boolean)
+    .map((value) => Date.parse(value))
+    .filter((value) => Number.isFinite(value));
+  return times.length ? new Date(Math.max(...times)).toISOString() : "";
 }
 
 function sleep(ms) {

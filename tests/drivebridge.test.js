@@ -1016,6 +1016,43 @@ async function run() {
   {
     const { PluginClass } = loadPlugin();
     const plugin = pluginInstance(PluginClass);
+    plugin.readOperationJournal = async () => ({
+      version: 2,
+      runId: "interrupted-run",
+      status: "running",
+      startedAt: "2026-07-17T03:39:18.626Z",
+      operations: {
+        "done.md": { path: "done.md", action: "upload", status: "done", completedAt: "2026-07-17T03:43:15.452Z" },
+        "pending.md": { path: "pending.md", action: "upload", status: "pending" },
+        "failed.md": { path: "failed.md", action: "upload", status: "failed", error: { time: "2026-07-17T03:42:00.000Z" } }
+      }
+    });
+    plugin.findPartialDownloads = async () => [];
+    const recovery = await plugin.checkInterruptedSync();
+    assert.strictEqual(recovery.done.length, 1);
+    assert.strictEqual(recovery.pending.length, 1);
+    assert.strictEqual(recovery.inProgress.length, 0);
+    assert.strictEqual(recovery.failed.length, 1);
+    assert.strictEqual(recovery.lastActivityAt, "2026-07-17T03:43:15.452Z");
+    const interruptedMessage = plugin.formatInterruptedSyncMessage(recovery);
+    assert.match(interruptedMessage, /Journal status: running/);
+    assert.match(interruptedMessage, /Done: 1/);
+    assert.match(interruptedMessage, /Pending: 1/);
+    assert.match(interruptedMessage, /In-progress: 0/);
+    assert.match(interruptedMessage, /Failed: 1/);
+    assert.match(interruptedMessage, /Stopped at: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \(UTC[+-]\d{2}:\d{2}\)/);
+
+    plugin.checkInterruptedSync = async () => recovery;
+    plugin.saveSettings = async () => {};
+    await plugin.previewRecovery();
+    assert.match(plugin.settings.lastRecoverySummary, /Completed at: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \(UTC[+-]\d{2}:\d{2}\)/);
+    assert.match(plugin.settings.lastSyncSummary, /Completed at:/);
+    assert.match(plugin.formatErrorModalMessage("DriveBridge sync error 1. Continuing...", [{ action: "upload", path: "note.md", time: "now", message: "failure" }]), /Logged at: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \(UTC[+-]\d{2}:\d{2}\)/);
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
     plugin.syncing = true;
     plugin.activeOperation = "sync";
     let queuedMessage = "";

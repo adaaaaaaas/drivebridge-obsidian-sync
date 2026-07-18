@@ -2,6 +2,7 @@
 
 ## Latest change
 
+- 0.5.72: Adds a local timestamp with UTC offset to every durable result log shown in DriveBridge settings or completion/error modals. Interrupted-sync notices now show journal status plus done, pending, in-progress, failed, and partial counts, along with the last journal activity time.
 - 0.5.71: The latest-run log shown in Obsidian now includes the local completion or stop time with its UTC offset for Preview, Normal sync, and Repair remote index.
 - 0.5.7: Queues Repair remote index when a Normal/automatic sync is already finishing, then starts Repair automatically instead of dropping the button action. The progress modal now distinguishes Normal sync, Repair queued, Repair running, Repair complete, and Repair stopped, preventing a previous Normal sync error from looking like the Repair result. Normal Preview now also populates the internal conflict review queue, so Open review becomes available immediately when Preview reports conflicts; no vault or Drive file is changed.
 - 0.5.6: Separates Normal sync from Repair remote index in commands, settings, progress, completion, and error messages. Repair now states that it is a metadata-index operation rather than a normal backup, reports an explicit COMPLETE or STOPPED result, and tells the user whether to repair again or continue with Normal Preview and Normal sync.
