@@ -2,6 +2,7 @@
 
 ## Latest change
 
+- 0.5.73: Fixes Conflict Review rows and responsive sizing for long paths, adds multi-select Local/Drive resolution, and makes `Use Local` / `Use Drive` discard the unselected version without leaving a conflict copy. `Keep both` remains the explicit way to preserve both versions.
 - 0.5.72: Adds a local timestamp with UTC offset to every durable result log shown in DriveBridge settings or completion/error modals. Interrupted-sync notices now show journal status plus done, pending, in-progress, failed, and partial counts, along with the last journal activity time.
 - 0.5.71: The latest-run log shown in Obsidian now includes the local completion or stop time with its UTC offset for Preview, Normal sync, and Repair remote index.
 - 0.5.7: Queues Repair remote index when a Normal/automatic sync is already finishing, then starts Repair automatically instead of dropping the button action. The progress modal now distinguishes Normal sync, Repair queued, Repair running, Repair complete, and Repair stopped, preventing a previous Normal sync error from looking like the Repair result. Normal Preview now also populates the internal conflict review queue, so Open review becomes available immediately when Preview reports conflicts; no vault or Drive file is changed.
@@ -52,7 +53,8 @@
 
 - `Manual review` is the recommended conflict mode. Safe files keep syncing while conflicts wait in `review-queue.json`.
 - Open `Review sync conflicts` from the command palette, ribbon, or DriveBridge settings.
-- Each pending item shows Local and Google Drive metadata and offers `Use Local`, `Use Drive`, `Keep both`, or `Defer`.
+- Each pending item shows Local and Google Drive metadata and offers `Use Local`, `Use Drive`, `Keep both`, or `Defer`. `Use Local` and `Use Drive` discard the other version without leaving a conflict copy; only `Keep both` preserves it under a conflict name.
+- Select multiple pending items to apply `Use Local` or `Use Drive` in one confirmed batch. Every item is still rechecked separately, failed items remain pending, and no conflict copies are kept for successful items.
 - DriveBridge rechecks both sides immediately before applying a review choice. A stale choice is rejected instead of overwriting newer content.
 - On iPhone/iPad, the review and settings layouts stack vertically with full-width touch controls; no desktop-only right-click or hover action is required.
 - Large ambiguous files are queued without automatic full-content hashing, keeping normal mobile sync lightweight.

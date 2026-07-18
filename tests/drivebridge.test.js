@@ -19,6 +19,7 @@ class FakeElement {
   }
   createDiv() { return this.createEl(); }
   addEventListener() {}
+  setAttribute(name, value) { this[name] = value; }
   setText() {}
   querySelectorAll() { return []; }
 }
@@ -723,6 +724,135 @@ async function run() {
     const modal = new PluginClass.__ReviewModal({}, plugin, { version: 1, items: [] });
     await modal.refreshQueue();
     assert.strictEqual(modal.queue.items.length, 0, "review modal refresh must render an empty queue without runtime errors");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    const item = {
+      id: "review-1",
+      path: "0_Notes/03_Lab_Notes/a-very-long-conflict-name.md",
+      reason: "changed on both sides",
+      local: { size: 10, mtime: 1 },
+      remote: { id: "remote-1", size: 11, modifiedTime: "2026-07-18T00:00:00Z" }
+    };
+    const modal = new PluginClass.__ReviewModal({}, plugin, { version: 1, items: [item] });
+    assert.doesNotThrow(() => modal.render(), "review modal must render selectable conflict rows");
+    assert.strictEqual(modal.checkedIds.size, 0);
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    plugin.syncing = false;
+    const calls = [];
+    plugin.resolveReviewItem = async (itemId, action, options) => {
+      calls.push({ itemId, action, options, locked: plugin.syncing });
+      if (itemId === "stale") throw new Error("changed after review");
+      return `${itemId}.md`;
+    };
+    plugin.clearSyncStatus = () => {};
+    const result = await PluginClass.prototype.resolveReviewItems.call(
+      plugin,
+      ["first", "stale", "last", "first"],
+      "keepRemote"
+    );
+    assert.strictEqual(calls.length, 3, "bulk review must deduplicate selected IDs");
+    assert.ok(calls.every((call) => call.locked && call.options.lockHeld && call.options.silent),
+      "bulk review must hold one sync lock while reusing the single-item verification path");
+    assert.strictEqual(JSON.stringify(result.resolved.map((item) => item.id)), JSON.stringify(["first", "last"]));
+    assert.strictEqual(JSON.stringify(result.failed.map((item) => item.id)), JSON.stringify(["stale"]));
+    assert.strictEqual(plugin.syncing, false, "bulk review must release the sync lock after partial failure");
+    await assert.rejects(
+      () => PluginClass.prototype.resolveReviewItems.call(plugin, ["first"], "keepBoth"),
+      /only Local or Drive/
+    );
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    const local = { path: "conflict.md", size: 3, mtime: 10 };
+    const remote = {
+      path: "conflict.md",
+      id: "remote-1",
+      size: 4,
+      modifiedTime: "2026-01-01T00:00:00Z",
+      md5Checksum: "abcd"
+    };
+    const item = plugin.reviewItemsForPlan({ entries: [
+      { path: "conflict.md", action: "conflict", reason: "changed on both sides" }
+    ] }, { local: { "conflict.md": local }, remote: { "conflict.md": remote } })[0];
+    plugin.syncing = false;
+    plugin.loadReviewQueue = async () => ({ version: 1, items: [item] });
+    plugin.ensureAccessToken = async () => {};
+    plugin.ensureRootFolder = async () => "root";
+    plugin.localInfoByPath = async () => local;
+    plugin.remoteInfoById = async () => remote;
+    let conflictCopies = 0;
+    plugin.writeConflictCopy = async () => { conflictCopies++; };
+    plugin.uploadLocalFile = async () => ({ ...remote, size: local.size });
+    plugin.snapshotFrom = () => ({ local: {}, remote: {} });
+    plugin.loadSnapshot = async () => ({});
+    plugin.saveSnapshot = async () => {};
+    plugin.scanRemoteVault = async () => ({ files: {}, deleted: {} });
+    plugin.saveRemoteSnapshot = async () => {};
+    plugin.saveReviewQueue = async () => { plugin.reviewCount = 0; };
+    plugin.saveSettings = async () => {};
+    plugin.clearSyncStatus = () => {};
+    await plugin.resolveReviewItem(item.id, "keepLocal", { silent: true });
+    assert.strictEqual(conflictCopies, 0, "Use Local must discard the Drive version without creating a conflict copy");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    const local = { path: "conflict.md", size: 3, mtime: 10 };
+    const localAfter = { path: "conflict.md", size: 4, mtime: 20 };
+    const remote = {
+      path: "conflict.md",
+      id: "remote-1",
+      size: 4,
+      modifiedTime: "2026-01-01T00:00:00Z",
+      md5Checksum: "abcd"
+    };
+    const item = plugin.reviewItemsForPlan({ entries: [
+      { path: "conflict.md", action: "conflict", reason: "changed on both sides" }
+    ] }, { local: { "conflict.md": local }, remote: { "conflict.md": remote } })[0];
+    plugin.syncing = false;
+    plugin.loadReviewQueue = async () => ({ version: 1, items: [item] });
+    plugin.ensureAccessToken = async () => {};
+    plugin.ensureRootFolder = async () => "root";
+    let downloaded = false;
+    plugin.localInfoByPath = async () => downloaded ? localAfter : local;
+    plugin.remoteInfoById = async () => remote;
+    let conflictRenames = 0;
+    plugin.renameLocalToConflict = async () => { conflictRenames++; };
+    let plannedLocal;
+    plugin.downloadRemoteFile = async (_path, _remote, options) => {
+      plannedLocal = options.plannedLocal;
+      downloaded = true;
+    };
+    plugin.hasSameContent = async () => true;
+    plugin.snapshotFrom = () => ({ local: {}, remote: {} });
+    plugin.loadSnapshot = async () => ({});
+    plugin.saveSnapshot = async () => {};
+    plugin.scanRemoteVault = async () => ({ files: {}, deleted: {} });
+    plugin.saveRemoteSnapshot = async () => {};
+    plugin.saveReviewQueue = async () => { plugin.reviewCount = 0; };
+    plugin.saveSettings = async () => {};
+    plugin.clearSyncStatus = () => {};
+    await plugin.resolveReviewItem(item.id, "keepRemote", { silent: true });
+    assert.strictEqual(conflictRenames, 0, "Use Drive must replace Local without creating a conflict copy");
+    assert.strictEqual(plannedLocal, local, "Use Drive must recheck the planned Local version before atomic replacement");
+  }
+
+  {
+    const css = fs.readFileSync(path.join(__dirname, "..", "styles.css"), "utf8");
+    assert.match(css, /\.drivebridge-review-item\s*\{[^}]*height:\s*auto/s,
+      "review rows must override Obsidian's fixed button height for wrapped paths");
+    assert.match(css, /\.drivebridge-review-row\s*\{[^}]*grid-template-columns:/s,
+      "review rows must reserve a separate checkbox column");
   }
 
   {

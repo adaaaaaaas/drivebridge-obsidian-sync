@@ -76,9 +76,44 @@
   }
 }
 
+.modal.drivebridge-review-shell {
+  width: min(1100px, calc(100vw - 32px));
+  max-width: calc(100vw - 32px);
+}
+
 .drivebridge-review-modal {
-  width: min(1000px, 92vw);
+  width: 100%;
   max-width: 100%;
+  container-type: inline-size;
+}
+
+.drivebridge-review-bulk {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding: 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-secondary);
+}
+
+.drivebridge-review-select-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 44px;
+}
+
+.drivebridge-review-selection-count {
+  margin-right: auto;
+  color: var(--text-muted);
+}
+
+.drivebridge-review-bulk button {
+  min-height: 44px;
+  white-space: normal;
 }
 
 .drivebridge-review-layout {
@@ -100,18 +135,43 @@
   gap: 6px;
 }
 
-.drivebridge-review-item {
-  width: 100%;
-  min-height: 44px;
-  padding: 8px 10px;
-  text-align: left;
-  white-space: normal;
-  overflow-wrap: anywhere;
+.drivebridge-review-row {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  align-items: start;
+  gap: 4px;
+  min-width: 0;
+  padding: 4px;
+  border: 1px solid transparent;
+  border-radius: 8px;
 }
 
-.drivebridge-review-item.is-selected {
+.drivebridge-review-row.is-selected {
   border-color: var(--interactive-accent);
   background: var(--background-modifier-hover);
+}
+
+.drivebridge-review-checkbox {
+  width: 18px;
+  height: 18px;
+  margin: 13px 5px;
+}
+
+.drivebridge-review-checkbox-spacer {
+  width: 28px;
+}
+
+.drivebridge-review-item {
+  display: block;
+  width: 100%;
+  height: auto;
+  min-height: 44px;
+  padding: 8px 10px;
+  align-self: stretch;
+  text-align: left;
+  line-height: 1.35;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .drivebridge-review-path {
@@ -162,6 +222,11 @@
 }
 
 @media (max-width: 600px) {
+  .modal.drivebridge-review-shell {
+    width: calc(100vw - 16px);
+    max-width: calc(100vw - 16px);
+  }
+
   .drivebridge-progress-modal,
   .drivebridge-review-modal {
     width: 100%;
@@ -185,6 +250,18 @@
     display: grid;
     grid-template-columns: minmax(0, 1fr);
     padding-bottom: max(12px, env(safe-area-inset-bottom));
+  }
+
+  .drivebridge-review-bulk {
+    align-items: stretch;
+  }
+
+  .drivebridge-review-selection-count {
+    align-self: center;
+  }
+
+  .drivebridge-review-bulk button {
+    width: 100%;
   }
 
   .drivebridge-settings .setting-item {
@@ -218,5 +295,16 @@
   .drivebridge-progress-message {
     overflow-wrap: anywhere;
     white-space: pre-wrap;
+  }
+}
+
+@container (max-width: 720px) {
+  .drivebridge-review-layout,
+  .drivebridge-review-compare {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .drivebridge-review-list {
+    max-height: 32vh;
   }
 }

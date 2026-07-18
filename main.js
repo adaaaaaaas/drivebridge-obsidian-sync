@@ -2690,11 +2690,12 @@ module.exports = class DriveBridgePlugin extends Plugin {
     modal.open();
   }
 
-  async resolveReviewItem(itemId, action) {
-    if (this.syncing) {
+  async resolveReviewItem(itemId, action, options = {}) {
+    const ownsSyncLock = !options.lockHeld;
+    if (this.syncing && ownsSyncLock) {
       throw new Error("DriveBridge is already running.");
     }
-    this.syncing = true;
+    if (ownsSyncLock) this.syncing = true;
     try {
       const queue = await this.loadReviewQueue();
       const item = queue.items.find((candidate) => candidate.id === itemId);
@@ -2713,10 +2714,12 @@ module.exports = class DriveBridgePlugin extends Plugin {
 
       let resolvedSnapshot;
       if (action === "keepLocal" || action === "keepBoth") {
-        await this.writeConflictCopy(item.path, remoteItem);
+        if (action === "keepBoth") {
+          await this.writeConflictCopy(item.path, remoteItem);
+        }
         const uploadStart = await this.localInfoByPath(item.path);
         if (reviewIdentityKey(item.path, uploadStart, remoteItem) !== item.id) {
-          throw new Error("Local changed while the Drive backup was being created. Run sync to refresh the review.");
+          throw new Error("Local or Drive changed before the reviewed version could be applied. Run sync to refresh the review.");
         }
         const uploaded = await this.uploadLocalFile(item.path, rootFolderId, remoteItem, { duplicateGuard: false });
         const localAfter = await this.localInfoByPath(item.path);
@@ -2725,8 +2728,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
         }
         resolvedSnapshot = this.snapshotFrom(localAfter, uploaded);
       } else if (action === "keepRemote") {
-        await this.renameLocalToConflict(item.path);
-        await this.downloadRemoteFile(item.path, remoteItem);
+        await this.downloadRemoteFile(item.path, remoteItem, { plannedLocal: localItem });
         const localAfter = await this.localInfoByPath(item.path);
         if (!(await this.hasSameContent(item.path, localAfter, remoteItem))) {
           throw new Error("Downloaded Drive version could not be reverified.");
@@ -2754,7 +2756,45 @@ module.exports = class DriveBridgePlugin extends Plugin {
       this.settings.lastSyncStatus = this.reviewCount ? "completed_incomplete" : "completed";
       this.settings.lastSyncSummary = withDisplayLogTime(`Conflict resolved: ${item.path}\nRemaining reviews: ${this.reviewCount}`);
       await this.saveSettings();
-      new Notice(`DriveBridge conflict resolved: ${item.path}`);
+      if (!options.silent) {
+        new Notice(`DriveBridge conflict resolved: ${item.path}`);
+      }
+      return item.path;
+    } finally {
+      if (ownsSyncLock) {
+        this.syncing = false;
+        this.clearSyncStatus();
+      }
+    }
+  }
+
+  async resolveReviewItems(itemIds, action) {
+    if (this.syncing) {
+      throw new Error("DriveBridge is already running.");
+    }
+    if (action !== "keepLocal" && action !== "keepRemote") {
+      throw new Error("Bulk review supports only Local or Drive as canonical.");
+    }
+    const pendingIds = Array.from(new Set(Array.isArray(itemIds) ? itemIds.filter(Boolean) : []));
+    if (!pendingIds.length) {
+      return { resolved: [], failed: [] };
+    }
+
+    this.syncing = true;
+    const result = { resolved: [], failed: [] };
+    try {
+      for (const itemId of pendingIds) {
+        try {
+          const path = await this.resolveReviewItem(itemId, action, { lockHeld: true, silent: true });
+          result.resolved.push({ id: itemId, path });
+        } catch (err) {
+          result.failed.push({
+            id: itemId,
+            message: err && err.message ? err.message : String(err)
+          });
+        }
+      }
+      return result;
     } finally {
       this.syncing = false;
       this.clearSyncStatus();
@@ -4110,9 +4150,13 @@ class DriveBridgeConflictReviewModal extends Modal {
     this.plugin = plugin;
     this.queue = queue;
     this.selectedId = queue.items.length ? queue.items[0].id : "";
+    this.checkedIds = new Set();
   }
 
   onOpen() {
+    if (this.modalEl && this.modalEl.addClass) {
+      this.modalEl.addClass("drivebridge-review-shell");
+    }
     this.render();
   }
 
@@ -4122,6 +4166,8 @@ class DriveBridgeConflictReviewModal extends Modal {
 
   async refreshQueue() {
     this.queue = await this.plugin.loadReviewQueue();
+    const pendingIds = new Set(this.queue.items.map((item) => item.id));
+    this.checkedIds = new Set(Array.from(this.checkedIds).filter((id) => pendingIds.has(id)));
     if (!this.queue.items.some((item) => item.id === this.selectedId)) {
       this.selectedId = this.queue.items.length ? this.queue.items[0].id : "";
     }
@@ -4138,13 +4184,46 @@ class DriveBridgeConflictReviewModal extends Modal {
       return;
     }
 
+    const resolvableItems = this.queue.items.filter((item) => item.type !== "duplicateRepair");
+    const bulk = contentEl.createDiv({ cls: "drivebridge-review-bulk" });
+    const selectAllLabel = bulk.createEl("label", { cls: "drivebridge-review-select-all" });
+    const selectAll = selectAllLabel.createEl("input");
+    selectAll.type = "checkbox";
+    selectAll.checked = resolvableItems.length > 0 && resolvableItems.every((item) => this.checkedIds.has(item.id));
+    selectAll.indeterminate = !selectAll.checked && resolvableItems.some((item) => this.checkedIds.has(item.id));
+    selectAllLabel.createEl("span", { text: "Select all" });
+    selectAll.addEventListener("change", () => {
+      this.checkedIds = selectAll.checked ? new Set(resolvableItems.map((item) => item.id)) : new Set();
+      this.render();
+    });
+    bulk.createDiv({
+      text: `${this.checkedIds.size} selected`,
+      cls: "drivebridge-review-selection-count"
+    });
+    this.addBulkAction(bulk, "Use Local for selected", "keepLocal", this.checkedIds.size === 0);
+    this.addBulkAction(bulk, "Use Drive for selected", "keepRemote", this.checkedIds.size === 0);
+
     const layout = contentEl.createDiv({ cls: "drivebridge-review-layout" });
     const list = layout.createDiv({ cls: "drivebridge-review-list" });
     const detail = layout.createDiv({ cls: "drivebridge-review-detail" });
     for (const item of this.queue.items) {
-      const button = list.createEl("button", {
-        cls: `drivebridge-review-item${item.id === this.selectedId ? " is-selected" : ""}`
+      const row = list.createDiv({
+        cls: `drivebridge-review-row${item.id === this.selectedId ? " is-selected" : ""}`
       });
+      if (item.type !== "duplicateRepair") {
+        const checkbox = row.createEl("input", { cls: "drivebridge-review-checkbox" });
+        checkbox.type = "checkbox";
+        checkbox.checked = this.checkedIds.has(item.id);
+        checkbox.setAttribute("aria-label", `Select ${item.path}`);
+        checkbox.addEventListener("change", () => {
+          if (checkbox.checked) this.checkedIds.add(item.id);
+          else this.checkedIds.delete(item.id);
+          this.render();
+        });
+      } else {
+        row.createDiv({ cls: "drivebridge-review-checkbox-spacer" });
+      }
+      const button = row.createEl("button", { cls: "drivebridge-review-item" });
       button.createDiv({ text: item.path, cls: "drivebridge-review-path" });
       button.createDiv({ text: item.reason, cls: "drivebridge-muted" });
       button.addEventListener("click", () => {
@@ -4170,7 +4249,7 @@ class DriveBridgeConflictReviewModal extends Modal {
       return;
     }
     detail.createEl("p", {
-      text: "The version not chosen as canonical is saved as a conflict backup.",
+      text: "Use Local / Use Drive permanently discards the other version after rechecking both sides. Only Keep both creates a conflict copy.",
       cls: "drivebridge-muted"
     });
     const actions = detail.createDiv({ cls: "drivebridge-review-actions" });
@@ -4202,6 +4281,15 @@ class DriveBridgeConflictReviewModal extends Modal {
   addAction(parent, label, action, itemId, cta) {
     const button = parent.createEl("button", { text: label, cls: cta ? "mod-cta" : "" });
     button.addEventListener("click", async () => {
+      if (action === "keepLocal" || action === "keepRemote") {
+        const canonical = action === "keepLocal" ? "Local" : "Google Drive";
+        const discarded = action === "keepLocal" ? "Google Drive" : "Local";
+        const confirmed = window.confirm(
+          `Use ${canonical} as canonical?\n\n` +
+          `The current ${discarded} version will be permanently discarded after both sides are rechecked. No conflict copy will be kept.`
+        );
+        if (!confirmed) return;
+      }
       const buttons = Array.from(parent.querySelectorAll("button"));
       buttons.forEach((candidate) => { candidate.disabled = true; });
       try {
@@ -4210,6 +4298,44 @@ class DriveBridgeConflictReviewModal extends Modal {
       } catch (err) {
         new Notice(err && err.message ? err.message : String(err), 10000);
         buttons.forEach((candidate) => { candidate.disabled = false; });
+      }
+    });
+  }
+
+  addBulkAction(parent, label, action, disabled) {
+    const button = parent.createEl("button", { text: label, cls: action === "keepLocal" ? "mod-cta" : "" });
+    button.disabled = disabled;
+    button.addEventListener("click", async () => {
+      const selectedIds = this.queue.items
+        .filter((item) => this.checkedIds.has(item.id) && item.type !== "duplicateRepair")
+        .map((item) => item.id);
+      if (!selectedIds.length) return;
+      const canonical = action === "keepLocal" ? "Local" : "Google Drive";
+      const confirmed = window.confirm(
+        `Use ${canonical} as canonical for ${selectedIds.length} selected conflict(s)?\n\n` +
+        "Each other version will be permanently discarded. No conflict copies will be kept. Both sides are rechecked before every change."
+      );
+      if (!confirmed) return;
+
+      const controls = Array.from(this.contentEl.querySelectorAll("button, input"));
+      controls.forEach((control) => { control.disabled = true; });
+      try {
+        const result = await this.plugin.resolveReviewItems(selectedIds, action);
+        const resolvedIds = new Set(result.resolved.map((item) => item.id));
+        this.checkedIds = new Set(Array.from(this.checkedIds).filter((id) => !resolvedIds.has(id)));
+        await this.refreshQueue();
+        if (result.failed.length) {
+          const examples = result.failed.slice(0, 3).map((failure) => failure.message).join("\n");
+          new Notice(
+            `Resolved ${result.resolved.length}; ${result.failed.length} failed and remain pending.\n${examples}`,
+            12000
+          );
+        } else {
+          new Notice(`DriveBridge resolved ${result.resolved.length} selected conflict(s) using ${canonical}.`);
+        }
+      } catch (err) {
+        new Notice(err && err.message ? err.message : String(err), 10000);
+        controls.forEach((control) => { control.disabled = false; });
       }
     });
   }
