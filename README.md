@@ -2,6 +2,7 @@
 
 ## Latest change
 
+- 0.5.74: Fixes a Recovery deadlock where `Resume safe operations` was disabled by delete-only plans even though Conflict Review had zero items. Safe resume now defers delete/automatic-conflict writes, completes safe transfers first, and leaves deferred actions for the next Normal Preview.
 - 0.5.73: Fixes Conflict Review rows and responsive sizing for long paths, adds multi-select Local/Drive resolution, and makes `Use Local` / `Use Drive` discard the unselected version without leaving a conflict copy. `Keep both` remains the explicit way to preserve both versions.
 - 0.5.72: Adds a local timestamp with UTC offset to every durable result log shown in DriveBridge settings or completion/error modals. Interrupted-sync notices now show journal status plus done, pending, in-progress, failed, and partial counts, along with the last journal activity time.
 - 0.5.71: The latest-run log shown in Obsidian now includes the local completion or stop time with its UTC offset for Preview, Normal sync, and Repair remote index.
@@ -35,7 +36,7 @@
 - 0.4.13: Adopts same-size files during the first scan and limits repeated per-file error notices to avoid UI overload.
 - 0.4.12: Speeds up many small Markdown syncs by avoiding full-vault rescans after each download and batching operation journal writes.
 - 0.4.11: Recovery buttons now use a dedicated responsive layout instead of a crowded settings row, fixing layout issues on narrow/mobile screens.
-- 0.4.10: Recovery resume is now poka-yoke gated: run Preview recovery, discard partials if needed, run normal Preview, then Resume safe operations only when no conflict/delete risk remains.
+- 0.4.10: Recovery resume is poka-yoke gated: run Preview recovery, discard partials if needed, run normal Preview, then Resume safe operations. Current releases defer conflict/delete risks and resume only safe operations, so delete-only plans cannot deadlock Recovery.
 - 0.4.9: Adds operation journaling, interrupted-sync recovery checks, partial cleanup, and large binary conflict skip for manual review.
 - 0.4.8: Conflict handling now adopts same-size files when local MD5 matches Google Drive MD5, and downloads now write to a verified partial file before replacing the final file.
 - 0.4.7: Sync progress now uses transferred/affected data size instead of processed file count during real sync.

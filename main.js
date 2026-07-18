@@ -330,13 +330,14 @@ module.exports = class DriveBridgePlugin extends Plugin {
       this.settings.lastPlanSummary = summary;
       if (dryRun && this.recoveryPreviewIsCurrent(recovery)) {
         const unsafeResumeActions = this.unsafeResumePlanEntries(plan);
+        const deferredCounts = this.resumeDeferredActionCounts(unsafeResumeActions);
         this.settings.recoveryPlanPreviewRunId = recovery.runId;
         this.settings.recoveryPlanPreviewAt = Date.now();
-        this.settings.recoveryPlanPreviewSafe = unsafeResumeActions.length === 0;
+        this.settings.recoveryPlanPreviewSafe = true;
         this.settings.lastRecoverySummary = withDisplayLogTime([
           "Normal Preview completed after recovery preview.",
           unsafeResumeActions.length
-            ? `Resume safe operations is blocked because Preview includes ${unsafeResumeActions.length} conflict/delete action(s).`
+            ? `Resume safe operations is available. It will defer ${deferredCounts.deletes} delete action(s) and ${deferredCounts.conflicts} automatic conflict action(s), then run only safe operations. After recovery completes, run Normal Preview again to review the deferred actions.`
             : "Resume safe operations is now available."
         ].join("\n"));
       }
@@ -362,22 +363,32 @@ module.exports = class DriveBridgePlugin extends Plugin {
         return;
       }
 
-      this.assertRealSyncAllowed(context, plan);
+      const deferredResumeActions = recoveryResume ? this.unsafeResumePlanEntries(plan) : [];
+      const executionPlan = recoveryResume ? this.safeResumePlan(plan) : plan;
+      this.assertRealSyncAllowed(context, executionPlan);
       if (recoveryResume) {
-        this.assertResumePlanSafe(plan);
+        this.assertResumePlanSafe(executionPlan);
       }
-      await this.writeJournal({ startedAt: new Date().toISOString(), dryRun, plan });
-      const hasOperationWork = recoveryResume || plan.entries.some((entry) => this.shouldJournalOperation(entry));
+      await this.writeJournal({ startedAt: new Date().toISOString(), dryRun, plan: executionPlan });
+      const hasOperationWork = recoveryResume || executionPlan.entries.some((entry) => this.shouldJournalOperation(entry));
       const runId = hasOperationWork
         ? (recoveryResume && recovery.runId
           ? recovery.runId
           : `${formatTimestamp(new Date(started))}-${randomId(6)}`)
         : "";
       if (hasOperationWork) {
-        await this.prepareOperationJournal(runId, plan, context, recoveryResume ? recovery.journal : null);
+        await this.prepareOperationJournal(runId, executionPlan, context, recoveryResume ? recovery.journal : null);
       }
       const resumeDonePaths = recoveryResume ? this.recoveryDonePaths(recovery) : new Set();
-      const executed = await this.executePlan(context, plan, runId, { skipDonePaths: resumeDonePaths });
+      const executed = await this.executePlan(context, executionPlan, runId, { skipDonePaths: resumeDonePaths });
+      if (deferredResumeActions.length) {
+        for (const entry of deferredResumeActions) {
+          executed.skippedSafe.push(this.skipRecord(
+            entry,
+            new Error(`${entry.action} was deferred by Recovery safe resume. Run Normal Preview after recovery completes.`)
+          ));
+        }
+      }
       if (hasOperationWork) {
         await this.markOperationJournalCommitPending(runId, executed);
       }
@@ -3286,7 +3297,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       throw new Error("Run normal Preview after Preview recovery before Resume safe operations.");
     }
     if (!this.settings.recoveryPlanPreviewSafe) {
-      throw new Error("Normal Preview still includes conflict/delete actions. Resolve them before Resume safe operations.");
+      throw new Error("The Normal Preview approval is missing or stale. Run Normal Preview again; Safe resume will defer conflict/delete actions and run only safe operations.");
     }
     if (recovery.partials.length) {
       throw new Error("Partial/replacement files remain. Use Discard partial downloads, then Preview recovery and normal Preview again.");
@@ -3300,7 +3311,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
   assertResumePlanSafe(plan) {
     const unsafe = this.unsafeResumePlanEntries(plan);
     if (unsafe.length) {
-      throw new Error(`Resume safe operations blocked: Preview still includes ${unsafe.length} conflict/delete action(s). Resolve or change mode before resuming.`);
+      throw new Error(`Recovery safety check failed: ${unsafe.length} conflict/delete action(s) were not deferred.`);
     }
   }
 
@@ -3311,6 +3322,29 @@ module.exports = class DriveBridgePlugin extends Plugin {
       return !manualConflict &&
         (entry.action === "conflict" || entry.action === "deleteLocal" || entry.action === "deleteRemote");
     });
+  }
+
+  resumeDeferredActionCounts(entries) {
+    const actions = Array.isArray(entries) ? entries : [];
+    return {
+      deletes: actions.filter((entry) => entry.action === "deleteLocal" || entry.action === "deleteRemote").length,
+      conflicts: actions.filter((entry) => entry.action === "conflict").length
+    };
+  }
+
+  safeResumePlan(plan) {
+    const unsafe = new Set(this.unsafeResumePlanEntries(plan).map((entry) => `${entry.action}\n${entry.path}`));
+    const entries = plan.entries.map((entry) => {
+      if (!unsafe.has(`${entry.action}\n${entry.path}`)) {
+        return entry;
+      }
+      return Object.assign({}, entry, {
+        action: "skip",
+        deferredAction: entry.action,
+        reason: `${entry.action} deferred by Recovery safe resume; review it in Normal Preview after recovery completes`
+      });
+    });
+    return { entries, stats: statsFromEntries(entries) };
   }
 
   recoveryDonePaths(recovery) {
@@ -4660,7 +4694,7 @@ class DriveBridgeSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Recovery")
-      .setDesc("Use in order after an interrupted sync.");
+      .setDesc("Use in order after an interrupted sync. Safe resume defers deletes and automatic conflict writes, runs only safe operations, then asks you to review deferred actions in Normal Preview.");
 
     const recoveryButtonsEl = containerEl.createDiv({ cls: "drivebridge-recovery-flow" });
     this.addRecoveryButton(recoveryButtonsEl, "1. Preview recovery", false, async () => {

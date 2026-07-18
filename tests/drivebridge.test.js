@@ -1182,6 +1182,39 @@ async function run() {
 
   {
     const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass, { conflictAction: "manualReview" });
+    const plan = { entries: [
+      { path: "safe.md", action: "download", reason: "remote changed" },
+      { path: "gone-local.md", action: "deleteLocal", reason: "remote deletion tombstone detected" },
+      { path: "gone-drive.md", action: "deleteRemote", reason: "local deletion detected" },
+      { path: "review.md", action: "conflict", reason: "changed on both sides" }
+    ] };
+    const unsafe = plugin.unsafeResumePlanEntries(plan);
+    assert.strictEqual(unsafe.length, 2, "manual-review conflicts are non-mutating during safe resume; deletes are deferred");
+    assert.strictEqual(JSON.stringify(plugin.resumeDeferredActionCounts(unsafe)), JSON.stringify({ deletes: 2, conflicts: 0 }));
+    const safePlan = plugin.safeResumePlan(plan);
+    assert.strictEqual(
+      JSON.stringify(safePlan.entries.map((entry) => [entry.path, entry.action, entry.deferredAction || ""])),
+      JSON.stringify([
+        ["safe.md", "download", ""],
+        ["gone-local.md", "skip", "deleteLocal"],
+        ["gone-drive.md", "skip", "deleteRemote"],
+        ["review.md", "conflict", ""]
+      ]),
+      "safe resume must execute safe work while preserving delete paths for a later Normal Preview"
+    );
+    assert.doesNotThrow(() => plugin.assertResumePlanSafe(safePlan));
+
+    plugin.settings.conflictAction = "newerWithBackup";
+    const automaticConflictPlan = plugin.safeResumePlan({ entries: [
+      { path: "automatic.md", action: "conflict", reason: "changed on both sides" }
+    ] });
+    assert.strictEqual(automaticConflictPlan.entries[0].action, "skip", "automatic conflict writes must also be deferred");
+    assert.strictEqual(automaticConflictPlan.entries[0].deferredAction, "conflict");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
     const plugin = pluginInstance(PluginClass);
     plugin.syncing = true;
     plugin.activeOperation = "sync";
