@@ -2,6 +2,7 @@
 
 ## Latest change
 
+- 0.5.75: Reuses the previous verified SHA-256 for local files whose size and exact modification time are unchanged, avoiding a full reread and rehash of every small Markdown/JSON/CSS/JS file on each sync. Changed metadata still forces a fresh content hash, substantially reducing repeat-sync load on tablets and phones without changing sync decisions.
 - 0.5.74: Fixes a Recovery deadlock where `Resume safe operations` was disabled by delete-only plans even though Conflict Review had zero items. Safe resume now defers delete/automatic-conflict writes, completes safe transfers first, and leaves deferred actions for the next Normal Preview.
 - 0.5.73: Fixes Conflict Review rows and responsive sizing for long paths, adds multi-select Local/Drive resolution, and makes `Use Local` / `Use Drive` discard the unselected version without leaving a conflict copy. `Keep both` remains the explicit way to preserve both versions.
 - 0.5.72: Adds a local timestamp with UTC offset to every durable result log shown in DriveBridge settings or completion/error modals. Interrupted-sync notices now show journal status plus done, pending, in-progress, failed, and partial counts, along with the last journal activity time.

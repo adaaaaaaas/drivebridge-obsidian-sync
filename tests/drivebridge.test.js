@@ -1249,6 +1249,34 @@ async function run() {
     assert.strictEqual(items[0].remote.id, "remote-1");
   }
 
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    const bytes = new TextEncoder().encode("unchanged note").buffer;
+    let reads = 0;
+    const file = { path: "note.md", stat: { size: bytes.byteLength, mtime: 1234 } };
+    plugin.app = {
+      vault: {
+        getFiles: () => [file],
+        readBinary: async () => { reads++; return bytes; }
+      }
+    };
+    plugin.isExcluded = () => false;
+    const previousHash = "a".repeat(64);
+    const result = await plugin.scanLocalVault({
+      "note.md": { local: { size: bytes.byteLength, mtime: 1234, sha256: previousHash } }
+    });
+    assert.strictEqual(reads, 0, "unchanged files must reuse the verified snapshot hash without rereading content");
+    assert.strictEqual(result["note.md"].sha256, previousHash);
+
+    file.stat.mtime = 1235;
+    const changed = await plugin.scanLocalVault({
+      "note.md": { local: { size: bytes.byteLength, mtime: 1234, sha256: previousHash } }
+    });
+    assert.strictEqual(reads, 1, "a metadata change must force content to be read and hashed again");
+    assert.notStrictEqual(changed["note.md"].sha256, previousHash);
+  }
+
   console.log("DriveBridge tests passed");
 }
 

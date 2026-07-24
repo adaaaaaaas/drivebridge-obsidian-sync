@@ -501,7 +501,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     await this.ensureAccessToken();
     const rootFolderId = await this.ensureRootFolder();
     const snapshot = await this.loadSnapshot();
-    const local = await this.scanLocalVault();
+    const local = await this.scanLocalVault(snapshot);
     const remoteState = await this.scanRemoteVault(rootFolderId);
     return {
       rootFolderId,
@@ -1567,32 +1567,34 @@ module.exports = class DriveBridgePlugin extends Plugin {
     return created.id;
   }
 
-  async scanLocalVault() {
+  async scanLocalVault(snapshot = {}) {
     const result = {};
     for (const file of this.app.vault.getFiles()) {
       if (!this.isExcluded(file.path)) {
-        result[file.path] = await this.localInfo(file);
+        const previousLocal = snapshot[file.path] && snapshot[file.path].local;
+        result[file.path] = await this.localInfo(file, previousLocal);
       }
     }
     if (this.settings.obsidianSyncMode === "safe") {
-      await this.scanAdapterFolder(this.app.vault.configDir || ".obsidian", result);
+      await this.scanAdapterFolder(this.app.vault.configDir || ".obsidian", result, snapshot);
     }
     return result;
   }
 
-  async scanAdapterFolder(folderPath, result) {
+  async scanAdapterFolder(folderPath, result, snapshot = {}) {
     if (!(await this.app.vault.adapter.exists(folderPath))) {
       return;
     }
     const listing = await this.app.vault.adapter.list(folderPath);
     for (const filePath of listing.files || []) {
       if (!this.isExcluded(filePath)) {
-        result[filePath] = await this.localInfoByPath(filePath);
+        const previousLocal = snapshot[filePath] && snapshot[filePath].local;
+        result[filePath] = await this.localInfoByPath(filePath, previousLocal);
       }
     }
     for (const childFolder of listing.folders || []) {
       if (this.shouldScanLocalFolder(childFolder)) {
-        await this.scanAdapterFolder(childFolder, result);
+        await this.scanAdapterFolder(childFolder, result, snapshot);
       }
     }
   }
@@ -3401,23 +3403,27 @@ module.exports = class DriveBridgePlugin extends Plugin {
     new Notice(this.settings.lastRecoverySummary, 10000);
   }
 
-  async localInfo(file) {
+  async localInfo(file, previousLocal = null) {
     const info = {
       path: file.path,
       size: file.stat.size,
       mtime: file.stat.mtime
     };
     if (shouldHashLocalFile(file.path, file.stat.size)) {
-      const data = await this.app.vault.readBinary(file);
-      info.sha256 = await sha256Hex(data);
+      if (canReuseLocalHash(previousLocal, info)) {
+        info.sha256 = previousLocal.sha256;
+      } else {
+        const data = await this.app.vault.readBinary(file);
+        info.sha256 = await sha256Hex(data);
+      }
     }
     return info;
   }
 
-  async localInfoByPath(path) {
+  async localInfoByPath(path, previousLocal = null) {
     const file = this.app.vault.getAbstractFileByPath(path);
     if (file instanceof TFile) {
-      return this.localInfo(file);
+      return this.localInfo(file, previousLocal);
     }
     const stat = await this.app.vault.adapter.stat(path);
     if (!stat) {
@@ -3429,8 +3435,12 @@ module.exports = class DriveBridgePlugin extends Plugin {
       mtime: stat.mtime
     };
     if (shouldHashLocalFile(path, stat.size)) {
-      const data = await this.app.vault.adapter.readBinary(path);
-      info.sha256 = await sha256Hex(data);
+      if (canReuseLocalHash(previousLocal, info)) {
+        info.sha256 = previousLocal.sha256;
+      } else {
+        const data = await this.app.vault.adapter.readBinary(path);
+        info.sha256 = await sha256Hex(data);
+      }
     }
     return info;
   }
@@ -5189,6 +5199,15 @@ function shouldHashLocalFile(path, size) {
     return false;
   }
   return HASHED_LOCAL_EXTENSIONS.has(lower.slice(dot));
+}
+
+function canReuseLocalHash(previous, current) {
+  return Boolean(
+    previous &&
+    previous.sha256 &&
+    previous.size === current.size &&
+    previous.mtime === current.mtime
+  );
 }
 
 async function sha256Hex(data) {
