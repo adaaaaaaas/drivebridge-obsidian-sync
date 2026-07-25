@@ -98,9 +98,11 @@ function pluginInstance(PluginClass, settings = {}) {
     excludedFolders: "",
     excludedPatterns: "",
     obsidianSyncMode: "off",
+    clientId: "client",
     accessToken: "token",
     tokenExpiresAt: Date.now() + 60000,
-    refreshToken: "refresh"
+    refreshToken: "refresh",
+    lastLocalFullScanAt: Date.now()
   }, settings);
   plugin.manifest = { id: "drivebridge-obsidian-sync", dir: ".obsidian/plugins/drivebridge-obsidian-sync" };
   return plugin;
@@ -1382,7 +1384,12 @@ async function run() {
       const start = Number(match[1]);
       const end = Number(match[2]);
       const chunk = source.slice(start, end + 1);
-      return { ok: true, status: 206, arrayBuffer: async () => chunk.buffer };
+      return {
+        ok: true,
+        status: 206,
+        headers: { get: (name) => name.toLowerCase() === "content-range" ? `bytes ${start}-${end}/${source.byteLength}` : null },
+        arrayBuffer: async () => chunk.buffer
+      };
     };
     let written;
     plugin.writeVerifiedDownload = async (_path, _remote, buffer, options) => {
@@ -1505,6 +1512,7 @@ async function run() {
     const { PluginClass } = loadPlugin();
     const plugin = pluginInstance(PluginClass);
     plugin.prefetchRemoteInfoForEntries = async () => {};
+    plugin.isExcluded = () => false;
     plugin.updateOperation = async () => {};
     plugin.executeEntry = async () => { throw new Error("expected failure"); };
     plugin.updateSyncProgress = () => {};
@@ -1516,11 +1524,560 @@ async function run() {
     const local = Object.fromEntries(entries.map((entry) => [entry.path, { path: entry.path, size: 1, mtime: 1 }]));
     const previousConsoleError = console.error;
     console.error = () => {};
-    const result = await plugin.executePlan({ snapshot: {}, local, remote: {} }, { entries }, "run");
-    console.error = previousConsoleError;
+    let result;
+    try {
+      result = await plugin.executePlan({ snapshot: {}, local, remote: {} }, { entries }, "run");
+    } finally {
+      console.error = previousConsoleError;
+    }
     assert.strictEqual(result.errorCount, 25);
     assert.strictEqual(result.errors.length, 20, "in-memory error details must be capped");
     assert.strictEqual(result.detailsTruncated, true);
+    assert.strictEqual(plugin.localDirtyPaths.size, 25, "every failed path must remain dirty without a second unbounded path collection");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    plugin.localDirtyPaths = new Map([
+      ["done.md", 1],
+      ["failed.md", 3]
+    ]);
+    plugin.localDirtyGeneration = 3;
+    plugin.isExcluded = () => false;
+    await plugin.commitLocalDirtyScan({
+      localScanWasFull: false,
+      localDirtyVersionsScanned: {
+        "done.md": 1,
+        "failed.md": 2
+      }
+    });
+    assert.strictEqual(plugin.localDirtyPaths.has("done.md"), false);
+    assert.strictEqual(plugin.localDirtyPaths.get("failed.md"), 3, "a newer failure generation must survive commit");
+    assert.strictEqual(plugin.localDirtyTrusted, true);
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    plugin.hasSameContent = async () => false;
+    plugin.assertLocalUnchangedSincePlan = async () => {};
+    let forceOption;
+    plugin.assertRemoteUnchangedSincePlan = async (_path, remote, options) => {
+      forceOption = options;
+      return remote;
+    };
+    plugin.assertRemoteContentUnchangedSincePlan = async (_path, remote, options) => {
+      forceOption = options;
+      return remote;
+    };
+    const local = { path: "large.pdf", size: 60 * 1024 * 1024, mtime: 1 };
+    const remote = { id: "remote", path: "large.pdf", size: local.size, md5Checksum: "old" };
+    plugin.localInfoByPath = async () => local;
+    plugin.uploadLocalFile = async () => Object.assign({}, remote, { md5Checksum: "new" });
+    plugin.resumableStateForOperation = () => ({});
+    plugin.shouldUseDuplicateGuard = () => false;
+    plugin.shouldRefreshDuplicateGuardPreflight = () => false;
+    plugin.shouldUseExactNameDuplicateGuard = () => false;
+    plugin.reservedRemoteIdForOperation = () => "";
+    plugin.operationIdForPath = () => "";
+    await plugin.executeEntry(
+      { path: "large.pdf", action: "upload" },
+      { rootFolderId: "root", local: { "large.pdf": local }, remote: { "large.pdf": remote } },
+      {},
+      { upload: 0 },
+      {},
+      {},
+      [],
+      "run"
+    );
+    assert.strictEqual(forceOption.force, true, "upload must bypass the batch metadata cache around the overwrite");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    plugin.remoteInfoById = async () => ({
+      id: "remote",
+      name: "renamed-remotely.pdf",
+      path: "large.pdf",
+      size: 10,
+      modifiedTime: "same",
+      md5Checksum: "same",
+      parentId: "root"
+    });
+    await assert.rejects(
+      () => plugin.assertRemoteUnchangedSincePlan("large.pdf", {
+        id: "remote",
+        name: "large.pdf",
+        path: "large.pdf",
+        size: 10,
+        modifiedTime: "same",
+        md5Checksum: "same",
+        parentId: "root"
+      }, { force: true }),
+      /differs from planned remote snapshot/,
+      "a remote rename must block an overwrite even when content metadata is unchanged"
+    );
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    plugin.isExcluded = () => false;
+    plugin.driveFetch = async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({
+        newStartPageToken: "token-2",
+        changes: [{
+          fileId: "folder-1",
+          removed: false,
+          file: {
+            id: "folder-1",
+            name: "moved-folder",
+            mimeType: "application/vnd.google-apps.folder",
+            modifiedTime: "2026-07-25T00:00:00Z",
+            parents: ["outside-root"],
+            trashed: false
+          }
+        }]
+      })
+    });
+    let fullScans = 0;
+    plugin.scanRemoteFolder = async (_root, _path, files) => {
+      fullScans++;
+      files["remaining.md"] = { id: "remaining", path: "remaining.md", size: 1 };
+    };
+    const state = await plugin.applyRemoteChanges("root", {
+      files: { "old/file.md": { id: "old", path: "old/file.md", size: 1 } },
+      deleted: {}
+    }, "token-1");
+    assert.strictEqual(fullScans, 1, "folder moves must force a safe full remote scan");
+    assert.ok(state.files["remaining.md"]);
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    let writeOptions;
+    plugin.writeRemoteSnapshotFile = async (_root, files, deleted, options) => {
+      writeOptions = { files, deleted, options };
+      return { files, deleted, written: true };
+    };
+    plugin.mergeRemoteDeleteTombstones = (previous, next) => Object.assign({}, previous, next);
+    const oldRemote = { id: "r1", path: "note.md", size: 1, modifiedTime: "old", md5Checksum: "old" };
+    const changedRemote = { id: "r1", path: "note.md", size: 2, modifiedTime: "new", md5Checksum: "new" };
+    await plugin.saveRemoteSnapshot("root", {
+      "note.md": changedRemote
+    }, {}, {}, {}, {
+      forceWrite: true,
+      mergeBaseFiles: { "note.md": oldRemote }
+    });
+    assert.strictEqual(writeOptions.options.baseFiles["note.md"].md5Checksum, "old");
+    assert.strictEqual(writeOptions.options.mutations["note.md"].md5Checksum, "new", "Changes API updates must participate in a concurrent snapshot merge");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass, { remoteSnapshotProtocolVersion: 2 });
+    plugin.driveFetch = async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ version: 1, files: {}, deleted: {} })
+    });
+    await assert.rejects(
+      () => plugin.loadRemoteSnapshotById("snapshot", "now"),
+      /downgraded by an older DriveBridge device/,
+      "cache/Changes paths must enforce the same snapshot protocol guard"
+    );
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    plugin.transferChunkBytes = () => 2;
+    plugin.waitForForegroundBeforeLargeTransfer = async () => {};
+    plugin.updateTransferProgress = () => {};
+    plugin.driveFetch = async () => ({
+      ok: true,
+      status: 206,
+      headers: { get: () => "bytes 1-2/4" },
+      arrayBuffer: async () => new Uint8Array([1, 2]).buffer
+    });
+    await assert.rejects(
+      () => plugin.downloadRemoteFileInRanges("large.pdf", { id: "remote", size: 4 }, {}),
+      /Content-Range mismatch/,
+      "a same-length but wrong range must not be written"
+    );
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass, { lastLocalFullScanAt: 1 });
+    plugin.localDirtyTrusted = true;
+    plugin.localDirtyPaths = new Map();
+    plugin.isExcluded = () => false;
+    plugin.app = {
+      vault: {
+        getFiles: () => [{ path: "audit.md", stat: { size: 1, mtime: 1 } }]
+      }
+    };
+    plugin.localInfo = async (file) => ({ path: file.path, size: 1, mtime: 1 });
+    const result = await plugin.scanLocalVault({});
+    assert.ok(result["audit.md"]);
+    assert.strictEqual(plugin.lastLocalScanMeta.full, true, "a trusted dirty queue still needs a bounded periodic full audit");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    plugin.syncing = false;
+    plugin.activeOperation = "";
+    plugin.resetSyncDetailLog = async () => {};
+    plugin.checkInterruptedSync = async () => ({ interrupted: true });
+    plugin.formatInterruptedSyncMessage = () => "interrupted";
+    plugin.saveSettings = async () => {};
+    plugin.safeFlushOperationJournal = async () => {};
+    plugin.flushSyncDetailBuffer = async () => {};
+    plugin.flushDirtyQueue = async () => { throw new Error("adapter unavailable"); };
+    plugin.clearSyncStatus = () => {};
+    plugin.startPendingRemoteIndexRepair = () => {};
+    const previousWarn = console.warn;
+    console.warn = () => {};
+    await plugin.syncNow({ dryRun: false, quiet: true });
+    console.warn = previousWarn;
+    assert.strictEqual(plugin.syncing, false, "cleanup must release the sync lock even when dirty queue persistence fails");
+    assert.strictEqual(plugin.activeOperation, "");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass, { maxFileSizeMb: 100 });
+    plugin.localDirtyTrusted = true;
+    plugin.localDirtyPaths = new Map();
+    plugin.localScanProfile = JSON.stringify({
+      excludedFolders: "",
+      excludedPatterns: "",
+      obsidianSyncMode: "off",
+      syncMode: "bidirectional",
+      maxFileSizeMb: 50
+    });
+    plugin.isExcluded = () => false;
+    plugin.app = {
+      vault: {
+        getFiles: () => [{ path: "large.pdf", stat: { size: 60 * 1024 * 1024, mtime: 1 } }]
+      }
+    };
+    plugin.localInfo = async (file) => ({ path: file.path, size: file.stat.size, mtime: file.stat.mtime });
+    const result = await plugin.scanLocalVault({});
+    assert.ok(result["large.pdf"], "raising Max file size must force a full scan that rediscovers a previously skipped PDF");
+    assert.strictEqual(plugin.lastLocalScanMeta.full, true);
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    const now = Date.now();
+    const older = { deletedAt: new Date(now - 10000).toISOString(), remote: { id: "old" } };
+    const newer = { deletedAt: new Date(now).toISOString(), remote: { id: "new" } };
+    const merged = plugin.mergeRemoteDeleteTombstones(
+      { "note.md": newer },
+      { "note.md": older },
+      {}
+    );
+    assert.strictEqual(merged["note.md"].remote.id, "new", "concurrent merge must retain the newest same-path tombstone");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    const now = Date.now();
+    const invalidFuture = {
+      deletedAt: new Date(now + 24 * 60 * 60 * 1000).toISOString(),
+      remote: { id: "future" }
+    };
+    assert.strictEqual(
+      plugin.remoteDeleteTombstoneIsFresh(invalidFuture, now),
+      false,
+      "an implausibly future-dated tombstone must not remain fresh indefinitely"
+    );
+    assert.strictEqual(
+      plugin.localChangedAfterRemoteDeletion({ mtime: now }, invalidFuture),
+      true,
+      "an implausibly future-dated tombstone must not delete a current local edit"
+    );
+    const plausibleSkew = {
+      deletedAt: new Date(now + 60 * 1000).toISOString(),
+      remote: { id: "skewed" }
+    };
+    assert.strictEqual(
+      plugin.localChangedAfterRemoteDeletion({ mtime: now }, plausibleSkew),
+      true,
+      "even plausible positive clock skew must defer local deletion until the timestamp is trustworthy"
+    );
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    plugin.isExcluded = () => false;
+    plugin.driveFetch = async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({
+        newStartPageToken: "token-2",
+        changes: [{
+          fileId: "folder-1",
+          removed: true
+        }]
+      })
+    });
+    plugin.scanRemoteFolder = async () => {};
+    const state = await plugin.applyRemoteChanges("root", {
+      files: {
+        "folder/child.pdf": {
+          id: "child",
+          path: "folder/child.pdf",
+          size: 10,
+          modifiedTime: "old",
+          md5Checksum: "hash",
+          parentId: "folder-1"
+        }
+      },
+      deleted: {},
+      folders: { "folder-1": "folder" },
+      folderIndexComplete: true
+    }, "token-1");
+    assert.ok(state.deleted["folder/child.pdf"], "a folder full-scan fallback must create tombstones for disappeared children");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    plugin.isExcluded = () => false;
+    plugin.driveFetch = async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({
+        newStartPageToken: "token-2",
+        changes: [{ fileId: "unknown", removed: true }]
+      })
+    });
+    plugin.scanRemoteFolder = async () => {};
+    const state = await plugin.applyRemoteChanges("root", {
+      files: {
+        "still-unconfirmed.pdf": {
+          id: "existing",
+          path: "still-unconfirmed.pdf",
+          size: 10,
+          modifiedTime: "old",
+          md5Checksum: "hash",
+          parentId: "root"
+        }
+      },
+      deleted: {},
+      folders: {},
+      folderIndexComplete: true
+    }, "token-1");
+    assert.strictEqual(
+      state.deleted["still-unconfirmed.pdf"],
+      undefined,
+      "absence from a safety full scan must not become a deletion tombstone without path-specific proof"
+    );
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    plugin.isExcluded = () => false;
+    plugin.driveFetch = async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({
+        newStartPageToken: "token-2",
+        changes: [{
+          fileId: "outside-folder",
+          removed: false,
+          file: {
+            id: "outside-folder",
+            name: "outside",
+            mimeType: "application/vnd.google-apps.folder",
+            parents: ["outside-root"],
+            trashed: false
+          }
+        }]
+      })
+    });
+    plugin.resolveChangedDriveFilePath = async () => "";
+    plugin.scanRemoteFolder = async () => {
+      throw new Error("a known outside-root folder must not trigger a full scan");
+    };
+    const state = await plugin.applyRemoteChanges("root", {
+      files: {},
+      deleted: {},
+      folders: {},
+      folderIndexComplete: true
+    }, "token-1");
+    assert.strictEqual(state.folderIndexComplete, true);
+  }
+
+  {
+    const { PluginClass, responses } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    plugin.transferChunkBytes = () => 2;
+    plugin.waitForForegroundBeforeLargeTransfer = async () => {};
+    plugin.updateTransferProgress = () => {};
+    responses.push({
+      status: 206,
+      text: "",
+      json: {},
+      arrayBuffer: new Uint8Array([1, 2]).buffer,
+      headers: { "Content-Range": "bytes 0-1/2" }
+    });
+    let written = false;
+    plugin.writeVerifiedDownload = async () => { written = true; };
+    await plugin.downloadRemoteFileInRanges("large.pdf", { id: "remote", size: 2 }, {});
+    assert.strictEqual(written, true, "requestUrl response headers must be matched case-insensitively");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    plugin.transferChunkBytes = () => 2;
+    plugin.waitForForegroundBeforeLargeTransfer = async () => {};
+    plugin.updateTransferProgress = () => {};
+    const data = new Uint8Array([1, 2, 3, 4]).buffer;
+    let beforeCommitCalls = 0;
+    let putCalls = 0;
+    plugin.driveFetch = async (url, options) => {
+      if (url.includes("uploadType=resumable")) {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: (name) => name.toLowerCase() === "location" ? "session" : null }
+        };
+      }
+      putCalls++;
+      if (putCalls === 1) {
+        return { ok: false, status: 308, headers: { get: () => "bytes=0-1" } };
+      }
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        text: async () => JSON.stringify({ id: "remote", name: "large.pdf", size: "4", modifiedTime: "new", md5Checksum: "hash" })
+      };
+    };
+    await plugin.uploadResumableFile(
+      "large.pdf",
+      { id: "remote" },
+      { name: "large.pdf" },
+      data,
+      { beforeRemoteCommit: async () => { beforeCommitCalls++; } }
+    );
+    assert.strictEqual(beforeCommitCalls, 1, "existing resumable uploads must revalidate immediately before the final chunk");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    plugin.isMobileRuntime = () => true;
+    plugin.localPathExists = async () => true;
+    plugin.localStatInfoByPath = async () => ({ path: "empty.pdf", size: 0, mtime: 1 });
+    plugin.readLocalBinary = async () => new ArrayBuffer(0);
+    plugin.ensureRemoteParent = async () => "root";
+    let requestedUrl = "";
+    plugin.driveFetch = async (url) => {
+      requestedUrl = url;
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ id: "empty", name: "empty.pdf", size: "0", modifiedTime: "now", md5Checksum: "d41d8cd98f00b204e9800998ecf8427e" })
+      };
+    };
+    await plugin.uploadLocalFile("empty.pdf", "root", null, {});
+    assert.match(requestedUrl, /uploadType=multipart/, "zero-byte mobile files must not enter an empty resumable loop");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    plugin.isExcluded = () => false;
+    plugin.localDirtyPaths = new Map();
+    plugin.prefetchRemoteInfoForEntries = async () => {};
+    plugin.updateOperation = async () => {};
+    plugin.executeEntry = async () => undefined;
+    plugin.updateSyncProgress = () => {};
+    plugin.flushOperationJournal = async () => {};
+    plugin.verifyCreatedUploadDuplicates = async () => {};
+    const entry = { path: "resolved.pdf", action: "conflict" };
+    await plugin.executePlan(
+      { snapshot: {}, local: {}, remote: {} },
+      { entries: [entry] },
+      "run"
+    );
+    assert.strictEqual(plugin.localDirtyPaths.size, 0, "a conflict adopted as same content must not be requeued solely from its original plan action");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    let requestedIds;
+    plugin.batchGetRemoteInfo = async (ids) => {
+      requestedIds = ids;
+      return ids.map((id) => ({ id, name: `${id}.md`, size: "1", modifiedTime: "now", md5Checksum: "hash", parents: ["root"] }));
+    };
+    await plugin.prefetchRemoteInfoForEntries([
+      { path: "download.md", action: "download" },
+      { path: "upload.md", action: "upload" },
+      { path: "move.md", fromPath: "old.md", action: "moveRemote" }
+    ], {
+      remote: {
+        "download.md": { id: "download" },
+        "upload.md": { id: "upload" },
+        "old.md": { id: "move" }
+      }
+    });
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(requestedIds)), ["download"], "batch prefetch must not duplicate just-in-time GETs for Drive mutations");
+  }
+
+  {
+    const { PluginClass, responses } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    responses.push(new Error("temporary network failure"));
+    responses.push({ status: 200, text: "{}", json: {}, arrayBuffer: new ArrayBuffer(0), headers: {} });
+    let rechecks = 0;
+    const response = await plugin.driveFetch(
+      "https://www.googleapis.com/upload/drive/v3/files/remote?uploadType=media",
+      {
+        method: "PUT",
+        body: new Uint8Array([1]),
+        beforeRetry: async () => { rechecks++; }
+      }
+    );
+    assert.strictEqual(response.ok, true);
+    assert.strictEqual(rechecks, 1, "a retried final upload request must repeat its remote precondition check");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    let saved;
+    plugin.writePluginDataFileAtomic = async (_primary, _backup, content) => {
+      saved = JSON.parse(content);
+    };
+    await plugin.saveRemoteStateCache("root", {
+      fileId: "snapshot",
+      modifiedTime: "2026-07-25T00:00:00Z",
+      files: {},
+      deleted: {}
+    }, {
+      "folder-1": "folder"
+    }, true);
+    assert.strictEqual(saved.version, 2);
+    assert.strictEqual(saved.folderIndexComplete, true);
+    assert.strictEqual(saved.folders["folder-1"], "folder");
   }
 
   console.log("DriveBridge tests passed");
