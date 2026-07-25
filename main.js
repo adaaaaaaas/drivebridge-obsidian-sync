@@ -2012,16 +2012,23 @@ module.exports = class DriveBridgePlugin extends Plugin {
 
   async scanRemoteVault(rootFolderId) {
     let snapshotState = null;
-    if (this.settings.driveChangesEnabled && this.settings.driveChangesPageToken) {
+    let changesCacheReady = false;
+    const driveChangesEnabled = this.settings.driveChangesEnabled !== false;
+    if (driveChangesEnabled && this.settings.driveChangesPageToken) {
       snapshotState = await this.loadRemoteStateCache(rootFolderId);
+      changesCacheReady = Boolean(snapshotState);
+      if (!changesCacheReady) {
+        this.settings.driveChangesPageToken = "";
+        console.warn("[drivebridge-obsidian-sync] Drive Changes cache is missing or incompatible; rebuilding the remote state once.");
+      }
     }
     if (!snapshotState) {
       snapshotState = await this.loadRemoteSnapshotFile(rootFolderId);
     }
-    if (snapshotState && !this.settings.driveChangesEnabled) {
+    if (snapshotState && !driveChangesEnabled) {
       return snapshotState;
     }
-    if (snapshotState && this.settings.driveChangesPageToken) {
+    if (snapshotState && changesCacheReady && this.settings.driveChangesPageToken) {
       try {
         return await this.applyRemoteChanges(rootFolderId, snapshotState, this.settings.driveChangesPageToken);
       } catch (err) {
@@ -2032,7 +2039,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
         console.warn("[drivebridge-obsidian-sync] Drive Changes token expired; rebuilding the remote state once.");
       }
     }
-    const bootstrapToken = this.settings.driveChangesEnabled
+    const bootstrapToken = driveChangesEnabled
       ? await this.getDriveStartPageToken()
       : "";
     const result = {};
@@ -2344,6 +2351,9 @@ module.exports = class DriveBridgePlugin extends Plugin {
   }
 
   async saveRemoteStateCache(rootFolderId, remoteSnapshotResult, folders = {}, folderIndexComplete = false) {
+    if (this.settings.driveChangesEnabled === false) {
+      return null;
+    }
     if (!remoteSnapshotResult || !remoteSnapshotResult.files || !remoteSnapshotResult.deleted) {
       throw new Error("Remote snapshot commit did not return a cacheable state.");
     }

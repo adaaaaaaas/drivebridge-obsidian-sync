@@ -1447,14 +1447,16 @@ async function run() {
       driveChangesPageToken: "token-1"
     });
     const cached = {
-      version: 1,
+      version: 2,
       rootFolderId: "root",
       snapshotFileId: "snapshot",
       snapshotModifiedTime: "2026-07-25T00:00:00Z",
       files: {
         "note.md": { id: "r1", name: "note.md", path: "note.md", size: 1, modifiedTime: "old", md5Checksum: "old", parentId: "root" }
       },
-      deleted: {}
+      deleted: {},
+      folders: {},
+      folderIndexComplete: true
     };
     plugin.loadRemoteStateCache = async () => cached;
     plugin.loadRemoteSnapshotFile = async () => {
@@ -1467,6 +1469,74 @@ async function run() {
     };
     const state = await plugin.scanRemoteVault("root");
     assert.strictEqual(state.nextPageToken, "token-2");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass, {
+      driveChangesEnabled: true,
+      driveChangesPageToken: "stale-token"
+    });
+    const sharedSnapshot = {
+      files: {
+        "note.md": { id: "r1", name: "note.md", path: "note.md", size: 1, modifiedTime: "old", md5Checksum: "old", parentId: "root" }
+      },
+      deleted: {},
+      snapshotFileId: "snapshot",
+      snapshotModifiedTime: "2026-07-25T00:00:00Z"
+    };
+    plugin.loadRemoteStateCache = async () => null;
+    plugin.loadRemoteSnapshotFile = async () => sharedSnapshot;
+    plugin.getDriveStartPageToken = async () => "fresh-token";
+    let fullScans = 0;
+    plugin.scanRemoteFolder = async (_root, _prefix, files, options) => {
+      fullScans++;
+      Object.assign(files, sharedSnapshot.files);
+      options.folderPaths["folder-1"] = "folder";
+    };
+    plugin.applyRemoteChanges = async (_root, base, token) => {
+      assert.strictEqual(token, "fresh-token", "an incompatible cache must not reuse its stale Changes token");
+      assert.strictEqual(base.folderIndexComplete, true);
+      assert.strictEqual(base.folders["folder-1"], "folder");
+      return Object.assign({}, base, { nextPageToken: "token-2" });
+    };
+    const previousWarn = console.warn;
+    console.warn = () => {};
+    let state;
+    try {
+      state = await plugin.scanRemoteVault("root");
+    } finally {
+      console.warn = previousWarn;
+    }
+    assert.strictEqual(fullScans, 1, "a missing or incompatible cache with an existing token must rebuild the folder index once");
+    assert.strictEqual(plugin.settings.driveChangesPageToken, "", "the stale token must be cleared before bootstrap");
+    assert.strictEqual(state.nextPageToken, "token-2");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    plugin.loadPluginDataJsonWithBackup = async (_primary, _backup, _fallback, validate) => {
+      const legacy = {
+        version: 1,
+        rootFolderId: "root",
+        snapshotFileId: "snapshot",
+        snapshotModifiedTime: "2026-07-25T00:00:00Z",
+        files: {},
+        deleted: {}
+      };
+      validate(legacy);
+      return legacy;
+    };
+    const previousWarn = console.warn;
+    console.warn = () => {};
+    let state;
+    try {
+      state = await plugin.loadRemoteStateCache("root");
+    } finally {
+      console.warn = previousWarn;
+    }
+    assert.strictEqual(state, null, "a legacy v1 cache must fail closed and trigger the full-scan bootstrap path");
   }
 
   {
@@ -2078,6 +2148,16 @@ async function run() {
     assert.strictEqual(saved.version, 2);
     assert.strictEqual(saved.folderIndexComplete, true);
     assert.strictEqual(saved.folders["folder-1"], "folder");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass, { driveChangesEnabled: false });
+    let writes = 0;
+    plugin.writePluginDataFileAtomic = async () => { writes++; };
+    const result = await plugin.saveRemoteStateCache("root", null, {}, false);
+    assert.strictEqual(result, null);
+    assert.strictEqual(writes, 0, "disabling Drive Changes must not write or validate its dedicated cache");
   }
 
   console.log("DriveBridge tests passed");
