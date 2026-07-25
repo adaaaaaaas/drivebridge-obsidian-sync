@@ -1277,6 +1277,252 @@ async function run() {
     assert.notStrictEqual(changed["note.md"].sha256, previousHash);
   }
 
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass, { mobileLightweightMode: true });
+    plugin.activeSyncContext = {
+      local: {
+        "z-large.pdf": { size: 50 },
+        "a-note.md": { size: 5 },
+        "b-config.json": { size: 3 },
+        "c-image.png": { size: 4 }
+      },
+      remote: {}
+    };
+    const ordered = plugin.orderPlanEntries([
+      { path: "z-large.pdf", action: "upload" },
+      { path: "delete.md", action: "deleteRemote" },
+      { path: "c-image.png", action: "upload" },
+      { path: "review.md", action: "conflict" },
+      { path: "b-config.json", action: "upload" },
+      { path: "a-note.md", action: "upload" }
+    ]);
+    assert.deepStrictEqual(
+      JSON.parse(JSON.stringify(ordered.map((entry) => entry.path))),
+      ["a-note.md", "b-config.json", "c-image.png", "z-large.pdf", "review.md", "delete.md"],
+      "notes and small files must run before large attachments, conflicts, and deletes"
+    );
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    const file = new FakeTFile();
+    const bytes = new TextEncoder().encode("hash once").buffer;
+    file.path = "note.md";
+    file.stat = { size: bytes.byteLength, mtime: 10 };
+    let reads = 0;
+    plugin.app = {
+      vault: {
+        getAbstractFileByPath: () => file,
+        readBinary: async () => { reads++; return bytes; }
+      }
+    };
+    const first = await plugin.localInfoByPath("note.md");
+    const second = await plugin.localInfoByPath("note.md");
+    const md5 = await plugin.localMd5ByPath("note.md");
+    assert.strictEqual(first.sha256, second.sha256);
+    assert.strictEqual(typeof md5, "string");
+    assert.strictEqual(reads, 1, "SHA-256 and MD5 for the same size+mtime must share one binary read");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    plugin.transferChunkBytes = () => 2;
+    plugin.waitForForegroundBeforeLargeTransfer = async () => {};
+    plugin.updateTransferProgress = () => {};
+    const data = new Uint8Array([1, 2, 3, 4, 5]).buffer;
+    const requests = [];
+    plugin.driveFetch = async (url, options) => {
+      requests.push({ url, options });
+      if (url.includes("uploadType=resumable")) {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: (name) => name.toLowerCase() === "location" ? "https://upload-session" : null }
+        };
+      }
+      const range = options.headers["Content-Range"];
+      if (range === "bytes 0-1/5") {
+        return { ok: false, status: 308, headers: { get: () => "bytes=0-1" } };
+      }
+      if (range === "bytes 2-3/5") {
+        return { ok: false, status: 308, headers: { get: () => "bytes=0-3" } };
+      }
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        text: async () => JSON.stringify({ id: "uploaded", name: "file.bin", size: "5" })
+      };
+    };
+    const progress = [];
+    const uploaded = await plugin.uploadResumableFile("file.bin", null, { name: "file.bin" }, data, {
+      onChunkProgress: async (value) => progress.push(value)
+    });
+    assert.strictEqual(uploaded.id, "uploaded");
+    assert.deepStrictEqual(
+      JSON.parse(JSON.stringify(requests.slice(1).map((item) => item.options.body.byteLength))),
+      [2, 2, 1],
+      "resumable upload must send bounded chunks instead of a second whole-file multipart body"
+    );
+    assert.strictEqual(progress.at(-1).uploadedBytes, 5);
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    plugin.transferChunkBytes = () => 2;
+    plugin.waitForForegroundBeforeLargeTransfer = async () => {};
+    plugin.updateTransferProgress = () => {};
+    const source = new Uint8Array([10, 20, 30, 40, 50, 60]);
+    plugin.driveFetch = async (_url, options) => {
+      const match = options.headers.Range.match(/bytes=(\d+)-(\d+)/);
+      const start = Number(match[1]);
+      const end = Number(match[2]);
+      const chunk = source.slice(start, end + 1);
+      return { ok: true, status: 206, arrayBuffer: async () => chunk.buffer };
+    };
+    let written;
+    plugin.writeVerifiedDownload = async (_path, _remote, buffer, options) => {
+      written = { bytes: Array.from(new Uint8Array(buffer)), options };
+    };
+    await plugin.downloadRemoteFileInRanges("file.bin", { id: "remote", size: 6 }, {});
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(written.bytes)), Array.from(source));
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    const responseBoundary = "batch-response";
+    const body = [
+      `--${responseBoundary}\r\nContent-Type: application/http\r\nContent-ID: <response-drivebridge-0>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n${JSON.stringify({ id: "a", name: "a.md", size: "1", parents: ["root"] })}\r\n`,
+      `--${responseBoundary}\r\nContent-Type: application/http\r\nContent-ID: <response-drivebridge-1>\r\n\r\nHTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\r\n{}\r\n`,
+      `--${responseBoundary}--\r\n`
+    ].join("");
+    plugin.driveFetch = async () => ({
+      ok: true,
+      status: 200,
+      headers: { get: () => `multipart/mixed; boundary=${responseBoundary}` },
+      text: async () => body
+    });
+    const values = await plugin.batchGetRemoteInfo(["a", "missing"]);
+    assert.strictEqual(values[0].id, "a");
+    assert.strictEqual(values[1], null);
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    plugin.localDirtyTrusted = true;
+    plugin.localDirtyPaths = new Map([["changed.md", 2]]);
+    plugin.isExcluded = () => false;
+    plugin.localPathExists = async () => true;
+    let statCalls = 0;
+    plugin.localInfoByPath = async (path) => {
+      statCalls++;
+      return { path, size: 2, mtime: 2, sha256: "b".repeat(64) };
+    };
+    const result = await plugin.scanLocalVault({
+      "unchanged.md": { local: { size: 1, mtime: 1, sha256: "a".repeat(64) } },
+      "changed.md": { local: { size: 1, mtime: 1, sha256: "a".repeat(64) } }
+    });
+    assert.strictEqual(statCalls, 1, "trusted dirty scan must stat only changed paths");
+    assert.strictEqual(result["unchanged.md"].mtime, 1);
+    assert.strictEqual(result["changed.md"].mtime, 2);
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass, {
+      driveChangesEnabled: true,
+      driveChangesPageToken: "token-1"
+    });
+    const cached = {
+      version: 1,
+      rootFolderId: "root",
+      snapshotFileId: "snapshot",
+      snapshotModifiedTime: "2026-07-25T00:00:00Z",
+      files: {
+        "note.md": { id: "r1", name: "note.md", path: "note.md", size: 1, modifiedTime: "old", md5Checksum: "old", parentId: "root" }
+      },
+      deleted: {}
+    };
+    plugin.loadRemoteStateCache = async () => cached;
+    plugin.loadRemoteSnapshotFile = async () => {
+      throw new Error("a valid local changes base must avoid downloading remote_snapshot.json");
+    };
+    plugin.applyRemoteChanges = async (_root, base, token) => {
+      assert.strictEqual(base, cached);
+      assert.strictEqual(token, "token-1");
+      return Object.assign({}, base, { nextPageToken: "token-2" });
+    };
+    const state = await plugin.scanRemoteVault("root");
+    assert.strictEqual(state.nextPageToken, "token-2");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    plugin.isExcluded = () => false;
+    plugin.driveFetch = async (url) => {
+      assert.match(url, /\/changes\?/);
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          newStartPageToken: "token-2",
+          changes: [{
+            fileId: "r1",
+            removed: false,
+            file: {
+              id: "r1",
+              name: "note.md",
+              mimeType: "text/markdown",
+              size: "2",
+              modifiedTime: "2026-07-25T00:00:00Z",
+              md5Checksum: "new",
+              parents: ["root"],
+              trashed: false
+            }
+          }]
+        })
+      };
+    };
+    const state = await plugin.applyRemoteChanges("root", {
+      files: {
+        "note.md": { id: "r1", name: "note.md", path: "note.md", size: 1, modifiedTime: "old", md5Checksum: "old", parentId: "root" }
+      },
+      deleted: {}
+    }, "token-1");
+    assert.strictEqual(state.files["note.md"].size, 2);
+    assert.strictEqual(state.nextPageToken, "token-2");
+    assert.strictEqual(state.changesApplied, true);
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    plugin.prefetchRemoteInfoForEntries = async () => {};
+    plugin.updateOperation = async () => {};
+    plugin.executeEntry = async () => { throw new Error("expected failure"); };
+    plugin.updateSyncProgress = () => {};
+    plugin.showProgressModal = () => {};
+    plugin.flushOperationJournal = async () => {};
+    plugin.verifyCreatedUploadDuplicates = async () => {};
+    plugin.appendSyncDetail = async () => {};
+    const entries = Array.from({ length: 25 }, (_, index) => ({ path: `note-${index}.md`, action: "upload" }));
+    const local = Object.fromEntries(entries.map((entry) => [entry.path, { path: entry.path, size: 1, mtime: 1 }]));
+    const previousConsoleError = console.error;
+    console.error = () => {};
+    const result = await plugin.executePlan({ snapshot: {}, local, remote: {} }, { entries }, "run");
+    console.error = previousConsoleError;
+    assert.strictEqual(result.errorCount, 25);
+    assert.strictEqual(result.errors.length, 20, "in-memory error details must be capped");
+    assert.strictEqual(result.detailsTruncated, true);
+  }
+
   console.log("DriveBridge tests passed");
 }
 

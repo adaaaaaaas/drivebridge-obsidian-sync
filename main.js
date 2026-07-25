@@ -1,4 +1,4 @@
-const { Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, requestUrl } = require("obsidian");
+const { Modal, Notice, Platform = {}, Plugin, PluginSettingTab, Setting, TFile, requestUrl } = require("obsidian");
 
 const DEFAULT_EXCLUDED_PATTERNS = [
   ".obsidian/**",
@@ -36,6 +36,9 @@ const DEFAULT_SETTINGS = {
   autoSyncOnStartup: false,
   autoSyncIntervalMinutes: 0,
   maxFileSizeMb: 50,
+  mobileLightweightMode: true,
+  driveChangesEnabled: true,
+  driveChangesPageToken: "",
   duplicateGuardMode: "auto",
   excludedFolders: "",
   excludedPatterns: DEFAULT_EXCLUDED_PATTERNS.join("\n"),
@@ -84,6 +87,10 @@ const REVIEW_QUEUE_FILE = "review-queue.json";
 const SNAPSHOT_BACKUP_FILE = "snapshot.previous.json";
 const REVIEW_QUEUE_BACKUP_FILE = "review-queue.previous.json";
 const REPAIR_PLAN_FILE = "repair-plan.json";
+const DIRTY_QUEUE_FILE = "dirty-paths.json";
+const SYNC_DETAIL_FILE = "sync-details.jsonl";
+const REMOTE_STATE_CACHE_FILE = "remote-state-cache.json";
+const REMOTE_STATE_CACHE_BACKUP_FILE = "remote-state-cache.previous.json";
 const RUNTIME_EPOCH_KEY = "__drivebridgeRuntimeEpoch";
 const REMOTE_DELETE_TOMBSTONE_RETENTION_MS = 20 * 24 * 60 * 60 * 1000;
 const MAX_RETRY_ATTEMPTS = 4;
@@ -94,6 +101,17 @@ const LARGE_BINARY_CONFLICT_BYTES = 10 * 1024 * 1024;
 const BULK_TIMESTAMP_SLOT_MS = 60 * 1000;
 const BULK_TIMESTAMP_MIN_FILES = 30;
 const ATOMIC_VERIFY_RETRY_DELAYS_MS = [0, 50, 200, 750, 2000];
+const RESUMABLE_UPLOAD_THRESHOLD_BYTES = 5 * 1024 * 1024;
+const TRANSFER_CHUNK_BYTES = 1024 * 1024;
+const MOBILE_BATCH_FILE_LIMIT = 25;
+const DESKTOP_BATCH_FILE_LIMIT = 100;
+const MOBILE_BATCH_BYTE_LIMIT = 10 * 1024 * 1024;
+const DESKTOP_BATCH_BYTE_LIMIT = 50 * 1024 * 1024;
+const SYNC_DETAIL_MEMORY_LIMIT = 20;
+const PROGRESS_THROTTLE_MS = 500;
+const STARTUP_SYNC_DELAY_MS = 25000;
+const REMOTE_INFO_CACHE_TTL_MS = 5000;
+const DRIVE_CHANGE_PAGE_SIZE = 1000;
 const HASHED_LOCAL_EXTENSIONS = new Set([".md", ".txt", ".json", ".css", ".js", ".canvas"]);
 const LARGE_BINARY_EXTENSIONS = new Set([".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".mp4", ".mov", ".zip"]);
 const OBSIDIAN_SAFE_ALLOW_PATTERNS = [
@@ -158,6 +176,16 @@ module.exports = class DriveBridgePlugin extends Plugin {
     this.operationJournalDirtyCount = 0;
     this.operationJournalLastFlushAt = 0;
     this.remoteChildCache = new Map();
+    this.remoteInfoCache = new Map();
+    this.localHashCache = new Map();
+    this.localDirtyPaths = new Map();
+    this.localDirtyGeneration = 0;
+    this.localDirtyTrusted = false;
+    this.dirtyQueueSaveTimer = null;
+    this.syncPausedForBackground = false;
+    this.lastProgressRenderAt = 0;
+    this.pendingProgress = null;
+    this.progressThrottleTimer = null;
     this.reviewCount = 0;
     this.statusBarItem = this.addStatusBarItem();
     this.statusBarItem.addClass("drivebridge-sync-status");
@@ -200,16 +228,25 @@ module.exports = class DriveBridgePlugin extends Plugin {
       console.error("[drivebridge-obsidian-sync] failed to load review queue", err);
       new Notice(`DriveBridge review queue error: ${err.message}`, 10000);
     }
+    await this.loadDirtyQueue();
+    this.registerLocalDirtyEvents();
+    this.registerMobileLifecycleEvents();
     this.clearSyncStatus();
     if (this.settings.autoSyncOnStartup) {
       this.app.workspace.onLayoutReady(() => {
-        if (this.isCurrentRuntime()) this.syncNow({ dryRun: this.settings.dryRunDefault, quiet: true });
+        window.setTimeout(() => {
+          if (this.isCurrentRuntime() && !this.isAppBackgrounded()) {
+            this.syncNow({ dryRun: this.settings.dryRunDefault, quiet: true });
+          }
+        }, this.isMobileRuntime() ? STARTUP_SYNC_DELAY_MS : 1000);
       });
     }
     if (this.settings.autoSyncIntervalMinutes > 0) {
       this.registerInterval(window.setInterval(
         () => {
-          if (this.isCurrentRuntime()) this.syncNow({ dryRun: this.settings.dryRunDefault, quiet: true });
+          if (this.isCurrentRuntime() && !this.isAppBackgrounded()) {
+            this.syncNow({ dryRun: this.settings.dryRunDefault, quiet: true });
+          }
         },
         this.settings.autoSyncIntervalMinutes * 60 * 1000
       ));
@@ -218,6 +255,91 @@ module.exports = class DriveBridgePlugin extends Plugin {
 
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+
+  async loadDirtyQueue() {
+    try {
+      const saved = await this.readPluginDataJson(DIRTY_QUEUE_FILE);
+      for (const item of saved && Array.isArray(saved.paths) ? saved.paths : []) {
+        if (Array.isArray(item) && item[0]) {
+          this.localDirtyPaths.set(item[0], Number(item[1] || 0));
+          this.localDirtyGeneration = Math.max(this.localDirtyGeneration, Number(item[1] || 0));
+        }
+      }
+    } catch (err) {
+      console.warn("[drivebridge-obsidian-sync] dirty path queue could not be loaded; next sync will full-scan", err);
+      this.localDirtyPaths = new Map();
+    }
+    this.localDirtyTrusted = false;
+  }
+
+  registerLocalDirtyEvents() {
+    if (!this.app || !this.app.vault || typeof this.app.vault.on !== "function" || typeof this.registerEvent !== "function") {
+      return;
+    }
+    const markFile = (file) => {
+      if (file && file.path) this.markLocalDirty(file.path);
+    };
+    this.registerEvent(this.app.vault.on("create", markFile));
+    this.registerEvent(this.app.vault.on("modify", markFile));
+    this.registerEvent(this.app.vault.on("delete", markFile));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+      if (oldPath) this.markLocalDirty(oldPath);
+      markFile(file);
+    }));
+  }
+
+  registerMobileLifecycleEvents() {
+    if (typeof document === "undefined" || typeof this.registerDomEvent !== "function") {
+      return;
+    }
+    this.registerDomEvent(document, "visibilitychange", () => {
+      this.syncPausedForBackground = this.isAppBackgrounded();
+      if (!this.syncPausedForBackground && this.syncing) {
+        this.updateSyncProgress({ phase: "Sync", message: "Obsidian returned to the foreground. Resuming..." });
+      }
+    });
+  }
+
+  markLocalDirty(path) {
+    const normalized = normalizeVaultFolderPath(path);
+    if (!normalized || this.isExcluded(normalized)) {
+      return;
+    }
+    this.localDirtyGeneration++;
+    this.localDirtyPaths.set(normalized, this.localDirtyGeneration);
+    this.scheduleDirtyQueueFlush();
+  }
+
+  scheduleDirtyQueueFlush() {
+    if (this.dirtyQueueSaveTimer) {
+      return;
+    }
+    this.dirtyQueueSaveTimer = window.setTimeout(() => {
+      this.dirtyQueueSaveTimer = null;
+      this.flushDirtyQueue().catch((err) => console.warn("[drivebridge-obsidian-sync] dirty queue save failed", err));
+    }, 1000);
+  }
+
+  async flushDirtyQueue() {
+    if (!this.localDirtyPaths || !this.app || !this.app.vault) {
+      return;
+    }
+    await this.writePluginDataFile(DIRTY_QUEUE_FILE, JSON.stringify({
+      version: 1,
+      generation: this.localDirtyGeneration,
+      paths: Array.from(this.localDirtyPaths.entries())
+    }));
+  }
+
+  async commitLocalDirtyScan(context) {
+    const scanned = context && context.localDirtyVersionsScanned || {};
+    for (const [path, version] of Object.entries(scanned)) {
+      if (this.localDirtyPaths.get(path) === version) {
+        this.localDirtyPaths.delete(path);
+      }
+    }
+    this.localDirtyTrusted = true;
   }
 
   async startDeviceAuth() {
@@ -287,6 +409,8 @@ module.exports = class DriveBridgePlugin extends Plugin {
     this.skipChangedFilesDuringSync = true;
     this.folderCache = new Map();
     this.remoteChildCache = new Map();
+    this.remoteInfoCache = new Map();
+    this.localHashCache = new Map();
     this.syncMetrics = {
       driveRequests: 0,
       idReservationRequests: 0,
@@ -296,10 +420,16 @@ module.exports = class DriveBridgePlugin extends Plugin {
       duplicateGuardSelfHealed: 0,
       remoteSnapshotWrites: 0,
       remoteSnapshotWriteSkipped: 0,
-      remoteSnapshotConflictMerges: 0
+      remoteSnapshotConflictMerges: 0,
+      remoteMetadataBatchRequests: 0,
+      driveChangesPages: 0,
+      localFullScans: 0,
+      localDirtyScans: 0,
+      localHashCacheHits: 0
     };
     const started = Date.now();
     try {
+      await this.resetSyncDetailLog();
       const recovery = await this.checkInterruptedSync();
       if (recovery.interrupted && !dryRun && !recoveryResume) {
         const message = this.formatInterruptedSyncMessage(recovery);
@@ -383,11 +513,14 @@ module.exports = class DriveBridgePlugin extends Plugin {
       const executed = await this.executePlan(context, executionPlan, runId, { skipDonePaths: resumeDonePaths });
       if (deferredResumeActions.length) {
         for (const entry of deferredResumeActions) {
-          executed.skippedSafe.push(this.skipRecord(
+          executed.skippedSafeCount = Number(executed.skippedSafeCount || 0) + 1;
+          await this.pushBoundedSyncDetail(executed.skippedSafe, "skippedSafe", this.skipRecord(
             entry,
             new Error(`${entry.action} was deferred by Recovery safe resume. Run Normal Preview after recovery completes.`)
           ));
         }
+        executed.detailsTruncated = executed.detailsTruncated ||
+          executed.skippedSafeCount > executed.skippedSafe.length;
       }
       if (hasOperationWork) {
         await this.markOperationJournalCommitPending(runId, executed);
@@ -403,14 +536,19 @@ module.exports = class DriveBridgePlugin extends Plugin {
             runId,
             expectedSnapshotFileId: context.remoteSnapshotFileId || "",
             expectedSnapshotModifiedTime: context.remoteSnapshotModifiedTime || "",
-            forceWrite: Boolean(context.remoteSnapshotMissing)
+            forceWrite: Boolean(context.remoteSnapshotMissing || context.remoteChangesApplied)
           }
         );
         if (hasOperationWork) {
           await this.updateOperationJournalSnapshotCommit(runId, remoteSnapshotResult);
         }
         await this.saveSnapshot(executed.nextSnapshot);
+        await this.saveRemoteStateCache(context.rootFolderId, remoteSnapshotResult);
         await this.reconcileReviewQueue(plan, executed.reviewItems);
+        if (context.remoteChangesNextPageToken) {
+          this.settings.driveChangesPageToken = context.remoteChangesNextPageToken;
+        }
+        await this.commitLocalDirtyScan(context, executed);
       }
       executed.performance = Object.assign({}, this.syncMetrics);
       await this.writeJournal({
@@ -486,8 +624,13 @@ module.exports = class DriveBridgePlugin extends Plugin {
       console.error("[drivebridge-obsidian-sync]", err);
     } finally {
       await this.safeFlushOperationJournal(true);
+      await this.flushSyncDetailBuffer();
+      await this.flushDirtyQueue();
       this.remoteChildCache = new Map();
       this.folderCache = new Map();
+      this.remoteInfoCache = new Map();
+      this.localHashCache = new Map();
+      this.activeSyncContext = null;
       this.syncing = false;
       this.activeOperation = "";
       this.syncUiQuiet = false;
@@ -513,7 +656,11 @@ module.exports = class DriveBridgePlugin extends Plugin {
       remoteSnapshotFileId: remoteState.snapshotFileId || "",
       remoteSnapshotModifiedTime: remoteState.snapshotModifiedTime || "",
       remoteSnapshotFromFullScan: Boolean(remoteState.fromFullScan),
-      remoteSnapshotMissing: Boolean(remoteState.snapshotMissing)
+      remoteSnapshotMissing: Boolean(remoteState.snapshotMissing),
+      remoteChangesApplied: Boolean(remoteState.changesApplied),
+      remoteChangesNextPageToken: remoteState.nextPageToken || "",
+      localScanWasFull: Boolean(this.lastLocalScanMeta && this.lastLocalScanMeta.full),
+      localDirtyVersionsScanned: this.lastLocalScanMeta && this.lastLocalScanMeta.dirtyVersionsScanned || {}
     };
   }
 
@@ -1116,6 +1263,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
   }
 
   async executePlan(context, plan, runId, options = {}) {
+    this.activeSyncContext = context;
     const nextSnapshot = Object.assign({}, context.snapshot);
     const stats = newEmptyStats();
     const errors = [];
@@ -1128,11 +1276,33 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const skipDonePaths = options.skipDonePaths || new Set();
     let processed = 0;
     let processedBytes = 0;
+    let errorCount = 0;
+    let skippedChangedCount = 0;
+    let skippedSafeCount = 0;
+    let batchFiles = 0;
+    let batchBytes = 0;
+    let currentStage = -1;
     const orderedEntries = this.orderPlanEntries(plan.entries);
     const totalBytes = orderedEntries.reduce((sum, entry) => {
       return sum + this.progressBytesForEntry(entry, context);
     }, 0);
-    for (const entry of orderedEntries) {
+    for (let entryIndex = 0; entryIndex < orderedEntries.length; entryIndex++) {
+      const entry = orderedEntries[entryIndex];
+      const entryStage = this.syncStageForEntry(entry);
+      if (currentStage >= 0 && entryStage !== currentStage) {
+        await this.flushOperationJournal(true);
+        this.remoteInfoCache = new Map();
+        batchFiles = 0;
+        batchBytes = 0;
+        await sleep(0);
+      }
+      currentStage = entryStage;
+      if (batchFiles === 0) {
+        await this.prefetchRemoteInfoForEntries(
+          orderedEntries.slice(entryIndex, entryIndex + this.syncBatchFileLimit()),
+          context
+        );
+      }
       if (skipDonePaths.has(entry.path)) {
         const localItem = context.local[entry.path];
         const remoteItem = context.remote[entry.path];
@@ -1145,7 +1315,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       }
       processed++;
       this.updateSyncProgress({
-        phase: "Sync",
+        phase: this.syncStageName(currentStage),
         current: processedBytes,
         total: totalBytes,
         unit: "bytes",
@@ -1164,20 +1334,23 @@ module.exports = class DriveBridgePlugin extends Plugin {
         });
       } catch (err) {
         if (this.shouldSkipChangedDuringSync(err)) {
-          skippedChanged.push(this.skipRecord(entry, err));
+          skippedChangedCount++;
+          await this.pushBoundedSyncDetail(skippedChanged, "skippedChanged", this.skipRecord(entry, err));
           this.recordRemoteSnapshotUpdate(remoteSnapshotUpdates, entry, err);
           stats.skip++;
           await this.updateOperation(runId, entry, "skipped", context, err);
           continue;
         }
         if (this.shouldSkipSafeConflict(err)) {
-          skippedSafe.push(this.skipRecord(entry, err));
+          skippedSafeCount++;
+          await this.pushBoundedSyncDetail(skippedSafe, "skippedSafe", this.skipRecord(entry, err));
           stats.skip++;
           await this.updateOperation(runId, entry, "skipped", context, err);
           continue;
         }
         const error = this.errorRecord(entry, err);
-        errors.push(error);
+        errorCount++;
+        await this.pushBoundedSyncDetail(errors, "error", error);
         stats.error++;
         await this.updateOperation(runId, entry, "failed", context, err);
         if (stats.error <= 3) {
@@ -1193,19 +1366,49 @@ module.exports = class DriveBridgePlugin extends Plugin {
         console.error("[drivebridge-obsidian-sync]", entry, err);
       } finally {
         processedBytes += entryBytes;
+        batchFiles++;
+        batchBytes += entryBytes;
         this.updateSyncProgress({
-          phase: "Sync",
+          phase: this.syncStageName(currentStage),
           current: processedBytes,
           total: totalBytes,
           unit: "bytes",
           action: entry.action,
           path: entry.path
         });
+        if (batchFiles >= this.syncBatchFileLimit() || batchBytes >= this.syncBatchByteLimit()) {
+          await this.flushOperationJournal(true);
+          batchFiles = 0;
+          batchBytes = 0;
+          this.remoteInfoCache = new Map();
+          await sleep(0);
+        }
       }
     }
     await this.verifyCreatedUploadDuplicates(context, orderedEntries, nextSnapshot, remoteMutations, runId);
     await this.flushOperationJournal(true);
-    return { nextSnapshot, stats, errors, skippedChanged, skippedSafe, remoteDeleted, remoteSnapshotUpdates, remoteMutations, reviewItems, processed, total: orderedEntries.length, processedBytes, totalBytes };
+    this.activeSyncContext = null;
+    return {
+      nextSnapshot,
+      stats,
+      errors,
+      errorCount,
+      skippedChanged,
+      skippedChangedCount,
+      skippedSafe,
+      skippedSafeCount,
+      detailsTruncated: errorCount > errors.length ||
+        skippedChangedCount > skippedChanged.length ||
+        skippedSafeCount > skippedSafe.length,
+      remoteDeleted,
+      remoteSnapshotUpdates,
+      remoteMutations,
+      reviewItems,
+      processed,
+      total: orderedEntries.length,
+      processedBytes,
+      totalBytes
+    };
   }
 
   recordRemoteSnapshotUpdate(remoteSnapshotUpdates, entry, err) {
@@ -1213,6 +1416,63 @@ module.exports = class DriveBridgePlugin extends Plugin {
       return;
     }
     remoteSnapshotUpdates[entry.path] = err.currentRemote || null;
+  }
+
+  syncBatchFileLimit() {
+    return this.isMobileRuntime() && this.settings.mobileLightweightMode !== false
+      ? MOBILE_BATCH_FILE_LIMIT
+      : DESKTOP_BATCH_FILE_LIMIT;
+  }
+
+  syncBatchByteLimit() {
+    return this.isMobileRuntime() && this.settings.mobileLightweightMode !== false
+      ? MOBILE_BATCH_BYTE_LIMIT
+      : DESKTOP_BATCH_BYTE_LIMIT;
+  }
+
+  async pushBoundedSyncDetail(target, type, record) {
+    if (target.length < SYNC_DETAIL_MEMORY_LIMIT) {
+      target.push(record);
+    }
+    await this.appendSyncDetail(type, record);
+  }
+
+  async appendSyncDetail(type, record) {
+    if (!this.app || !this.app.vault || !this.app.vault.adapter || typeof this.app.vault.adapter.append !== "function") {
+      return;
+    }
+    this.syncDetailBuffer = this.syncDetailBuffer || [];
+    this.syncDetailBuffer.push(`${JSON.stringify({ type, record })}\n`);
+    if (this.syncDetailBuffer.length >= 20) {
+      await this.flushSyncDetailBuffer();
+    }
+  }
+
+  async flushSyncDetailBuffer() {
+    if (!this.syncDetailBuffer || !this.syncDetailBuffer.length ||
+        !this.app || !this.app.vault || typeof this.app.vault.adapter.append !== "function") {
+      return;
+    }
+    const content = this.syncDetailBuffer.join("");
+    this.syncDetailBuffer = [];
+    try {
+      await this.ensureAdapterFolderPath(this.pluginDataDir());
+      await this.app.vault.adapter.append(this.pluginDataPath(SYNC_DETAIL_FILE), content);
+    } catch (err) {
+      console.warn("[drivebridge-obsidian-sync] could not append sync detail", err);
+    }
+  }
+
+  async resetSyncDetailLog() {
+    if (!this.app || !this.app.vault || !this.app.vault.adapter) {
+      return;
+    }
+    try {
+      await this.writePluginDataFile(SYNC_DETAIL_FILE, "");
+      this.syncDetailBuffer = [];
+    } catch (err) {
+      console.warn("[drivebridge-obsidian-sync] could not reset sync detail log", err);
+    }
   }
 
   progressBytesForEntry(entry, context) {
@@ -1253,9 +1513,9 @@ module.exports = class DriveBridgePlugin extends Plugin {
       upload: 1,
       download: 1,
       moveRemote: 1,
-      conflict: 1,
-      deleteRemote: 2,
-      deleteLocal: 2
+      conflict: 3,
+      deleteRemote: 4,
+      deleteLocal: 4
     };
     return entries.slice().sort((a, b) => {
       const aw = weight[a.action] === undefined ? 1 : weight[a.action];
@@ -1266,8 +1526,45 @@ module.exports = class DriveBridgePlugin extends Plugin {
       if (a.action === "deleteLocal" || a.action === "deleteRemote") {
         return b.path.length - a.path.length;
       }
+      if (this.settings.mobileLightweightMode !== false) {
+        const ar = this.mobileResourcePriority(a);
+        const br = this.mobileResourcePriority(b);
+        if (ar !== br) {
+          return ar - br;
+        }
+        const as = this.entryTransferSize(a, this.activeSyncContext || {});
+        const bs = this.entryTransferSize(b, this.activeSyncContext || {});
+        if (as !== bs) {
+          return as - bs;
+        }
+      }
       return a.path.localeCompare(b.path);
     });
+  }
+
+  mobileResourcePriority(entry) {
+    const lower = String(entry.path || "").toLowerCase();
+    if (lower.endsWith(".md")) return 0;
+    if (/\.(txt|json|css|js|canvas)$/.test(lower)) return 1;
+    if (isLargeBinaryPath(lower)) return 3;
+    return 2;
+  }
+
+  syncStageForEntry(entry) {
+    if (!entry || entry.action === "skip" || entry.action === "adopt") return 0;
+    if (entry.action === "deleteLocal" || entry.action === "deleteRemote") return 4;
+    if (entry.action === "conflict") return 3;
+    return this.mobileResourcePriority(entry) >= 3 ? 2 : 1;
+  }
+
+  syncStageName(stage) {
+    return ["Index", "Notes", "Attachments", "Conflicts", "Deletes"][stage] || "Sync";
+  }
+
+  entryTransferSize(entry, context) {
+    const localItem = context.local && context.local[entry.path];
+    const remoteItem = context.remote && context.remote[entry.path];
+    return Math.max(Number(localItem && localItem.size || 0), Number(remoteItem && remoteItem.size || 0));
   }
 
   async executeEntry(entry, context, nextSnapshot, stats, remoteDeleted, remoteMutations, reviewItems, runId = "") {
@@ -1311,10 +1608,17 @@ module.exports = class DriveBridgePlugin extends Plugin {
         reservedRemoteId: this.reservedRemoteIdForOperation(runId, path),
         operationId: this.operationIdForPath(runId, path),
         runId,
+        resumeSessionUrl: this.resumableStateForOperation(runId, path).uploadSessionUrl,
+        resumeUploadedBytes: this.resumableStateForOperation(runId, path).uploadedBytes,
         onPrepared: async (prepared) => {
           await this.updateOperation(runId, entry, "in_progress", context, null, Object.assign({
             phase: "request_sent"
           }, prepared));
+        },
+        onChunkProgress: async (progress) => {
+          await this.updateOperation(runId, entry, "in_progress", context, null, Object.assign({
+            phase: "transferring"
+          }, progress));
         }
       });
       const localAfter = await this.localInfoByPath(path);
@@ -1346,7 +1650,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     }
     if (entry.action === "conflict") {
       await this.assertLocalUnchangedSincePlan(path, localItem);
-      await this.assertRemoteUnchangedSincePlan(path, remoteItem);
+      await this.assertRemoteUnchangedSincePlan(path, remoteItem, { force: true });
       if ((this.settings.conflictAction || DEFAULT_SETTINGS.conflictAction) === "manualReview") {
         reviewItems.push(this.reviewItemFrom(entry, localItem, remoteItem));
         stats.review++;
@@ -1377,7 +1681,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     }
     if (entry.action === "deleteLocal") {
       await this.assertLocalUnchangedSincePlan(path, localItem, true);
-      await this.assertRemoteUnchangedSincePlan(path, remoteItem);
+      await this.assertRemoteUnchangedSincePlan(path, remoteItem, { force: true });
       await this.deleteLocal(path);
       delete nextSnapshot[path];
       stats.deleteLocal++;
@@ -1385,7 +1689,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     }
     if (entry.action === "deleteRemote") {
       await this.assertLocalUnchangedSincePlan(path, localItem);
-      const deletedRemote = await this.assertRemoteContentUnchangedSincePlan(path, remoteItem);
+      const deletedRemote = await this.assertRemoteContentUnchangedSincePlan(path, remoteItem, { force: true });
       if (!deletedRemote) {
         throw this.changedDuringSyncError(`Google Drive file disappeared before delete: ${path}`, "remote", "delete was not applied", null);
       }
@@ -1485,7 +1789,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
         (url.startsWith(DRIVE_API) || url.startsWith(DRIVE_UPLOAD_API))) {
       this.assertCurrentRuntime();
     }
-    const retrySafe = method !== "POST";
+    const retrySafe = options.retrySafe === true || method !== "POST";
     let res;
     try {
       if (this.syncMetrics) {
@@ -1568,7 +1872,44 @@ module.exports = class DriveBridgePlugin extends Plugin {
   }
 
   async scanLocalVault(snapshot = {}) {
+    const profile = JSON.stringify({
+      excludedFolders: this.settings.excludedFolders || "",
+      excludedPatterns: this.settings.excludedPatterns || "",
+      obsidianSyncMode: this.settings.obsidianSyncMode || "off"
+    });
+    if (this.localScanProfile && this.localScanProfile !== profile) {
+      this.localDirtyTrusted = false;
+    }
+    this.localScanProfile = profile;
+    const dirtyVersions = Object.fromEntries(this.localDirtyPaths || []);
+    if (this.localDirtyTrusted) {
+      if (this.syncMetrics) this.syncMetrics.localDirtyScans++;
+      const incremental = {};
+      for (const [path, value] of Object.entries(snapshot || {})) {
+        if (value && value.local && !this.isExcluded(path)) {
+          incremental[path] = Object.assign({ path }, value.local);
+        }
+      }
+      for (const path of Object.keys(dirtyVersions)) {
+        if (this.isExcluded(path)) {
+          delete incremental[path];
+          continue;
+        }
+        if (await this.localPathExists(path)) {
+          const previousLocal = snapshot[path] && snapshot[path].local;
+          incremental[path] = await this.localInfoByPath(path, previousLocal);
+        } else {
+          delete incremental[path];
+        }
+      }
+      this.lastLocalScanMeta = {
+        full: false,
+        dirtyVersionsScanned: dirtyVersions
+      };
+      return incremental;
+    }
     const result = {};
+    if (this.syncMetrics) this.syncMetrics.localFullScans++;
     for (const file of this.app.vault.getFiles()) {
       if (!this.isExcluded(file.path)) {
         const previousLocal = snapshot[file.path] && snapshot[file.path].local;
@@ -1578,6 +1919,10 @@ module.exports = class DriveBridgePlugin extends Plugin {
     if (this.settings.obsidianSyncMode === "safe") {
       await this.scanAdapterFolder(this.app.vault.configDir || ".obsidian", result, snapshot);
     }
+    this.lastLocalScanMeta = {
+      full: true,
+      dirtyVersionsScanned: dirtyVersions
+    };
     return result;
   }
 
@@ -1600,13 +1945,201 @@ module.exports = class DriveBridgePlugin extends Plugin {
   }
 
   async scanRemoteVault(rootFolderId) {
-    const snapshotState = await this.loadRemoteSnapshotFile(rootFolderId);
-    if (snapshotState) {
+    let snapshotState = null;
+    if (this.settings.driveChangesEnabled && this.settings.driveChangesPageToken) {
+      snapshotState = await this.loadRemoteStateCache(rootFolderId);
+    }
+    if (!snapshotState) {
+      snapshotState = await this.loadRemoteSnapshotFile(rootFolderId);
+    }
+    if (snapshotState && !this.settings.driveChangesEnabled) {
       return snapshotState;
     }
+    if (snapshotState && this.settings.driveChangesPageToken) {
+      try {
+        return await this.applyRemoteChanges(rootFolderId, snapshotState, this.settings.driveChangesPageToken);
+      } catch (err) {
+        if (!err || err.status !== 410) {
+          throw err;
+        }
+        this.settings.driveChangesPageToken = "";
+        console.warn("[drivebridge-obsidian-sync] Drive Changes token expired; rebuilding the remote state once.");
+      }
+    }
+    const bootstrapToken = this.settings.driveChangesEnabled
+      ? await this.getDriveStartPageToken()
+      : "";
     const result = {};
     await this.scanRemoteFolder(rootFolderId, "", result);
-    return { files: result, deleted: {}, snapshotAt: 0, fromFullScan: true, snapshotMissing: true };
+    const base = {
+      files: result,
+      deleted: snapshotState && snapshotState.deleted || {},
+      snapshotAt: snapshotState && snapshotState.snapshotAt || 0,
+      snapshotFileId: snapshotState && snapshotState.snapshotFileId || "",
+      snapshotModifiedTime: snapshotState && snapshotState.snapshotModifiedTime || "",
+      fromFullScan: true,
+      snapshotMissing: !snapshotState,
+      changesApplied: Boolean(snapshotState)
+    };
+    if (!bootstrapToken) {
+      return base;
+    }
+    const changed = await this.applyRemoteChanges(rootFolderId, base, bootstrapToken);
+    changed.fromFullScan = true;
+    changed.snapshotMissing = !snapshotState;
+    changed.changesApplied = true;
+    return changed;
+  }
+
+  async getDriveStartPageToken() {
+    const params = new URLSearchParams({ supportsAllDrives: "false" });
+    const data = await parseJsonResponse(await this.driveFetch(`${DRIVE_API}/changes/startPageToken?${params}`));
+    return data.startPageToken || "";
+  }
+
+  async applyRemoteChanges(rootFolderId, snapshotState, pageToken) {
+    const files = Object.assign({}, snapshotState.files || {});
+    const deleted = Object.assign({}, snapshotState.deleted || {});
+    const idToPath = new Map(Object.entries(files)
+      .filter(([, item]) => item && item.id)
+      .map(([path, item]) => [item.id, path]));
+    const folderPathCache = new Map([[rootFolderId, ""]]);
+    let token = pageToken;
+    let nextPageToken = pageToken;
+    let changesApplied = false;
+    let requiresFullScan = false;
+    do {
+      const params = new URLSearchParams({
+        pageToken: token,
+        pageSize: String(DRIVE_CHANGE_PAGE_SIZE),
+        spaces: "drive",
+        includeRemoved: "true",
+        fields: "nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,mimeType,size,modifiedTime,md5Checksum,parents,trashed))"
+      });
+      const data = await parseJsonResponse(await this.driveFetch(`${DRIVE_API}/changes?${params}`));
+      if (this.syncMetrics) this.syncMetrics.driveChangesPages++;
+      for (const change of data.changes || []) {
+        const previousPath = idToPath.get(change.fileId) || "";
+        const file = change.file;
+        if (change.removed || !file || file.trashed) {
+          if (previousPath) {
+            const previous = files[previousPath];
+            delete files[previousPath];
+            idToPath.delete(change.fileId);
+            deleted[previousPath] = this.remoteDeleteTombstone(previous);
+            changesApplied = true;
+          }
+          continue;
+        }
+        if (file.mimeType === "application/vnd.google-apps.folder") {
+          assertSafeRemoteName(file.name);
+          if (previousPath || await this.driveItemBelongsToRoot(file, rootFolderId, folderPathCache)) {
+            requiresFullScan = true;
+          }
+          continue;
+        }
+        if (file.mimeType && file.mimeType.startsWith("application/vnd.google-apps.")) {
+          continue;
+        }
+        assertSafeRemoteName(file.name);
+        if (file.name === REMOTE_SNAPSHOT_FILE && file.parents && file.parents[0] === rootFolderId) {
+          continue;
+        }
+        const resolvedPath = await this.resolveChangedDriveFilePath(file, rootFolderId, folderPathCache);
+        if (previousPath && previousPath !== resolvedPath) {
+          const previous = files[previousPath];
+          delete files[previousPath];
+          idToPath.delete(file.id);
+          deleted[previousPath] = this.remoteDeleteTombstone(previous);
+          changesApplied = true;
+        }
+        if (!resolvedPath || this.isExcluded(resolvedPath)) {
+          if (previousPath) {
+            delete files[previousPath];
+            idToPath.delete(file.id);
+            changesApplied = true;
+          }
+          continue;
+        }
+        if (files[resolvedPath] && files[resolvedPath].id !== file.id) {
+          throw new Error(`Duplicate Google Drive path "${resolvedPath}" detected by the Changes API. Run duplicate Repair before syncing.`);
+        }
+        files[resolvedPath] = remoteInfo(resolvedPath, file);
+        idToPath.set(file.id, resolvedPath);
+        delete deleted[resolvedPath];
+        changesApplied = true;
+      }
+      token = data.nextPageToken || "";
+      nextPageToken = data.newStartPageToken || data.nextPageToken || nextPageToken;
+    } while (token);
+
+    if (requiresFullScan) {
+      const rescanned = {};
+      await this.scanRemoteFolder(rootFolderId, "", rescanned);
+      return Object.assign({}, snapshotState, {
+        files: rescanned,
+        deleted,
+        changesApplied: true,
+        nextPageToken
+      });
+    }
+    return Object.assign({}, snapshotState, {
+      files,
+      deleted,
+      changesApplied,
+      nextPageToken
+    });
+  }
+
+  async driveItemBelongsToRoot(file, rootFolderId, folderPathCache) {
+    return Boolean(await this.resolveChangedDriveFilePath(file, rootFolderId, folderPathCache, true));
+  }
+
+  async resolveChangedDriveFilePath(file, rootFolderId, folderPathCache, folderOnly = false) {
+    const parentId = file.parents && file.parents[0] || "";
+    if (!parentId) {
+      return "";
+    }
+    const parent = await this.resolveDriveFolderPath(parentId, rootFolderId, folderPathCache);
+    if (parent === null) {
+      return "";
+    }
+    const path = parent ? `${parent}/${file.name}` : file.name;
+    return folderOnly ? path : path;
+  }
+
+  async resolveDriveFolderPath(folderId, rootFolderId, cache) {
+    if (folderId === rootFolderId) {
+      return "";
+    }
+    if (cache.has(folderId)) {
+      return cache.get(folderId);
+    }
+    const params = new URLSearchParams({ fields: "id,name,mimeType,parents,trashed" });
+    const res = await this.driveFetch(`${DRIVE_API}/files/${folderId}?${params}`);
+    if (res.status === 404) {
+      cache.set(folderId, null);
+      return null;
+    }
+    const folder = await parseJsonResponse(res);
+    if (folder.trashed || folder.mimeType !== "application/vnd.google-apps.folder") {
+      cache.set(folderId, null);
+      return null;
+    }
+    assertSafeRemoteName(folder.name);
+    const parentId = folder.parents && folder.parents[0] || "";
+    if (!parentId) {
+      cache.set(folderId, null);
+      return null;
+    }
+    const parentPathValue = await this.resolveDriveFolderPath(parentId, rootFolderId, cache);
+    if (parentPathValue === null) {
+      cache.set(folderId, null);
+      return null;
+    }
+    const value = parentPathValue ? `${parentPathValue}/${folder.name}` : folder.name;
+    cache.set(folderId, value);
+    return value;
   }
 
   async loadRemoteSnapshotFile(rootFolderId) {
@@ -1660,6 +2193,45 @@ module.exports = class DriveBridgePlugin extends Plugin {
       console.warn(`[drivebridge-obsidian-sync] Failed to load ${REMOTE_SNAPSHOT_FILE}, falling back to full scan`, err);
     }
     return null;
+  }
+
+  async loadRemoteStateCache(rootFolderId) {
+    try {
+      const value = await this.loadPluginDataJsonWithBackup(
+        REMOTE_STATE_CACHE_FILE,
+        REMOTE_STATE_CACHE_BACKUP_FILE,
+        null,
+        validateRemoteStateCache,
+        "Drive changes will fall back to the shared remote snapshot."
+      );
+      return value && value.rootFolderId === rootFolderId ? value : null;
+    } catch (err) {
+      console.warn("[drivebridge-obsidian-sync] local remote-state cache could not be loaded; using the shared remote snapshot", err);
+      return null;
+    }
+  }
+
+  async saveRemoteStateCache(rootFolderId, remoteSnapshotResult) {
+    if (!remoteSnapshotResult || !remoteSnapshotResult.files || !remoteSnapshotResult.deleted) {
+      throw new Error("Remote snapshot commit did not return a cacheable state.");
+    }
+    const modifiedTime = remoteSnapshotResult.modifiedTime || "";
+    const value = {
+      version: 1,
+      rootFolderId,
+      generatedAt: new Date().toISOString(),
+      snapshotAt: Date.parse(modifiedTime) || Number(remoteSnapshotResult.snapshotAt || 0) || Date.now(),
+      snapshotFileId: remoteSnapshotResult.fileId || "",
+      snapshotModifiedTime: modifiedTime,
+      files: remoteSnapshotResult.files,
+      deleted: remoteSnapshotResult.deleted
+    };
+    validateRemoteStateCache(value);
+    await this.writePluginDataFileAtomic(
+      REMOTE_STATE_CACHE_FILE,
+      REMOTE_STATE_CACHE_BACKUP_FILE,
+      JSON.stringify(value)
+    );
   }
 
   remoteSnapshotNewerThanLocalSync(context) {
@@ -1725,7 +2297,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     if (!(await this.localPathExists(path))) {
       throw new Error(`Local file not found: ${path}`);
     }
-    const localItem = await this.localInfoByPath(path);
+    const localItem = await this.localStatInfoByPath(path);
     const data = await this.readLocalBinary(path);
     const parentId = await this.ensureRemoteParent(path, rootFolderId);
     const metadata = { name: basename(path) };
@@ -1755,16 +2327,23 @@ module.exports = class DriveBridgePlugin extends Plugin {
         expectedSize: Number(localItem.size || 0)
       });
     }
-    const boundary = `drivebridge-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const body = makeMultipartBody(boundary, metadata, data, getMimeType(path));
-    const url = existingRemote
-      ? `${DRIVE_UPLOAD_API}/files/${existingRemote.id}?uploadType=multipart&fields=id,name,size,modifiedTime,md5Checksum`
-      : `${DRIVE_UPLOAD_API}/files?uploadType=multipart&fields=id,name,size,modifiedTime,md5Checksum`;
-    const request = async () => parseJsonResponse(await this.driveFetch(url, {
-      method: existingRemote ? "PATCH" : "POST",
-      headers: { "Content-Type": `multipart/related; boundary=${boundary}` },
-      body
-    }));
+    const useResumable = data.byteLength >= RESUMABLE_UPLOAD_THRESHOLD_BYTES ||
+      (this.isMobileRuntime() && this.settings.mobileLightweightMode !== false);
+    const request = async () => {
+      if (useResumable) {
+        return this.uploadResumableFile(path, existingRemote, metadata, data, options);
+      }
+      const boundary = `drivebridge-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const body = makeMultipartBody(boundary, metadata, data, getMimeType(path));
+      const url = existingRemote
+        ? `${DRIVE_UPLOAD_API}/files/${existingRemote.id}?uploadType=multipart&fields=id,name,size,modifiedTime,md5Checksum`
+        : `${DRIVE_UPLOAD_API}/files?uploadType=multipart&fields=id,name,size,modifiedTime,md5Checksum`;
+      return parseJsonResponse(await this.driveFetch(url, {
+        method: existingRemote ? "PATCH" : "POST",
+        headers: { "Content-Type": `multipart/related; boundary=${boundary}` },
+        body
+      }));
+    };
     let uploaded;
     try {
       uploaded = await request();
@@ -1814,6 +2393,102 @@ module.exports = class DriveBridgePlugin extends Plugin {
       this.rememberRemoteChild(parentId, result);
     }
     return result;
+  }
+
+  async uploadResumableFile(path, existingRemote, metadata, data, options = {}) {
+    const mimeType = getMimeType(path);
+    const total = data.byteLength;
+    let sessionUrl = options.resumeSessionUrl || "";
+    let offset = Math.max(0, Number(options.resumeUploadedBytes || 0));
+    if (sessionUrl) {
+      try {
+        const status = await this.queryResumableUpload(sessionUrl, total);
+        if (status.completed) {
+          return status.file;
+        }
+        offset = status.offset;
+      } catch (err) {
+        if (!err || (err.status !== 404 && err.status !== 410)) {
+          throw err;
+        }
+        sessionUrl = "";
+        offset = 0;
+      }
+    }
+    if (!sessionUrl) {
+      const url = existingRemote
+        ? `${DRIVE_UPLOAD_API}/files/${existingRemote.id}?uploadType=resumable&fields=id,name,size,modifiedTime,md5Checksum`
+        : `${DRIVE_UPLOAD_API}/files?uploadType=resumable&fields=id,name,size,modifiedTime,md5Checksum`;
+      const res = await this.driveFetch(url, {
+        method: existingRemote ? "PATCH" : "POST",
+        headers: {
+          "Content-Type": "application/json; charset=UTF-8",
+          "X-Upload-Content-Type": mimeType,
+          "X-Upload-Content-Length": String(total)
+        },
+        body: JSON.stringify(metadata)
+      });
+      if (!res.ok) {
+        await parseJsonResponse(res);
+      }
+      sessionUrl = res.headers.get("Location") || res.headers.get("location") || "";
+      if (!sessionUrl) {
+        throw new Error(`Google Drive resumable upload did not return a session URL for ${path}.`);
+      }
+      if (options.onChunkProgress) {
+        await options.onChunkProgress({ uploadSessionUrl: sessionUrl, uploadedBytes: 0, totalBytes: total });
+      }
+    }
+
+    while (offset < total) {
+      await this.waitForForegroundBeforeLargeTransfer(path);
+      const endExclusive = Math.min(total, offset + this.transferChunkBytes());
+      const chunk = new Uint8Array(data, offset, endExclusive - offset);
+      const res = await this.driveFetch(sessionUrl, {
+        method: "PUT",
+        headers: {
+          "Content-Type": mimeType,
+          "Content-Length": String(chunk.byteLength),
+          "Content-Range": `bytes ${offset}-${endExclusive - 1}/${total}`
+        },
+        body: chunk
+      });
+      if (res.status === 308) {
+        offset = resumableNextOffset(res.headers.get("Range"), endExclusive);
+      } else if (res.ok) {
+        const uploaded = await parseJsonResponse(res);
+        if (options.onChunkProgress) {
+          await options.onChunkProgress({ uploadSessionUrl: sessionUrl, uploadedBytes: total, totalBytes: total });
+        }
+        return uploaded;
+      } else {
+        await parseJsonResponse(res);
+      }
+      if (options.onChunkProgress) {
+        await options.onChunkProgress({ uploadSessionUrl: sessionUrl, uploadedBytes: offset, totalBytes: total });
+      }
+      this.updateTransferProgress("Upload", path, offset, total);
+      await sleep(0);
+    }
+    throw new Error(`Google Drive resumable upload ended without metadata for ${path}.`);
+  }
+
+  async queryResumableUpload(sessionUrl, total) {
+    const res = await this.driveFetch(sessionUrl, {
+      method: "PUT",
+      headers: {
+        "Content-Length": "0",
+        "Content-Range": `bytes */${total}`
+      }
+    });
+    if (res.status === 308) {
+      return { completed: false, offset: resumableNextOffset(res.headers.get("Range"), 0) };
+    }
+    if (res.ok) {
+      return { completed: true, file: await parseJsonResponse(res) };
+    }
+    await parseJsonResponse(res);
+    return { completed: false, offset: 0 };
   }
 
   isAmbiguousCreateError(err) {
@@ -2275,6 +2950,11 @@ module.exports = class DriveBridgePlugin extends Plugin {
   }
 
   async downloadRemoteFile(path, remoteItem, options = {}) {
+    const expectedSize = Number(remoteItem.size || 0);
+    if (expectedSize >= RESUMABLE_UPLOAD_THRESHOLD_BYTES ||
+        (this.isMobileRuntime() && this.settings.mobileLightweightMode !== false && expectedSize > 0)) {
+      return this.downloadRemoteFileInRanges(path, remoteItem, options);
+    }
     const res = await this.driveFetch(`${DRIVE_API}/files/${remoteItem.id}?alt=media`);
     if (!res.ok) {
       await parseJsonResponse(res);
@@ -2282,6 +2962,48 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const buffer = await res.arrayBuffer();
     await this.ensureLocalParent(path);
     await this.writeVerifiedDownload(path, remoteItem, buffer, options);
+  }
+
+  async downloadRemoteFileInRanges(path, remoteItem, options = {}) {
+    const total = Number(remoteItem.size || 0);
+    if (!total) {
+      const res = await this.driveFetch(`${DRIVE_API}/files/${remoteItem.id}?alt=media`);
+      if (!res.ok) await parseJsonResponse(res);
+      return this.writeVerifiedDownload(path, remoteItem, await res.arrayBuffer(), options);
+    }
+    const assembled = new Uint8Array(total);
+    let offset = 0;
+    while (offset < total) {
+      await this.waitForForegroundBeforeLargeTransfer(path);
+      const endExclusive = Math.min(total, offset + this.transferChunkBytes());
+      const res = await this.driveFetch(`${DRIVE_API}/files/${remoteItem.id}?alt=media`, {
+        headers: { Range: `bytes=${offset}-${endExclusive - 1}` }
+      });
+      if (!(res.status === 206 || (res.ok && offset === 0))) {
+        await parseJsonResponse(res);
+      }
+      const chunkBuffer = await res.arrayBuffer();
+      const chunk = new Uint8Array(chunkBuffer);
+      if (res.status !== 206 && chunk.byteLength === total) {
+        const preverifiedMd5 = remoteItem.md5Checksum ? md5Hex(chunkBuffer) : "";
+        return this.writeVerifiedDownload(path, remoteItem, chunkBuffer, Object.assign({}, options, {
+          preverifiedMd5
+        }));
+      }
+      const expectedChunkLength = endExclusive - offset;
+      if (chunk.byteLength !== expectedChunkLength) {
+        throw new Error(`Google Drive range length mismatch for ${path}: ${chunk.byteLength} != ${expectedChunkLength}`);
+      }
+      assembled.set(chunk, offset);
+      offset = endExclusive;
+      this.updateTransferProgress("Download", path, offset, total);
+      await sleep(0);
+    }
+    const buffer = assembled.buffer;
+    const preverifiedMd5 = remoteItem.md5Checksum ? md5Hex(buffer) : "";
+    await this.writeVerifiedDownload(path, remoteItem, buffer, Object.assign({}, options, {
+      preverifiedMd5
+    }));
   }
 
   async writeVerifiedDownload(path, remoteItem, buffer, options = {}) {
@@ -2292,7 +3014,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     }
     await this.ensureLocalParent(tempPath);
     await this.app.vault.adapter.writeBinary(tempPath, buffer);
-    await this.assertDownloadedTempMatchesRemote(tempPath, remoteItem);
+    await this.assertDownloadedTempMatchesRemote(tempPath, remoteItem, options.preverifiedMd5 || "");
 
     if (Object.prototype.hasOwnProperty.call(options, "plannedLocal")) {
       await this.assertLocalUnchangedSincePlan(path, options.plannedLocal, true);
@@ -2319,14 +3041,14 @@ module.exports = class DriveBridgePlugin extends Plugin {
     }
   }
 
-  async assertDownloadedTempMatchesRemote(tempPath, remoteItem) {
+  async assertDownloadedTempMatchesRemote(tempPath, remoteItem, preverifiedMd5 = "") {
     const stat = await this.app.vault.adapter.stat(tempPath);
     const expectedSize = Number(remoteItem.size || 0);
     if (expectedSize && (!stat || stat.size !== expectedSize)) {
       throw new Error(`Downloaded file size mismatch for ${tempPath}: ${stat ? stat.size : "missing"} != ${expectedSize}`);
     }
     if (remoteItem.md5Checksum) {
-      const localMd5 = await this.localMd5ByPath(tempPath);
+      const localMd5 = preverifiedMd5 || await this.localMd5ByPath(tempPath);
       if (localMd5 !== remoteItem.md5Checksum.toLowerCase()) {
         throw new Error(`Downloaded file checksum mismatch for ${tempPath}`);
       }
@@ -2428,7 +3150,15 @@ module.exports = class DriveBridgePlugin extends Plugin {
       if (this.syncMetrics) {
         this.syncMetrics.remoteSnapshotWriteSkipped++;
       }
-      return { written: false, mergedConflict: false };
+      return {
+        written: false,
+        mergedConflict: false,
+        fileId: options.expectedSnapshotFileId || "",
+        modifiedTime: options.expectedSnapshotModifiedTime || "",
+        snapshotAt: Date.parse(options.expectedSnapshotModifiedTime || "") || 0,
+        files: remoteState,
+        deleted
+      };
     }
     return this.writeRemoteSnapshotFile(rootFolderId, remoteState, deleted, Object.assign({}, options, {
       baseFiles: currentRemote || {},
@@ -2501,7 +3231,10 @@ module.exports = class DriveBridgePlugin extends Plugin {
       mergedConflict,
       fileId: uploaded.id || existingId || "",
       modifiedTime: uploaded.modifiedTime || "",
-      commitId
+      commitId,
+      snapshotAt: Date.parse(uploaded.modifiedTime || "") || Date.now(),
+      files,
+      deleted
     };
   }
 
@@ -2961,6 +3694,17 @@ module.exports = class DriveBridgePlugin extends Plugin {
     return operation && operation.operationId || "";
   }
 
+  resumableStateForOperation(runId, path) {
+    const journal = this.operationJournalCache;
+    const operation = journal && journal.runId === runId && journal.operations
+      ? journal.operations[path]
+      : null;
+    return {
+      uploadSessionUrl: operation && operation.uploadSessionUrl || "",
+      uploadedBytes: Number(operation && operation.uploadedBytes || 0)
+    };
+  }
+
   async updateOperation(runId, entry, status, context, err, details = {}) {
     if (!runId || !entry || !entry.path) {
       return;
@@ -3412,9 +4156,10 @@ module.exports = class DriveBridgePlugin extends Plugin {
     if (shouldHashLocalFile(file.path, file.stat.size)) {
       if (canReuseLocalHash(previousLocal, info)) {
         info.sha256 = previousLocal.sha256;
+        this.rememberLocalHashes(info, { sha256: previousLocal.sha256 });
       } else {
-        const data = await this.app.vault.readBinary(file);
-        info.sha256 = await sha256Hex(data);
+        const hashes = await this.localHashesForPath(file.path, info, () => this.app.vault.readBinary(file));
+        info.sha256 = hashes.sha256;
       }
     }
     return info;
@@ -3437,12 +4182,28 @@ module.exports = class DriveBridgePlugin extends Plugin {
     if (shouldHashLocalFile(path, stat.size)) {
       if (canReuseLocalHash(previousLocal, info)) {
         info.sha256 = previousLocal.sha256;
+        this.rememberLocalHashes(info, { sha256: previousLocal.sha256 });
       } else {
-        const data = await this.app.vault.adapter.readBinary(path);
-        info.sha256 = await sha256Hex(data);
+        const hashes = await this.localHashesForPath(path, info, () => this.app.vault.adapter.readBinary(path));
+        info.sha256 = hashes.sha256;
       }
     }
     return info;
+  }
+
+  async localStatInfoByPath(path) {
+    if (!this.app || !this.app.vault) {
+      return this.localInfoByPath(path);
+    }
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (file instanceof TFile) {
+      return { path, size: file.stat.size, mtime: file.stat.mtime };
+    }
+    const stat = await this.app.vault.adapter.stat(path);
+    if (!stat) {
+      throw new Error(`Local file not found: ${path}`);
+    }
+    return { path, size: stat.size, mtime: stat.mtime };
   }
 
   async readLocalBinary(path) {
@@ -3454,8 +4215,38 @@ module.exports = class DriveBridgePlugin extends Plugin {
   }
 
   async localMd5ByPath(path) {
-    const data = await this.readLocalBinary(path);
-    return md5Hex(data);
+    const info = await this.localStatInfoByPath(path);
+    const hashes = await this.localHashesForPath(path, info, () => this.readLocalBinary(path));
+    return hashes.md5;
+  }
+
+  localHashCacheKey(info) {
+    return `${info.path}\n${Number(info.size || 0)}\n${Number(info.mtime || 0)}`;
+  }
+
+  rememberLocalHashes(info, hashes) {
+    this.localHashCache = this.localHashCache || new Map();
+    const key = this.localHashCacheKey(info);
+    const previous = this.localHashCache.get(key) || {};
+    this.localHashCache.set(key, Object.assign({}, previous, hashes));
+  }
+
+  async localHashesForPath(path, info, reader) {
+    this.localHashCache = this.localHashCache || new Map();
+    const normalizedInfo = Object.assign({ path }, info);
+    const key = this.localHashCacheKey(normalizedInfo);
+    const cached = this.localHashCache.get(key);
+    if (cached && cached.sha256 && cached.md5) {
+      if (this.syncMetrics) this.syncMetrics.localHashCacheHits++;
+      return cached;
+    }
+    const data = await reader();
+    const hashes = {
+      sha256: cached && cached.sha256 ? cached.sha256 : await sha256Hex(data),
+      md5: cached && cached.md5 ? cached.md5 : md5Hex(data)
+    };
+    this.localHashCache.set(key, hashes);
+    return hashes;
   }
 
   async hasSameContent(path, localItem, remoteItem) {
@@ -3497,26 +4288,99 @@ module.exports = class DriveBridgePlugin extends Plugin {
     }
   }
 
-  async remoteInfoById(path, fileId) {
+  async prefetchRemoteInfoForEntries(entries, context) {
+    this.remoteInfoCache = this.remoteInfoCache || new Map();
+    const byId = new Map();
+    for (const entry of entries || []) {
+      if (!entry || ["skip", "adopt", "deleteLocal", "deleteRemote"].includes(entry.action)) {
+        continue;
+      }
+      const planned = entry.fromPath
+        ? context.remote && context.remote[entry.fromPath]
+        : context.remote && context.remote[entry.path];
+      if (planned && planned.id && !this.remoteInfoCache.has(planned.id)) {
+        byId.set(planned.id, entry.fromPath || entry.path);
+      }
+    }
+    const ids = Array.from(byId.keys());
+    for (let index = 0; index < ids.length; index += 100) {
+      const batch = ids.slice(index, index + 100);
+      const values = await this.batchGetRemoteInfo(batch);
+      for (let itemIndex = 0; itemIndex < batch.length; itemIndex++) {
+        const id = batch[itemIndex];
+        const file = values[itemIndex];
+        const path = byId.get(id) || file && file.name || "";
+        this.remoteInfoCache.set(id, {
+          value: file && !file.trashed ? remoteInfo(path, file) : null,
+          fetchedAt: Date.now()
+        });
+      }
+    }
+  }
+
+  async batchGetRemoteInfo(fileIds) {
+    if (!fileIds.length) {
+      return [];
+    }
+    if (this.syncMetrics) this.syncMetrics.remoteMetadataBatchRequests++;
+    const boundary = `drivebridge-batch-${Date.now()}-${randomId(8)}`;
+    const fields = "id,name,size,modifiedTime,md5Checksum,parents,trashed";
+    const parts = fileIds.map((id, index) => [
+      `--${boundary}`,
+      "Content-Type: application/http",
+      `Content-ID: <drivebridge-${index}>`,
+      "",
+      `GET /drive/v3/files/${encodeURIComponent(id)}?fields=${encodeURIComponent(fields)} HTTP/1.1`,
+      "",
+      ""
+    ].join("\r\n"));
+    const body = `${parts.join("")}--${boundary}--\r\n`;
+    const res = await this.driveFetch("https://www.googleapis.com/batch/drive/v3", {
+      method: "POST",
+      retrySafe: true,
+      headers: { "Content-Type": `multipart/mixed; boundary=${boundary}` },
+      body
+    });
+    if (!res.ok) {
+      await parseJsonResponse(res);
+    }
+    const responseText = await res.text();
+    return parseDriveBatchMetadataResponse(
+      responseText,
+      res.headers.get("Content-Type") || res.headers.get("content-type") || "",
+      fileIds.length
+    );
+  }
+
+  async remoteInfoById(path, fileId, options = {}) {
+    this.remoteInfoCache = this.remoteInfoCache || new Map();
+    const cached = this.remoteInfoCache.get(fileId);
+    if (!options.force && cached && Date.now() - cached.fetchedAt <= REMOTE_INFO_CACHE_TTL_MS) {
+      return cached.value ? Object.assign({}, cached.value, { path }) : null;
+    }
     const params = new URLSearchParams({
       fields: "id,name,size,modifiedTime,md5Checksum,parents,trashed"
     });
     const res = await this.driveFetch(`${DRIVE_API}/files/${fileId}?${params}`);
     if (res.status === 404) {
+      this.remoteInfoCache.set(fileId, { value: null, fetchedAt: Date.now() });
       return null;
     }
     const file = await parseJsonResponse(res);
     if (file.trashed) {
+      this.remoteInfoCache.set(fileId, { value: null, fetchedAt: Date.now() });
       return null;
     }
-    return remoteInfo(path, file);
+    const value = remoteInfo(path, file);
+    this.remoteInfoCache.set(fileId, { value, fetchedAt: Date.now() });
+    return value;
   }
 
-  async assertRemoteUnchangedSincePlan(path, plannedRemote) {
+  async assertRemoteUnchangedSincePlan(path, plannedRemote, options = {}) {
     if (!plannedRemote || !plannedRemote.id) {
       return;
     }
-    const currentInfo = await this.remoteInfoById(path, plannedRemote.id);
+    const currentInfo = await this.remoteInfoById(path, plannedRemote.id, options);
     if (!currentInfo || !sameRemote(plannedRemote, currentInfo)) {
       throw this.changedDuringSyncError(
         `Google Drive file differs from planned remote snapshot: ${path}`,
@@ -3527,11 +4391,11 @@ module.exports = class DriveBridgePlugin extends Plugin {
     }
   }
 
-  async assertRemoteContentUnchangedSincePlan(path, plannedRemote) {
+  async assertRemoteContentUnchangedSincePlan(path, plannedRemote, options = {}) {
     if (!plannedRemote || !plannedRemote.id) {
       return null;
     }
-    const currentInfo = await this.remoteInfoById(path, plannedRemote.id);
+    const currentInfo = await this.remoteInfoById(path, plannedRemote.id, options);
     if (!currentInfo || !sameRemoteContent(plannedRemote, currentInfo)) {
       throw this.changedDuringSyncError(
         `Google Drive file differs from planned remote snapshot: ${path}`,
@@ -3780,9 +4644,32 @@ module.exports = class DriveBridgePlugin extends Plugin {
       total: progress.total || 0,
       unit: progress.unit || ""
     };
+    const now = Date.now();
+    const terminal = progress.total > 0 && progress.current >= progress.total;
+    if (!terminal && now - Number(this.lastProgressRenderAt || 0) < PROGRESS_THROTTLE_MS) {
+      this.pendingProgress = { text, statusText, state: this.currentProgressState };
+      if (!this.progressThrottleTimer) {
+        const delay = Math.max(0, PROGRESS_THROTTLE_MS - (now - Number(this.lastProgressRenderAt || 0)));
+        this.progressThrottleTimer = window.setTimeout(() => {
+          this.progressThrottleTimer = null;
+          const pending = this.pendingProgress;
+          this.pendingProgress = null;
+          if (pending) {
+            this.renderSyncProgress(pending.text, pending.statusText, pending.state);
+          }
+        }, delay);
+      }
+      return;
+    }
+    this.pendingProgress = null;
+    this.renderSyncProgress(text, statusText, this.currentProgressState);
+  }
+
+  renderSyncProgress(text, statusText, state) {
+    this.lastProgressRenderAt = Date.now();
     this.setSyncStatus(statusText, text.replace(/\n/g, " | "));
     if (!this.syncUiQuiet) {
-      this.showProgressModal(text, this.currentProgressState);
+      this.showProgressModal(text, state);
     }
   }
 
@@ -3845,6 +4732,11 @@ module.exports = class DriveBridgePlugin extends Plugin {
   }
 
   clearSyncStatus() {
+    if (this.progressThrottleTimer) {
+      window.clearTimeout(this.progressThrottleTimer);
+      this.progressThrottleTimer = null;
+    }
+    this.pendingProgress = null;
     if (this.reviewCount > 0) {
       this.setSyncStatus(`DriveBridge: ${this.reviewCount} review`, `${this.reviewCount} DriveBridge conflict(s) need review.`);
     } else {
@@ -3882,6 +4774,54 @@ module.exports = class DriveBridgePlugin extends Plugin {
 
   maxFileSizeBytes() {
     return Math.max(1, Number(this.settings.maxFileSizeMb) || DEFAULT_SETTINGS.maxFileSizeMb) * 1024 * 1024;
+  }
+
+  isMobileRuntime() {
+    return Boolean(
+      Platform.isMobile ||
+      Platform.isIosApp ||
+      Platform.isAndroidApp ||
+      (typeof navigator !== "undefined" && /iPhone|iPad|iPod|Android/i.test(navigator.userAgent || ""))
+    );
+  }
+
+  transferChunkBytes() {
+    return TRANSFER_CHUNK_BYTES;
+  }
+
+  isAppBackgrounded() {
+    return Boolean(typeof document !== "undefined" && document.visibilityState === "hidden");
+  }
+
+  async waitForForegroundBeforeLargeTransfer(path) {
+    if (!this.isMobileRuntime() || this.settings.mobileLightweightMode === false) {
+      return;
+    }
+    let checkpointed = false;
+    while (this.isAppBackgrounded()) {
+      this.syncPausedForBackground = true;
+      if (!checkpointed) {
+        await this.safeFlushOperationJournal(true);
+        await this.flushDirtyQueue();
+        checkpointed = true;
+      }
+      this.updateTransferProgress("Paused", path, 0, 0, "Waiting for Obsidian to return to the foreground.");
+      await sleep(500);
+      this.assertCurrentRuntime();
+    }
+    this.syncPausedForBackground = false;
+  }
+
+  updateTransferProgress(phase, path, current, total, message = "") {
+    this.updateSyncProgress({
+      phase,
+      current,
+      total,
+      unit: "bytes",
+      action: phase.toLowerCase(),
+      path,
+      message
+    });
   }
 
   remoteDeleteTombstone(remoteItem) {
@@ -3963,7 +4903,10 @@ module.exports = class DriveBridgePlugin extends Plugin {
   }
 
   formatExecutionSummary(executed, elapsedMs) {
-    const incomplete = executed.errors.length || executed.skippedChanged.length || executed.skippedSafe.length || executed.reviewItems.length;
+    const errorCount = Number(executed.errorCount === undefined ? executed.errors.length : executed.errorCount);
+    const skippedChangedCount = Number(executed.skippedChangedCount === undefined ? executed.skippedChanged.length : executed.skippedChangedCount);
+    const skippedSafeCount = Number(executed.skippedSafeCount === undefined ? executed.skippedSafe.length : executed.skippedSafeCount);
+    const incomplete = errorCount || skippedChangedCount || skippedSafeCount || executed.reviewItems.length;
     const lines = [
       `${incomplete ? "Completed with pending items" : "Completed"} in ${(elapsedMs / 1000).toFixed(1)}s`,
       `DriveBridge version: ${this.manifest.version}`,
@@ -3978,7 +4921,9 @@ module.exports = class DriveBridgePlugin extends Plugin {
       `Deleted local: ${executed.stats.deleteLocal}`,
       `Deleted remote: ${executed.stats.deleteRemote}`,
       `Skipped: ${executed.stats.skip}`,
-      `Errors: ${executed.errors.length}`
+      `Errors: ${errorCount}`,
+      `Changed-during-sync skips: ${skippedChangedCount}`,
+      `Safety skips: ${skippedSafeCount}`
     ];
     if (executed.performance) {
       lines.push(
@@ -3990,17 +4935,22 @@ module.exports = class DriveBridgePlugin extends Plugin {
         `Duplicate creates self-healed: ${executed.performance.duplicateGuardSelfHealed || 0}`,
         `Remote snapshot writes: ${executed.performance.remoteSnapshotWrites}`,
         `Remote snapshot writes skipped: ${executed.performance.remoteSnapshotWriteSkipped}`,
-        `Remote snapshot conflict merges: ${executed.performance.remoteSnapshotConflictMerges}`
+        `Remote snapshot conflict merges: ${executed.performance.remoteSnapshotConflictMerges}`,
+        `Remote metadata batch requests: ${executed.performance.remoteMetadataBatchRequests || 0}`,
+        `Drive Changes pages: ${executed.performance.driveChangesPages || 0}`,
+        `Local full scans: ${executed.performance.localFullScans || 0}`,
+        `Local dirty scans: ${executed.performance.localDirtyScans || 0}`,
+        `Local hash cache hits: ${executed.performance.localHashCacheHits || 0}`
       );
     }
     if (executed.skippedChanged && executed.skippedChanged.length) {
       lines.push("", "Skipped because files changed before/during sync:", ...this.formatSkipLines(executed.skippedChanged, 20));
-      lines.push("", `Full latest run details are saved in ${JOURNAL_FILE}.`);
+      lines.push("", `Full latest run details are saved in ${SYNC_DETAIL_FILE}.`);
     }
     if (executed.skippedSafe && executed.skippedSafe.length) {
       lines.push("", "Skipped for manual review:", ...this.formatSkipLines(executed.skippedSafe, 20));
       lines.push("", "These files were not auto-resolved because doing so could create heavy or unsafe conflict work.");
-      lines.push("", `Full latest run details are saved in ${JOURNAL_FILE}.`);
+      lines.push("", `Full latest run details are saved in ${SYNC_DETAIL_FILE}.`);
     }
     if (executed.reviewItems && executed.reviewItems.length) {
       lines.push("", "Queued for BAS-style conflict review:", ...executed.reviewItems.slice(0, 20).map((item) => `- ${item.path} (${item.reason})`));
@@ -4010,7 +4960,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     }
     if (executed.errors.length) {
       lines.push("", "Error details:", ...this.formatErrorLines(executed.errors, 20));
-      lines.push("", `Full latest run details are saved in ${JOURNAL_FILE}.`);
+      lines.push("", `Full latest run details are saved in ${SYNC_DETAIL_FILE}.`);
     }
     return lines.join("\n");
   }
@@ -4599,6 +5549,29 @@ class DriveBridgeSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
+      .setName("Mobile lightweight mode")
+      .setDesc("Prioritize Markdown, use resumable/range transfers, batch work, throttle UI updates, and pause new large transfers while Obsidian is in the background.")
+      .addToggle((toggle) => toggle
+        .setValue(this.plugin.settings.mobileLightweightMode !== false)
+        .onChange(async (value) => {
+          this.plugin.settings.mobileLightweightMode = value;
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName("Google Drive incremental changes")
+      .setDesc("Use the Drive Changes API after a one-time bootstrap scan so normal sync reads only changed remote metadata.")
+      .addToggle((toggle) => toggle
+        .setValue(this.plugin.settings.driveChangesEnabled !== false)
+        .onChange(async (value) => {
+          this.plugin.settings.driveChangesEnabled = value;
+          if (!value) {
+            this.plugin.settings.driveChangesPageToken = "";
+          }
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
       .setName("Excluded folders")
       .setDesc("One vault-relative folder per line. Files below these folders stay local-only and are not uploaded, downloaded, or deleted remotely.")
       .addTextArea((text) => {
@@ -4793,7 +5766,9 @@ async function customFetch(url, options = {}) {
   };
   if (body !== undefined) {
     if (ArrayBuffer.isView(body)) {
-      requestParam.body = body.buffer;
+      requestParam.body = body.byteOffset === 0 && body.byteLength === body.buffer.byteLength
+        ? body.buffer
+        : body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength);
     } else {
       requestParam.body = body;
     }
@@ -4845,6 +5820,42 @@ function newEmptyStats() {
     skip: 0,
     error: 0
   };
+}
+
+function parseDriveBatchMetadataResponse(text, contentType, expectedCount) {
+  const boundaryMatch = String(contentType || "").match(/boundary="?([^";]+)"?/i);
+  const boundary = boundaryMatch && boundaryMatch[1];
+  if (!boundary) {
+    throw new Error("Google Drive batch response did not include a multipart boundary.");
+  }
+  const results = Array.from({ length: expectedCount }, () => null);
+  const parts = String(text || "").split(`--${boundary}`);
+  let fallbackIndex = 0;
+  for (const part of parts) {
+    if (!/HTTP\/1\.[01]\s+\d{3}/i.test(part)) {
+      continue;
+    }
+    const contentIdMatch = part.match(/Content-ID:\s*<?response-drivebridge-(\d+)>?/i) ||
+      part.match(/Content-ID:\s*<?drivebridge-(\d+)>?/i);
+    const index = contentIdMatch ? Number(contentIdMatch[1]) : fallbackIndex++;
+    const statusMatch = part.match(/HTTP\/1\.[01]\s+(\d{3})/i);
+    const status = statusMatch ? Number(statusMatch[1]) : 0;
+    if (status === 404) {
+      results[index] = null;
+      continue;
+    }
+    if (status < 200 || status >= 300) {
+      const error = new Error(`Google Drive batch metadata request failed with HTTP ${status || "unknown"}.`);
+      error.status = status;
+      throw error;
+    }
+    const bodyMatch = part.match(/\r?\n\r?\n(\{[\s\S]*\})\s*$/);
+    if (!bodyMatch) {
+      throw new Error("Google Drive batch metadata response contained an invalid JSON part.");
+    }
+    results[index] = JSON.parse(bodyMatch[1]);
+  }
+  return results;
 }
 
 function statsFromEntries(entries) {
@@ -4949,6 +5960,28 @@ function validateSnapshot(snapshot) {
     }
     if (value.remote !== null && value.remote !== undefined && typeof value.remote !== "object") {
       throw new Error(`${SNAPSHOT_FILE} contains invalid remote metadata for ${path}.`);
+    }
+  }
+}
+
+function validateRemoteStateCache(value) {
+  if (!value || value.version !== 1 ||
+      typeof value.rootFolderId !== "string" || !value.rootFolderId ||
+      typeof value.snapshotFileId !== "string" || !value.snapshotFileId ||
+      typeof value.snapshotModifiedTime !== "string" || !value.snapshotModifiedTime ||
+      !value.files || typeof value.files !== "object" || Array.isArray(value.files) ||
+      !value.deleted || typeof value.deleted !== "object" || Array.isArray(value.deleted)) {
+    throw new Error(`${REMOTE_STATE_CACHE_FILE} has an unsupported format.`);
+  }
+  for (const [path, remote] of Object.entries(value.files)) {
+    if (!path || !remote || typeof remote !== "object" || Array.isArray(remote) ||
+        typeof remote.id !== "string" || !remote.id) {
+      throw new Error(`${REMOTE_STATE_CACHE_FILE} contains invalid remote metadata for ${path || "(empty path)"}.`);
+    }
+  }
+  for (const [path, deleted] of Object.entries(value.deleted)) {
+    if (!path || !deleted || typeof deleted !== "object" || Array.isArray(deleted)) {
+      throw new Error(`${REMOTE_STATE_CACHE_FILE} contains an invalid tombstone for ${path || "(empty path)"}.`);
     }
   }
 }
@@ -5424,4 +6457,9 @@ function latestJournalActivityAt(journal) {
 
 function sleep(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function resumableNextOffset(rangeHeader, fallback) {
+  const match = String(rangeHeader || "").match(/bytes=0-(\d+)/i);
+  return match ? Number(match[1]) + 1 : fallback;
 }
