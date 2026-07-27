@@ -42,6 +42,7 @@
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-size: var(--font-ui-small);
+  white-space: pre-wrap;
 }
 
 .drivebridge-progress-message {

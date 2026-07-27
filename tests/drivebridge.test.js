@@ -20,7 +20,7 @@ class FakeElement {
   createDiv() { return this.createEl(); }
   addEventListener() {}
   setAttribute(name, value) { this[name] = value; }
-  setText() {}
+  setText(value) { this.text = value; }
   querySelectorAll() { return []; }
 }
 
@@ -83,7 +83,8 @@ function loadPlugin() {
     }
   };
   const code = fs.readFileSync(path.join(__dirname, "..", "main.js"), "utf8") +
-    "\nmodule.exports.__ReviewModal = DriveBridgeConflictReviewModal;";
+    "\nmodule.exports.__ReviewModal = DriveBridgeConflictReviewModal;" +
+    "\nmodule.exports.__ProgressModal = DriveBridgeProgressModal;";
   vm.runInNewContext(code, sandbox, { filename: "main.js" });
   return { PluginClass: sandbox.module.exports, requests, responses };
 }
@@ -492,6 +493,18 @@ async function run() {
       (error) => error.code === "DRIVEBRIDGE_NETWORK_ERROR"
     );
     assert.strictEqual(requests.length, 1, "ambiguous POST must be reconciled by its caller, not blindly retried");
+  }
+
+  {
+    const { PluginClass, requests, responses } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    plugin.ensureAccessToken = async () => {};
+    responses.push(new Error("net::ERR_INVALID_ARGUMENT"));
+    await assert.rejects(
+      () => plugin.driveFetch("https://example.test/upload", { method: "PUT" }),
+      (error) => error.code === "DRIVEBRIDGE_NETWORK_ERROR" && error.retryable === false
+    );
+    assert.strictEqual(requests.length, 1, "deterministic Electron request errors must not be retried");
   }
 
   {
@@ -1369,7 +1382,98 @@ async function run() {
       [2, 2, 1],
       "resumable upload must send bounded chunks instead of a second whole-file multipart body"
     );
+    assert.ok(
+      requests.slice(1).every((item) => !Object.keys(item.options.headers).some((name) => name.toLowerCase() === "content-length")),
+      "resumable chunk PUTs must let Electron derive Content-Length from the request body"
+    );
     assert.strictEqual(progress.at(-1).uploadedBytes, 5);
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    let requestOptions;
+    plugin.driveFetch = async (_url, options) => {
+      requestOptions = options;
+      return {
+        ok: false,
+        status: 308,
+        headers: { get: () => "bytes=0-1" }
+      };
+    };
+    const status = await plugin.queryResumableUpload("https://upload-session", 5);
+    assert.strictEqual(status.offset, 2);
+    assert.ok(
+      !Object.keys(requestOptions.headers).some((name) => name.toLowerCase() === "content-length"),
+      "resumable status PUTs must not set Electron's restricted Content-Length header"
+    );
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass, { mobileLightweightMode: true });
+    plugin.isMobileRuntime = () => true;
+    assert.strictEqual(plugin.transferChunkBytes(), 2 * 1024 * 1024, "mobile transfers should use 2 MiB chunks");
+    plugin.isMobileRuntime = () => false;
+    assert.strictEqual(plugin.transferChunkBytes(), 1024 * 1024, "desktop transfer chunk behavior must stay unchanged");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    const rendered = [];
+    plugin.updateSyncProgress = (progress) => rendered.push(progress);
+    plugin.activeTransferProgress = {
+      completedBytes: 200,
+      entryBytes: 100,
+      totalBytes: 1000,
+      transferredBytes: 0
+    };
+    plugin.updateTransferProgress("Upload", "large.pdf", 25, 100);
+    plugin.updateTransferProgress("Upload", "large.pdf", 10, 100);
+    plugin.updateTransferProgress("Upload", "large.pdf", 100, 100);
+    assert.deepStrictEqual(
+      JSON.parse(JSON.stringify(rendered.map((item) => item.current))),
+      [225, 225, 300],
+      "chunk progress must be monotonic and composed into the whole-sync progress bar"
+    );
+    assert.ok(rendered.every((item) => item.total === 1000));
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    plugin.overallProgressContext = {
+      startedAt: Date.now() - 10000,
+      completedItems: 4,
+      totalItems: 20,
+      totalBytes: 100
+    };
+    const progress = plugin.enrichOverallProgress({
+      phase: "Attachments",
+      current: 25,
+      total: 100,
+      unit: "bytes",
+      action: "upload",
+      path: "large.pdf"
+    });
+    assert.strictEqual(progress.completedItems, 4);
+    assert.strictEqual(progress.totalItems, 20);
+    assert.match(progress.elapsedText, /^10s$/);
+    assert.match(progress.etaText, /^about 30s$/);
+    assert.match(progress.finishText, /^\d{2}:\d{2}$/);
+    const display = plugin.formatProgressText(progress);
+    assert.match(display, /Overall: 25 B \/ 100 B \(25%\)/);
+    assert.match(display, /Files: 4 \/ 20/);
+    assert.match(display, /ETA: about 30s/);
+    assert.match(display, /Finish around: \d{2}:\d{2}/);
+    assert.match(display, /Phase: Attachments/);
+    assert.match(display, /upload: large\.pdf/);
+
+    const finalizing = plugin.enrichOverallProgress({ current: 100, total: 100, unit: "bytes" });
+    assert.strictEqual(finalizing.etaText, "Finalizing...");
+    const complete = plugin.enrichOverallProgress({ current: 100, total: 100, unit: "bytes", complete: true });
+    assert.strictEqual(complete.etaText, "Done");
   }
 
   {
@@ -2128,6 +2232,21 @@ async function run() {
     );
     assert.strictEqual(response.ok, true);
     assert.strictEqual(rechecks, 1, "a retried final upload request must repeat its remote precondition check");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const modal = new PluginClass.__ProgressModal({});
+    assert.strictEqual(
+      modal.titleForMessage("DriveBridge sync error 1. Continuing...\nError: temporary"),
+      "Normal sync is running with errors"
+    );
+    assert.strictEqual(
+      modal.titleForMessage("DriveBridge sync completed with errors.\nError: temporary"),
+      "Normal sync completed with errors"
+    );
+    assert.strictEqual(modal.titleForMessage("DriveBridge Sync: 10 / 10\nSync complete."), "Normal sync complete");
+    assert.strictEqual(modal.titleForMessage("DriveBridge failed.\nError: fatal"), "Normal sync stopped");
   }
 
   {

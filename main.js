@@ -105,6 +105,7 @@ const BULK_TIMESTAMP_MIN_FILES = 30;
 const ATOMIC_VERIFY_RETRY_DELAYS_MS = [0, 50, 200, 750, 2000];
 const RESUMABLE_UPLOAD_THRESHOLD_BYTES = 5 * 1024 * 1024;
 const TRANSFER_CHUNK_BYTES = 1024 * 1024;
+const MOBILE_TRANSFER_CHUNK_BYTES = 2 * 1024 * 1024;
 const MOBILE_BATCH_FILE_LIMIT = 25;
 const DESKTOP_BATCH_FILE_LIMIT = 100;
 const MOBILE_BATCH_BYTE_LIMIT = 10 * 1024 * 1024;
@@ -609,7 +610,8 @@ module.exports = class DriveBridgePlugin extends Plugin {
         this.showProgressModal(this.formatErrorModalMessage("DriveBridge sync completed with errors.", executed.errors), {
           current: executed.processedBytes,
           total: executed.totalBytes,
-          unit: "bytes"
+          unit: "bytes",
+          complete: true
         });
       } else {
         if (!quiet) {
@@ -621,7 +623,8 @@ module.exports = class DriveBridgePlugin extends Plugin {
           current: executed.processedBytes,
           total: executed.totalBytes,
           unit: "bytes",
-          message: "Sync complete."
+          message: "Sync complete.",
+          complete: true
         });
         if (!quiet) {
           this.scheduleProgressModalClose(1800);
@@ -661,6 +664,8 @@ module.exports = class DriveBridgePlugin extends Plugin {
         this.remoteInfoCache = new Map();
         this.localHashCache = new Map();
         this.activeSyncContext = null;
+        this.activeTransferProgress = null;
+        this.overallProgressContext = null;
         this.syncing = false;
         this.activeOperation = "";
         this.syncUiQuiet = false;
@@ -1320,8 +1325,16 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const totalBytes = orderedEntries.reduce((sum, entry) => {
       return sum + this.progressBytesForEntry(entry, context);
     }, 0);
+    this.overallProgressContext = {
+      startedAt: Date.now(),
+      completedItems: 0,
+      totalItems: orderedEntries.length,
+      totalBytes
+    };
     for (let entryIndex = 0; entryIndex < orderedEntries.length; entryIndex++) {
       const entry = orderedEntries[entryIndex];
+      const entryBytes = this.progressBytesForEntry(entry, context);
+      this.overallProgressContext.completedItems = entryIndex;
       const entryStage = this.syncStageForEntry(entry);
       if (currentStage >= 0 && entryStage !== currentStage) {
         await this.flushOperationJournal(true);
@@ -1344,6 +1357,16 @@ module.exports = class DriveBridgePlugin extends Plugin {
           nextSnapshot[entry.path] = this.snapshotFrom(localItem, remoteItem);
           stats.adopt++;
           await this.updateOperation(runId, entry, "skipped", context, new Error("Previous operation result was reverified and adopted."));
+          processedBytes += entryBytes;
+          this.overallProgressContext.completedItems = entryIndex + 1;
+          this.updateSyncProgress({
+            phase: this.syncStageName(currentStage),
+            current: processedBytes,
+            total: totalBytes,
+            unit: "bytes",
+            action: "adopt",
+            path: entry.path
+          });
           continue;
         }
       }
@@ -1356,7 +1379,12 @@ module.exports = class DriveBridgePlugin extends Plugin {
         action: entry.action,
         path: entry.path
       });
-      const entryBytes = this.progressBytesForEntry(entry, context);
+      this.activeTransferProgress = {
+        completedBytes: processedBytes,
+        entryBytes,
+        totalBytes,
+        transferredBytes: 0
+      };
       try {
         await this.updateOperation(runId, entry, "in_progress", context);
         const executionResult = await this.executeEntry(
@@ -1414,7 +1442,9 @@ module.exports = class DriveBridgePlugin extends Plugin {
         });
         console.error("[drivebridge-obsidian-sync]", entry, err);
       } finally {
+        this.activeTransferProgress = null;
         processedBytes += entryBytes;
+        this.overallProgressContext.completedItems = entryIndex + 1;
         batchFiles++;
         batchBytes += entryBytes;
         this.updateSyncProgress({
@@ -1850,7 +1880,8 @@ module.exports = class DriveBridgePlugin extends Plugin {
       }
       res = await customFetch(url, Object.assign({}, options, { headers }));
     } catch (cause) {
-      if (retrySafe && attempt < MAX_RETRY_ATTEMPTS) {
+      const retryableNetworkError = !this.isNonRetryableNetworkError(cause);
+      if (retrySafe && retryableNetworkError && attempt < MAX_RETRY_ATTEMPTS) {
         if (typeof options.beforeRetry === "function") {
           await options.beforeRetry();
         }
@@ -1861,6 +1892,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       error.code = "DRIVEBRIDGE_NETWORK_ERROR";
       error.method = method;
       error.cause = cause;
+      error.retryable = retryableNetworkError;
       throw error;
     }
     if (res.status === 401 && this.settings.refreshToken && attempt === 1) {
@@ -1884,6 +1916,11 @@ module.exports = class DriveBridgePlugin extends Plugin {
   retryDelayMs(attempt) {
     const base = 500 * Math.pow(2, Math.max(0, attempt - 1));
     return Math.round(base * (0.8 + Math.random() * 0.4));
+  }
+
+  isNonRetryableNetworkError(error) {
+    const message = String(error && error.message ? error.message : error || "");
+    return /\bERR_(?:INVALID_ARGUMENT|INVALID_URL|UNSAFE_PORT)\b/i.test(message);
   }
 
   async ensureRootFolder() {
@@ -2516,7 +2553,10 @@ module.exports = class DriveBridgePlugin extends Plugin {
         size: Number(localItem.size || 0),
         md5Checksum: expectedMd5
       });
-      if (!uploaded && (err.code === "DRIVEBRIDGE_NETWORK_ERROR" || RETRYABLE_STATUS.has(err.status))) {
+      if (!uploaded && (
+        (err.code === "DRIVEBRIDGE_NETWORK_ERROR" && err.retryable !== false) ||
+        RETRYABLE_STATUS.has(err.status)
+      )) {
         try {
           uploaded = await request();
         } catch (retryError) {
@@ -2612,7 +2652,6 @@ module.exports = class DriveBridgePlugin extends Plugin {
         method: "PUT",
         headers: {
           "Content-Type": mimeType,
-          "Content-Length": String(chunk.byteLength),
           "Content-Range": `bytes ${offset}-${endExclusive - 1}/${total}`
         },
         body: chunk,
@@ -2644,7 +2683,6 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const res = await this.driveFetch(sessionUrl, {
       method: "PUT",
       headers: {
-        "Content-Length": "0",
         "Content-Range": `bytes */${total}`
       }
     });
@@ -2660,7 +2698,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
 
   isAmbiguousCreateError(err) {
     return Boolean(err && (
-      err.code === "DRIVEBRIDGE_NETWORK_ERROR" ||
+      (err.code === "DRIVEBRIDGE_NETWORK_ERROR" && err.retryable !== false) ||
       err.status === 409 ||
       RETRYABLE_STATUS.has(err.status)
     ));
@@ -4872,13 +4910,20 @@ module.exports = class DriveBridgePlugin extends Plugin {
   }
 
   updateSyncProgress(progress) {
+    progress = this.enrichOverallProgress(progress);
     const text = this.formatProgressText(progress);
     const statusText = this.formatStatusProgressText(progress);
     this.currentSyncProgress = text;
     this.currentProgressState = {
       current: progress.current || 0,
       total: progress.total || 0,
-      unit: progress.unit || ""
+      unit: progress.unit || "",
+      completedItems: progress.completedItems,
+      totalItems: progress.totalItems,
+      elapsedText: progress.elapsedText || "",
+      etaText: progress.etaText || "",
+      finishText: progress.finishText || "",
+      complete: Boolean(progress.complete)
     };
     const now = Date.now();
     const terminal = progress.total > 0 && progress.current >= progress.total;
@@ -4901,6 +4946,44 @@ module.exports = class DriveBridgePlugin extends Plugin {
     this.renderSyncProgress(text, statusText, this.currentProgressState);
   }
 
+  enrichOverallProgress(progress) {
+    const enriched = Object.assign({}, progress || {});
+    const context = this.overallProgressContext;
+    if (!context) {
+      return enriched;
+    }
+    const now = Date.now();
+    const current = Math.max(0, Number(enriched.current || 0));
+    const total = Math.max(0, Number(enriched.total || context.totalBytes || 0));
+    const completedItems = Math.max(0, Number(context.completedItems || 0));
+    const totalItems = Math.max(0, Number(context.totalItems || 0));
+    const elapsedMs = Math.max(0, now - Number(context.startedAt || now));
+    enriched.completedItems = completedItems;
+    enriched.totalItems = totalItems;
+    enriched.elapsedText = formatDurationCompact(elapsedMs);
+    if (enriched.complete) {
+      enriched.etaText = "Done";
+      return enriched;
+    }
+    const basisCurrent = total > 0 ? Math.min(current, total) : completedItems;
+    const basisTotal = total > 0 ? total : totalItems;
+    if (basisTotal > 0 && basisCurrent >= basisTotal) {
+      enriched.etaText = "Finalizing...";
+      return enriched;
+    }
+    if (elapsedMs < 3000 || basisCurrent <= 0 || basisTotal <= basisCurrent) {
+      enriched.etaText = "Estimating...";
+      return enriched;
+    }
+    const etaMs = Math.min(
+      7 * 24 * 60 * 60 * 1000,
+      Math.max(0, elapsedMs * (basisTotal - basisCurrent) / basisCurrent)
+    );
+    enriched.etaText = `about ${formatDurationCompact(etaMs)}`;
+    enriched.finishText = formatClockTime(new Date(now + etaMs));
+    return enriched;
+  }
+
   renderSyncProgress(text, statusText, state) {
     this.lastProgressRenderAt = Date.now();
     this.setSyncStatus(statusText, text.replace(/\n/g, " | "));
@@ -4917,8 +5000,17 @@ module.exports = class DriveBridgePlugin extends Plugin {
         ? `${formatBytes(progress.current)} / ${formatBytes(progress.total)}`
         : `${progress.current}/${progress.total}`;
       parts.push(`DriveBridge ${fraction} (${percent}%)`);
+      if (progress.etaText) {
+        parts.push(`ETA ${progress.etaText}`);
+      }
     } else {
       parts.push(`DriveBridge ${progress.phase}`);
+    }
+    if (progress.totalItems > 0) {
+      parts.push(`${progress.completedItems || 0}/${progress.totalItems} files`);
+    }
+    if (progress.etaText && !(progress.total > 0)) {
+      parts.push(`ETA ${progress.etaText}`);
     }
     if (progress.action && progress.path) {
       const fileName = basename(progress.path);
@@ -4937,8 +5029,25 @@ module.exports = class DriveBridgePlugin extends Plugin {
         ? `${formatBytes(progress.current)} / ${formatBytes(progress.total)}`
         : `${progress.current}/${progress.total}`;
       const lines = [
-        `DriveBridge ${progress.phase}: ${fraction} (${percent}%)`
+        `Overall: ${fraction} (${percent}%)`
       ];
+      const timing = [];
+      if (progress.totalItems > 0) {
+        timing.push(`Files: ${progress.completedItems || 0} / ${progress.totalItems}`);
+      }
+      if (progress.elapsedText) {
+        timing.push(`Elapsed: ${progress.elapsedText}`);
+      }
+      if (progress.etaText) {
+        timing.push(`ETA: ${progress.etaText}`);
+      }
+      if (progress.finishText) {
+        timing.push(`Finish around: ${progress.finishText}`);
+      }
+      if (timing.length) {
+        lines.push(timing.join(" | "));
+      }
+      lines.push(`Phase: ${progress.phase}`);
       if (progress.action && progress.path) {
         lines.push(`${progress.action}: ${progress.path}`);
       }
@@ -4947,10 +5056,20 @@ module.exports = class DriveBridgePlugin extends Plugin {
       }
       return lines.join("\n");
     }
-    return [
+    const lines = [
       `DriveBridge ${progress.phase}`,
       progress.message || "Preparing..."
-    ].join("\n");
+    ];
+    if (progress.totalItems > 0) {
+      lines.push(`Files: ${progress.completedItems || 0} / ${progress.totalItems}`);
+    }
+    if (progress.elapsedText || progress.etaText) {
+      lines.push([
+        progress.elapsedText ? `Elapsed: ${progress.elapsedText}` : "",
+        progress.etaText ? `ETA: ${progress.etaText}` : ""
+      ].filter(Boolean).join(" | "));
+    }
+    return lines.join("\n");
   }
 
   lastProgressForModal() {
@@ -4992,7 +5111,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       };
       this.progressModal.open();
     }
-    this.progressModal.update(message, progress);
+    this.progressModal.update(message, progress ? this.enrichOverallProgress(progress) : progress);
   }
 
   scheduleProgressModalClose(delayMs) {
@@ -5022,7 +5141,9 @@ module.exports = class DriveBridgePlugin extends Plugin {
   }
 
   transferChunkBytes() {
-    return TRANSFER_CHUNK_BYTES;
+    return this.isMobileRuntime() && this.settings.mobileLightweightMode !== false
+      ? MOBILE_TRANSFER_CHUNK_BYTES
+      : TRANSFER_CHUNK_BYTES;
   }
 
   isAppBackgrounded() {
@@ -5049,6 +5170,25 @@ module.exports = class DriveBridgePlugin extends Plugin {
   }
 
   updateTransferProgress(phase, path, current, total, message = "") {
+    const transfer = this.activeTransferProgress;
+    if (transfer && transfer.totalBytes > 0) {
+      const fraction = total > 0 ? Math.max(0, Math.min(1, current / total)) : 0;
+      const entryProgress = Math.min(
+        transfer.entryBytes,
+        Math.max(transfer.transferredBytes || 0, Math.floor(transfer.entryBytes * fraction))
+      );
+      transfer.transferredBytes = entryProgress;
+      this.updateSyncProgress({
+        phase,
+        current: Math.min(transfer.totalBytes, transfer.completedBytes + entryProgress),
+        total: transfer.totalBytes,
+        unit: "bytes",
+        action: phase.toLowerCase(),
+        path,
+        message: message || `Current file: ${formatBytes(current)} / ${formatBytes(total)}`
+      });
+      return;
+    }
     this.updateSyncProgress({
       phase,
       current,
@@ -5170,7 +5310,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       `${incomplete ? "Completed with pending items" : "Completed"} in ${(elapsedMs / 1000).toFixed(1)}s`,
       `DriveBridge version: ${this.manifest.version}`,
       `Completed at: ${formatLogDateTime(new Date())}`,
-      `Data processed: ${formatBytes(executed.processedBytes || 0)} / ${formatBytes(executed.totalBytes || 0)}`,
+      `Work attempted: ${formatBytes(executed.processedBytes || 0)} / ${formatBytes(executed.totalBytes || 0)} (completion, not success)`,
       `Uploaded: ${executed.stats.upload}`,
       `Downloaded: ${executed.stats.download}`,
       `Moved remote: ${executed.stats.moveRemote}`,
@@ -5360,7 +5500,11 @@ class DriveBridgeProgressModal extends Modal {
     if (text.includes("REPAIR REMOTE INDEX — COMPLETE")) return "Repair complete";
     if (text.includes("REPAIR REMOTE INDEX — STOPPED")) return "Repair stopped";
     if (text.includes("REPAIR REMOTE INDEX") || text.includes("DriveBridge REPAIR")) return "Repair remote index";
-    if (text.includes("failed") || text.includes("Error:")) return "Normal sync stopped";
+    if (/sync completed with errors/i.test(text)) return "Normal sync completed with errors";
+    if (/Completed with pending items/i.test(text)) return "Normal sync completed with pending items";
+    if (/Sync complete\./i.test(text)) return "Normal sync complete";
+    if (/sync error \d+\. Continuing/i.test(text)) return "Normal sync is running with errors";
+    if (/DriveBridge failed\.|Failed after/i.test(text)) return "Normal sync stopped";
     return "Normal sync is running";
   }
 
@@ -5370,6 +5514,8 @@ class DriveBridgeProgressModal extends Modal {
     if (text.includes("COMPLETE")) return "Repair finished. You may continue with Normal Preview.";
     if (text.includes("STOPPED")) return "Resolve the displayed cause before retrying Repair.";
     if (text.includes("REPAIR REMOTE INDEX")) return "Keep Obsidian open. This is metadata Repair, not a normal backup.";
+    if (/sync completed with errors|Completed with pending items/i.test(text)) return "All planned work was attempted. Review the pending items before retrying.";
+    if (/Sync complete\./i.test(text)) return "Sync finished. You may continue editing notes.";
     return "Keep Obsidian open and avoid editing notes until this finishes.";
   }
 
@@ -5385,11 +5531,24 @@ class DriveBridgeProgressModal extends Modal {
       const fraction = unit === "bytes"
         ? `${formatBytes(current)} / ${formatBytes(total)}`
         : `${current}/${total}`;
+      const details = [];
+      if (this.progress.totalItems > 0) {
+        details.push(`Files ${this.progress.completedItems || 0}/${this.progress.totalItems}`);
+      }
+      if (this.progress.elapsedText) {
+        details.push(`Elapsed ${this.progress.elapsedText}`);
+      }
+      if (this.progress.etaText) {
+        details.push(`ETA ${this.progress.etaText}`);
+      }
+      if (this.progress.finishText) {
+        details.push(`Finish around ${this.progress.finishText}`);
+      }
       this.progressEl.style.display = "";
       this.progressTextEl.style.display = "";
       this.progressEl.max = total;
       this.progressEl.value = current;
-      this.progressTextEl.setText(`${fraction} (${percent}%)`);
+      this.progressTextEl.setText(`${fraction} (${percent}%)${details.length ? `\n${details.join(" | ")}` : ""}`);
     } else {
       this.progressEl.style.display = "none";
       this.progressTextEl.style.display = "none";
@@ -6074,6 +6233,25 @@ async function parseJsonResponse(res) {
     throw error;
   }
   return data;
+}
+
+function formatDurationCompact(milliseconds) {
+  const totalSeconds = Math.max(0, Math.round(Number(milliseconds || 0) / 1000));
+  if (totalSeconds < 60) {
+    return `${totalSeconds}s`;
+  }
+  const totalMinutes = Math.round(totalSeconds / 60);
+  if (totalMinutes < 60) {
+    return `${totalMinutes}m`;
+  }
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return minutes ? `${hours}h ${minutes}m` : `${hours}h`;
+}
+
+function formatClockTime(date) {
+  const value = date instanceof Date ? date : new Date(date);
+  return `${String(value.getHours()).padStart(2, "0")}:${String(value.getMinutes()).padStart(2, "0")}`;
 }
 
 function newEmptyStats() {
