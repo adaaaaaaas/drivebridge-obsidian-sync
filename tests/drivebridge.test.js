@@ -1479,6 +1479,56 @@ async function run() {
   {
     const { PluginClass } = loadPlugin();
     const plugin = pluginInstance(PluginClass);
+    const rendered = [];
+    plugin.overallProgressContext = {
+      startedAt: Date.now() - 10000,
+      completedItems: 0,
+      totalItems: 0,
+      totalBytes: 0
+    };
+    plugin.updateSyncProgress = (progress) => {
+      rendered.push({
+        progress: JSON.parse(JSON.stringify(progress)),
+        context: JSON.parse(JSON.stringify(plugin.overallProgressContext))
+      });
+    };
+    plugin.planPath = (path) => ({
+      path,
+      action: path === "conflict.md" ? "conflict" : "skip",
+      reason: path === "conflict.md" ? "changed on both sides" : "unchanged"
+    });
+    plugin.detectMoveEntries = async (entries) => entries;
+    plugin.bypassBulkTimestampUpdate = async (entries) => entries;
+    const plan = await plugin.buildSyncPlan({
+      local: { "conflict.md": {}, "note.md": {} },
+      remote: { "conflict.md": {}, "note.md": {} },
+      snapshot: {},
+      remoteDeleted: {}
+    });
+    assert.strictEqual(plan.entries.length, 2);
+    assert.strictEqual(rendered.length, 3);
+    assert.deepStrictEqual(
+      JSON.parse(JSON.stringify(rendered.map((item) => item.progress.current))),
+      [0, 1, 2],
+      "Preview planning must advance monotonically against the complete path count"
+    );
+    assert.ok(rendered.every((item) => item.progress.total === 2 && item.progress.unit === "items"));
+    assert.ok(rendered.every((item) => item.context.totalItems === 2));
+    assert.strictEqual(rendered.at(-1).context.completedItems, 2);
+    assert.strictEqual(
+      rendered[0].context.startedAt,
+      rendered.at(-1).context.startedAt,
+      "Preview planning must preserve elapsed time from the beginning of Preview"
+    );
+    assert.ok(
+      rendered[0].context.etaStartedAt >= rendered[0].context.startedAt,
+      "Preview ETA must use the comparison phase rate instead of treating earlier scanning as per-path work"
+    );
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
     plugin.transferChunkBytes = () => 2;
     plugin.waitForForegroundBeforeLargeTransfer = async () => {};
     plugin.updateTransferProgress = () => {};

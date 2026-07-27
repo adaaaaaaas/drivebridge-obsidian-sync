@@ -442,6 +442,12 @@ module.exports = class DriveBridgePlugin extends Plugin {
       localHashCacheHits: 0
     };
     const started = Date.now();
+    this.overallProgressContext = {
+      startedAt: started,
+      completedItems: 0,
+      totalItems: 0,
+      totalBytes: 0
+    };
     try {
       await this.resetSyncDetailLog();
       const recovery = await this.checkInterruptedSync();
@@ -498,7 +504,9 @@ module.exports = class DriveBridgePlugin extends Plugin {
           phase: "Preview",
           current: plan.entries.length,
           total: plan.entries.length,
-          message: "Preview complete."
+          unit: "items",
+          message: "Preview complete.",
+          complete: true
         });
         if (!quiet) {
           this.scheduleProgressModalClose(1800);
@@ -919,7 +927,24 @@ module.exports = class DriveBridgePlugin extends Plugin {
     ])).sort();
     const entries = [];
     const stats = newEmptyStats();
-    for (const path of allPaths) {
+    const progressStartedAt = this.overallProgressContext && this.overallProgressContext.startedAt || Date.now();
+    this.overallProgressContext = {
+      startedAt: progressStartedAt,
+      etaStartedAt: Date.now(),
+      completedItems: 0,
+      totalItems: allPaths.length,
+      totalBytes: 0
+    };
+    this.updateSyncProgress({
+      phase: "Preview plan",
+      current: 0,
+      total: allPaths.length,
+      unit: "items",
+      message: "Comparing Local and Google Drive state..."
+    });
+    for (let pathIndex = 0; pathIndex < allPaths.length; pathIndex++) {
+      const path = allPaths[pathIndex];
+      this.overallProgressContext.completedItems = pathIndex;
       let entry = this.planPath(path, context);
       if (entry.reason === "same-size files on both sides require content verification") {
         const localItem = context.local[path];
@@ -934,6 +959,15 @@ module.exports = class DriveBridgePlugin extends Plugin {
       }
       entries.push(entry);
       stats[entry.action] = (stats[entry.action] || 0) + 1;
+      this.overallProgressContext.completedItems = pathIndex + 1;
+      this.updateSyncProgress({
+        phase: "Preview plan",
+        current: pathIndex + 1,
+        total: allPaths.length,
+        unit: "items",
+        action: entry.action,
+        path
+      });
     }
     const moveAwareEntries = await this.detectMoveEntries(entries, context);
     const timestampAwareEntries = await this.bypassBulkTimestampUpdate(moveAwareEntries, context);
@@ -4958,6 +4992,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const completedItems = Math.max(0, Number(context.completedItems || 0));
     const totalItems = Math.max(0, Number(context.totalItems || 0));
     const elapsedMs = Math.max(0, now - Number(context.startedAt || now));
+    const etaElapsedMs = Math.max(0, now - Number(context.etaStartedAt || context.startedAt || now));
     enriched.completedItems = completedItems;
     enriched.totalItems = totalItems;
     enriched.elapsedText = formatDurationCompact(elapsedMs);
@@ -4971,13 +5006,13 @@ module.exports = class DriveBridgePlugin extends Plugin {
       enriched.etaText = "Finalizing...";
       return enriched;
     }
-    if (elapsedMs < 3000 || basisCurrent <= 0 || basisTotal <= basisCurrent) {
+    if (etaElapsedMs < 3000 || basisCurrent <= 0 || basisTotal <= basisCurrent) {
       enriched.etaText = "Estimating...";
       return enriched;
     }
     const etaMs = Math.min(
       7 * 24 * 60 * 60 * 1000,
-      Math.max(0, elapsedMs * (basisTotal - basisCurrent) / basisCurrent)
+      Math.max(0, etaElapsedMs * (basisTotal - basisCurrent) / basisCurrent)
     );
     enriched.etaText = `about ${formatDurationCompact(etaMs)}`;
     enriched.finishText = formatClockTime(new Date(now + etaMs));
