@@ -33,6 +33,7 @@ class FakeModal {
 class FakeSetting {}
 class FakeSettingTab {}
 class FakeTFile {}
+class FakeTFolder {}
 
 function loadPlugin() {
   const requests = [];
@@ -110,6 +111,95 @@ function pluginInstance(PluginClass, settings = {}) {
 }
 
 async function run() {
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    const handlers = {};
+    plugin.app = {
+      vault: {
+        on: (name, callback) => {
+          handlers[name] = callback;
+          return { name };
+        }
+      }
+    };
+    plugin.registerEvent = () => {};
+    plugin.localDirtyPaths = new Map();
+    plugin.localDirtyGeneration = 0;
+    plugin.localDirtyTrusted = true;
+    plugin.isExcluded = () => false;
+    plugin.scheduleDirtyQueueFlush = () => {};
+    plugin.registerLocalDirtyEvents();
+
+    const file = new FakeTFile();
+    file.path = "notes/file.md";
+    handlers.create(file);
+    assert.ok(plugin.localDirtyPaths.has(file.path), "file events must enter the dirty queue");
+    handlers.rename(file, "notes/old-file.md");
+    assert.ok(plugin.localDirtyPaths.has("notes/old-file.md"), "file rename must retain the old path");
+    handlers.delete(file);
+    assert.ok(plugin.localDirtyPaths.has(file.path), "file delete must retain the deleted path");
+
+    const folder = new FakeTFolder();
+    folder.path = "notes/folder";
+    plugin.localDirtyTrusted = true;
+    handlers.create(folder);
+    assert.strictEqual(plugin.localDirtyTrusted, false, "folder create must force the next local scan to be full");
+    assert.strictEqual(plugin.localDirtyPaths.has(folder.path), false, "folders must never enter the file dirty queue");
+
+    plugin.localDirtyTrusted = true;
+    handlers.rename(folder, "notes/old-folder");
+    assert.strictEqual(plugin.localDirtyTrusted, false, "folder rename must force the next local scan to be full");
+    assert.strictEqual(plugin.localDirtyPaths.has("notes/old-folder"), false);
+
+    plugin.localDirtyTrusted = true;
+    handlers.delete(folder);
+    assert.strictEqual(plugin.localDirtyTrusted, false, "folder delete must force the next local scan to be full");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    const folder = new FakeTFolder();
+    folder.path = "notes/folder";
+    plugin.localDirtyTrusted = true;
+    plugin.localDirtyPaths = new Map([[folder.path, 2]]);
+    plugin.isExcluded = () => false;
+    plugin.app = {
+      vault: {
+        getAbstractFileByPath: () => folder
+      }
+    };
+    plugin.localPathExists = async () => {
+      throw new Error("folder paths must be rejected before existence checks");
+    };
+    const result = await plugin.scanLocalVault({});
+    assert.strictEqual(result[folder.path], undefined, "saved dirty folders must not become local file entries");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    const folder = new FakeTFolder();
+    folder.path = "notes/folder";
+    let readAttempted = false;
+    plugin.app = {
+      vault: {
+        getAbstractFileByPath: () => folder
+      }
+    };
+    plugin.localPathExists = async () => true;
+    plugin.readLocalBinary = async () => {
+      readAttempted = true;
+      return new ArrayBuffer(0);
+    };
+    await assert.rejects(
+      () => plugin.uploadLocalFile(folder.path, "root", null),
+      /Local path is not a file/
+    );
+    assert.strictEqual(readAttempted, false, "folder upload must stop before binary reads");
+  }
+
   {
     const { PluginClass } = loadPlugin();
     const plugin = pluginInstance(PluginClass);

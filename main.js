@@ -282,14 +282,22 @@ module.exports = class DriveBridgePlugin extends Plugin {
       return;
     }
     const markFile = (file) => {
-      if (file && file.path) this.markLocalDirty(file.path);
+      if (file instanceof TFile) {
+        this.markLocalDirty(file.path);
+      } else if (file && file.path) {
+        this.localDirtyTrusted = false;
+      }
     };
     this.registerEvent(this.app.vault.on("create", markFile));
     this.registerEvent(this.app.vault.on("modify", markFile));
     this.registerEvent(this.app.vault.on("delete", markFile));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
-      if (oldPath) this.markLocalDirty(oldPath);
-      markFile(file);
+      if (file instanceof TFile) {
+        if (oldPath) this.markLocalDirty(oldPath);
+        this.markLocalDirty(file.path);
+      } else if (file && file.path) {
+        this.localDirtyTrusted = false;
+      }
     }));
   }
 
@@ -2032,6 +2040,14 @@ module.exports = class DriveBridgePlugin extends Plugin {
           delete incremental[path];
           continue;
         }
+        const abstractFile = this.app && this.app.vault &&
+          typeof this.app.vault.getAbstractFileByPath === "function"
+          ? this.app.vault.getAbstractFileByPath(path)
+          : null;
+        if (abstractFile && !(abstractFile instanceof TFile)) {
+          delete incremental[path];
+          continue;
+        }
         if (await this.localPathExists(path)) {
           const previousLocal = snapshot[path] && snapshot[path].local;
           incremental[path] = await this.localInfoByPath(path, previousLocal);
@@ -2512,6 +2528,13 @@ module.exports = class DriveBridgePlugin extends Plugin {
   }
 
   async uploadLocalFile(path, rootFolderId, existingRemote, options = {}) {
+    const abstractFile = this.app && this.app.vault &&
+      typeof this.app.vault.getAbstractFileByPath === "function"
+      ? this.app.vault.getAbstractFileByPath(path)
+      : null;
+    if (abstractFile && !(abstractFile instanceof TFile)) {
+      throw new Error(`Local path is not a file: ${path}`);
+    }
     if (!(await this.localPathExists(path))) {
       throw new Error(`Local file not found: ${path}`);
     }
@@ -4473,6 +4496,9 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const file = this.app.vault.getAbstractFileByPath(path);
     if (file instanceof TFile) {
       return this.localInfo(file, previousLocal);
+    }
+    if (file) {
+      throw new Error(`Local path is not a file: ${path}`);
     }
     const stat = await this.app.vault.adapter.stat(path);
     if (!stat) {
