@@ -447,7 +447,11 @@ module.exports = class DriveBridgePlugin extends Plugin {
       driveChangesPages: 0,
       localFullScans: 0,
       localDirtyScans: 0,
-      localHashCacheHits: 0
+      localHashCacheHits: 0,
+      localSnapshotWrites: 0,
+      localSnapshotWriteSkipped: 0,
+      remoteStateCacheWrites: 0,
+      remoteStateCacheWriteSkipped: 0
     };
     const started = Date.now();
     this.overallProgressContext = {
@@ -574,13 +578,23 @@ module.exports = class DriveBridgePlugin extends Plugin {
         if (hasOperationWork) {
           await this.updateOperationJournalSnapshotCommit(runId, remoteSnapshotResult);
         }
-        await this.saveSnapshot(executed.nextSnapshot);
-        await this.saveRemoteStateCache(
-          context.rootFolderId,
-          remoteSnapshotResult,
-          context.remoteFolders || {},
-          Boolean(context.remoteFolderIndexComplete)
-        );
+        if (jsonValuesEqual(context.snapshot, executed.nextSnapshot)) {
+          this.syncMetrics.localSnapshotWriteSkipped++;
+        } else {
+          await this.saveSnapshot(executed.nextSnapshot);
+          this.syncMetrics.localSnapshotWrites++;
+        }
+        if (this.shouldSaveRemoteStateCache(context, remoteSnapshotResult)) {
+          await this.saveRemoteStateCache(
+            context.rootFolderId,
+            remoteSnapshotResult,
+            context.remoteFolders || {},
+            Boolean(context.remoteFolderIndexComplete)
+          );
+          this.syncMetrics.remoteStateCacheWrites++;
+        } else {
+          this.syncMetrics.remoteStateCacheWriteSkipped++;
+        }
         await this.reconcileReviewQueue(plan, executed.reviewItems);
         if (context.remoteChangesNextPageToken) {
           this.settings.driveChangesPageToken = context.remoteChangesNextPageToken;
@@ -1355,7 +1369,19 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const remoteDeleted = {};
     const reviewItems = [];
     const skipDonePaths = options.skipDonePaths || new Set();
-    let processed = 0;
+    const passiveEntries = plan.entries.filter((entry) => entry.action === "skip" || entry.action === "adopt");
+    for (const entry of passiveEntries) {
+      if (entry.action === "skip") {
+        if (entry.reason === "missing on both sides") {
+          delete nextSnapshot[entry.path];
+        }
+        stats.skip++;
+      } else {
+        nextSnapshot[entry.path] = this.snapshotFrom(context.local[entry.path], context.remote[entry.path]);
+        stats.adopt++;
+      }
+    }
+    let processed = passiveEntries.length;
     let processedBytes = 0;
     let errorCount = 0;
     let skippedChangedCount = 0;
@@ -1363,7 +1389,9 @@ module.exports = class DriveBridgePlugin extends Plugin {
     let batchFiles = 0;
     let batchBytes = 0;
     let currentStage = -1;
-    const orderedEntries = this.orderPlanEntries(plan.entries);
+    const orderedEntries = this.orderPlanEntries(plan.entries.filter((entry) => {
+      return entry.action !== "skip" && entry.action !== "adopt";
+    }));
     const totalBytes = orderedEntries.reduce((sum, entry) => {
       return sum + this.progressBytesForEntry(entry, context);
     }, 0);
@@ -1526,7 +1554,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       remoteMutations,
       reviewItems,
       processed,
-      total: orderedEntries.length,
+      total: plan.entries.length,
       processedBytes,
       totalBytes
     };
@@ -1724,6 +1752,11 @@ module.exports = class DriveBridgePlugin extends Plugin {
       }
       const uploadStartLocal = await this.localInfoByPath(path);
       const uploaded = await this.uploadLocalFile(path, context.rootFolderId, remoteToUpdate, {
+        adoptIfContentMatches: Boolean(
+          remoteToUpdate &&
+          remoteToUpdate.md5Checksum &&
+          Number(remoteToUpdate.size || 0) === Number(localItem && localItem.size || 0)
+        ),
         duplicateGuard: this.shouldUseDuplicateGuard(context, entry, remoteToUpdate),
         duplicateGuardRefresh: this.shouldRefreshDuplicateGuardPreflight(),
         duplicateGuardExactName: this.shouldUseExactNameDuplicateGuard(context, entry, remoteToUpdate),
@@ -1756,6 +1789,10 @@ module.exports = class DriveBridgePlugin extends Plugin {
         );
       }
       nextSnapshot[path] = this.snapshotFrom(localAfter, uploaded);
+      if (uploaded && uploaded.contentAlreadyMatched) {
+        stats.adopt = Number(stats.adopt || 0) + 1;
+        return;
+      }
       remoteMutations[path] = uploaded;
       stats.upload++;
       return;
@@ -2465,6 +2502,20 @@ module.exports = class DriveBridgePlugin extends Plugin {
     );
   }
 
+  shouldSaveRemoteStateCache(context, remoteSnapshotResult) {
+    if (this.settings.driveChangesEnabled === false) {
+      return false;
+    }
+    return Boolean(
+      context && (
+        context.remoteSnapshotFromFullScan ||
+        context.remoteSnapshotMissing ||
+        context.remoteChangesApplied
+      ) ||
+      remoteSnapshotResult && remoteSnapshotResult.written
+    );
+  }
+
   remoteSnapshotNewerThanLocalSync(context) {
     const remoteSnapshotAt = Number(context && context.remoteSnapshotAt || 0);
     const lastSyncAt = Number(this.settings.lastSyncAt || 0);
@@ -2544,6 +2595,12 @@ module.exports = class DriveBridgePlugin extends Plugin {
       options = Object.assign({}, options, {
         beforeRemoteCommit: async () => this.assertRemoteUnchangedSincePlan(path, existingRemote, { force: true })
       });
+    }
+    if (existingRemote && options.adoptIfContentMatches && existingRemote.md5Checksum &&
+        Number(existingRemote.size || 0) === Number(data.byteLength || 0) &&
+        md5Hex(data).toLowerCase() === String(existingRemote.md5Checksum).toLowerCase()) {
+      const verifiedRemote = await options.beforeRemoteCommit();
+      return Object.assign({}, verifiedRemote || existingRemote, { contentAlreadyMatched: true });
     }
     const parentId = await this.ensureRemoteParent(path, rootFolderId);
     const metadata = { name: basename(path) };
@@ -3750,7 +3807,14 @@ module.exports = class DriveBridgePlugin extends Plugin {
     for (const item of incomingById.values()) {
       nextById.set(item.id, item);
     }
-    await this.saveReviewQueue({ version: 1, items: Array.from(nextById.values()).sort((a, b) => a.path.localeCompare(b.path)) });
+    const next = { version: 1, items: Array.from(nextById.values()).sort((a, b) => a.path.localeCompare(b.path)) };
+    if (jsonValuesEqual(existing, next)) {
+      this.reviewCount = next.items.length;
+      this.clearSyncStatus();
+      return false;
+    }
+    await this.saveReviewQueue(next);
+    return true;
   }
 
   async openConflictReview() {
@@ -5400,7 +5464,11 @@ module.exports = class DriveBridgePlugin extends Plugin {
         `Drive Changes pages: ${executed.performance.driveChangesPages || 0}`,
         `Local full scans: ${executed.performance.localFullScans || 0}`,
         `Local dirty scans: ${executed.performance.localDirtyScans || 0}`,
-        `Local hash cache hits: ${executed.performance.localHashCacheHits || 0}`
+        `Local hash cache hits: ${executed.performance.localHashCacheHits || 0}`,
+        `Local snapshot writes: ${executed.performance.localSnapshotWrites || 0}`,
+        `Local snapshot writes skipped: ${executed.performance.localSnapshotWriteSkipped || 0}`,
+        `Remote state cache writes: ${executed.performance.remoteStateCacheWrites || 0}`,
+        `Remote state cache writes skipped: ${executed.performance.remoteStateCacheWriteSkipped || 0}`
       );
     }
     if (executed.skippedChanged && executed.skippedChanged.length) {
@@ -6417,6 +6485,10 @@ function sameLocal(previous, current) {
     return previous.sha256 === current.sha256;
   }
   return Math.abs(previous.mtime - current.mtime) < 2000;
+}
+
+function jsonValuesEqual(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function sameRemote(previous, current) {

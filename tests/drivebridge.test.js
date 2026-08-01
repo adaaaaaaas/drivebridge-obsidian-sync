@@ -2,7 +2,7 @@ const assert = require("assert");
 const fs = require("fs");
 const path = require("path");
 const vm = require("vm");
-const { webcrypto } = require("crypto");
+const { webcrypto, createHash } = require("crypto");
 
 class FakeElement {
   constructor() {
@@ -371,6 +371,32 @@ async function run() {
     assert.strictEqual(uploaded.id, "reserved-1");
     assert.strictEqual(requests, 1);
     assert.strictEqual(reconciliations, 1, "ambiguous POST must be reconciled by reserved ID");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
+    const bytes = new TextEncoder().encode("unchanged large PDF bytes").buffer;
+    const md5Checksum = createHash("md5").update(Buffer.from(bytes)).digest("hex");
+    plugin.localPathExists = async () => true;
+    plugin.localStatInfoByPath = async () => ({ path: "paper.pdf", size: bytes.byteLength, mtime: 2 });
+    plugin.readLocalBinary = async () => bytes;
+    plugin.ensureRemoteParent = async () => { throw new Error("matching content must not prepare an upload"); };
+    plugin.driveFetch = async () => { throw new Error("matching content must not reach Google Drive upload"); };
+    const remote = {
+      id: "remote-pdf",
+      path: "paper.pdf",
+      size: bytes.byteLength,
+      modifiedTime: "same",
+      md5Checksum,
+      parentId: "parent"
+    };
+    const result = await plugin.uploadLocalFile("paper.pdf", "root", remote, {
+      adoptIfContentMatches: true,
+      beforeRemoteCommit: async () => remote
+    });
+    assert.strictEqual(result.contentAlreadyMatched, true, "same-size matching MD5 must adopt instead of uploading");
+    assert.strictEqual(result.id, remote.id);
   }
 
   {
@@ -754,11 +780,11 @@ async function run() {
     const incoming = plugin.reviewItemFrom({ path: "note.md", reason: "changed" }, local, remote);
     const existing = Object.assign({}, incoming, { createdAt: "old-time" });
     plugin.loadReviewQueue = async () => ({ version: 1, items: [existing] });
-    let saved;
-    plugin.saveReviewQueue = async (queue) => { saved = queue; };
-    await plugin.reconcileReviewQueue({ entries: [{ path: "note.md", action: "conflict" }] }, [incoming]);
-    assert.strictEqual(saved.items.length, 1);
-    assert.strictEqual(saved.items[0].createdAt, "old-time");
+    let writes = 0;
+    plugin.saveReviewQueue = async () => { writes++; };
+    const changed = await plugin.reconcileReviewQueue({ entries: [{ path: "note.md", action: "conflict" }] }, [incoming]);
+    assert.strictEqual(changed, false);
+    assert.strictEqual(writes, 0, "an unchanged review queue must not be atomically rewritten");
   }
 
   {
@@ -1187,10 +1213,20 @@ async function run() {
     };
     plugin.remoteChildren = async () => { guardRequests++; return []; };
     plugin.flushOperationJournal = async () => { flushedAfterVerification = verified; };
-    await plugin.executePlan({ snapshot: {}, local: {}, remote: {} }, { entries: [] }, "");
+    let operationUpdates = 0;
+    plugin.updateOperation = async () => { operationUpdates++; };
+    const unchangedEntries = Array.from({ length: 3064 }, (_, index) => ({
+      path: `unchanged-${index}.pdf`,
+      action: "skip",
+      reason: "unchanged"
+    }));
+    const result = await plugin.executePlan({ snapshot: {}, local: {}, remote: {} }, { entries: unchangedEntries }, "");
     assert.strictEqual(verified, true, "executePlan must run duplicate postflight before returning");
     assert.strictEqual(flushedAfterVerification, true, "operation journal must flush after postflight reconciliation");
     assert.strictEqual(guardRequests, 0, "an unchanged sync must not make duplicate-guard Drive requests");
+    assert.strictEqual(operationUpdates, 0, "unchanged paths must be accounted for in bulk without per-file operation work");
+    assert.strictEqual(result.stats.skip, unchangedEntries.length);
+    assert.strictEqual(result.total, unchangedEntries.length);
   }
 
   {
@@ -1911,6 +1947,46 @@ async function run() {
   {
     const { PluginClass } = loadPlugin();
     const plugin = pluginInstance(PluginClass);
+    plugin.hasSameContent = async () => false;
+    plugin.assertLocalUnchangedSincePlan = async () => {};
+    plugin.assertRemoteUnchangedSincePlan = async (_path, remote) => remote;
+    const local = { path: "large.pdf", size: 60 * 1024 * 1024, mtime: 2 };
+    const remote = { id: "remote", path: "large.pdf", size: local.size, md5Checksum: "same" };
+    plugin.localInfoByPath = async () => local;
+    let adoptOption = false;
+    plugin.uploadLocalFile = async (_path, _root, currentRemote, options) => {
+      adoptOption = options.adoptIfContentMatches;
+      return Object.assign({}, currentRemote, { contentAlreadyMatched: true });
+    };
+    plugin.resumableStateForOperation = () => ({});
+    plugin.shouldUseDuplicateGuard = () => false;
+    plugin.shouldRefreshDuplicateGuardPreflight = () => false;
+    plugin.shouldUseExactNameDuplicateGuard = () => false;
+    plugin.reservedRemoteIdForOperation = () => "";
+    plugin.operationIdForPath = () => "";
+    const nextSnapshot = {};
+    const stats = { upload: 0, adopt: 0 };
+    const remoteMutations = {};
+    await plugin.executeEntry(
+      { path: "large.pdf", action: "upload" },
+      { rootFolderId: "root", local: { "large.pdf": local }, remote: { "large.pdf": remote } },
+      nextSnapshot,
+      stats,
+      {},
+      remoteMutations,
+      [],
+      "run"
+    );
+    assert.strictEqual(adoptOption, true);
+    assert.strictEqual(stats.adopt, 1);
+    assert.strictEqual(stats.upload, 0);
+    assert.strictEqual(remoteMutations["large.pdf"], undefined, "MD5 adoption must not record a Drive mutation");
+    assert.ok(nextSnapshot["large.pdf"]);
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass);
     plugin.remoteInfoById = async () => ({
       id: "remote",
       name: "renamed-remotely.pdf",
@@ -2417,6 +2493,26 @@ async function run() {
     const result = await plugin.saveRemoteStateCache("root", null, {}, false);
     assert.strictEqual(result, null);
     assert.strictEqual(writes, 0, "disabling Drive Changes must not write or validate its dedicated cache");
+  }
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass, { driveChangesEnabled: true });
+    assert.strictEqual(
+      plugin.shouldSaveRemoteStateCache({ remoteChangesApplied: false }, { written: false }),
+      false,
+      "an unchanged incremental scan must keep the existing remote-state cache"
+    );
+    assert.strictEqual(
+      plugin.shouldSaveRemoteStateCache({ remoteSnapshotFromFullScan: true }, { written: false }),
+      true,
+      "a full remote scan must refresh the cache"
+    );
+    assert.strictEqual(
+      plugin.shouldSaveRemoteStateCache({ remoteChangesApplied: false }, { written: true }),
+      true,
+      "a remote snapshot mutation must refresh the cache"
+    );
   }
 
   console.log("DriveBridge tests passed");
