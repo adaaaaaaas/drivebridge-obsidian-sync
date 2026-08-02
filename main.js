@@ -106,6 +106,8 @@ const ATOMIC_VERIFY_RETRY_DELAYS_MS = [0, 50, 200, 750, 2000];
 const RESUMABLE_UPLOAD_THRESHOLD_BYTES = 5 * 1024 * 1024;
 const TRANSFER_CHUNK_BYTES = 1024 * 1024;
 const MOBILE_TRANSFER_CHUNK_BYTES = 2 * 1024 * 1024;
+const DOWNLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
+const MOBILE_DOWNLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
 const MOBILE_BATCH_FILE_LIMIT = 25;
 const DESKTOP_BATCH_FILE_LIMIT = 100;
 const MOBILE_BATCH_BYTE_LIMIT = 10 * 1024 * 1024;
@@ -3301,7 +3303,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
     let offset = 0;
     while (offset < total) {
       await this.waitForForegroundBeforeLargeTransfer(path);
-      const endExclusive = Math.min(total, offset + this.transferChunkBytes());
+      const endExclusive = Math.min(total, offset + this.downloadChunkBytes());
       const res = await this.driveFetch(`${DRIVE_API}/files/${remoteItem.id}?alt=media`, {
         headers: { Range: `bytes=${offset}-${endExclusive - 1}` }
       });
@@ -5269,6 +5271,12 @@ module.exports = class DriveBridgePlugin extends Plugin {
     return this.isMobileRuntime() && this.settings.mobileLightweightMode !== false
       ? MOBILE_TRANSFER_CHUNK_BYTES
       : TRANSFER_CHUNK_BYTES;
+  }
+
+  downloadChunkBytes() {
+    return this.isMobileRuntime() && this.settings.mobileLightweightMode !== false
+      ? MOBILE_DOWNLOAD_CHUNK_BYTES
+      : DOWNLOAD_CHUNK_BYTES;
   }
 
   isAppBackgrounded() {

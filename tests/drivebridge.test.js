@@ -1540,8 +1540,10 @@ async function run() {
     const plugin = pluginInstance(PluginClass, { mobileLightweightMode: true });
     plugin.isMobileRuntime = () => true;
     assert.strictEqual(plugin.transferChunkBytes(), 2 * 1024 * 1024, "mobile transfers should use 2 MiB chunks");
+    assert.strictEqual(plugin.downloadChunkBytes(), 8 * 1024 * 1024, "mobile downloads should use fewer 8 MiB ranges");
     plugin.isMobileRuntime = () => false;
     assert.strictEqual(plugin.transferChunkBytes(), 1024 * 1024, "desktop transfer chunk behavior must stay unchanged");
+    assert.strictEqual(plugin.downloadChunkBytes(), 4 * 1024 * 1024, "desktop range downloads should use 4 MiB chunks");
   }
 
   {
@@ -1655,7 +1657,7 @@ async function run() {
   {
     const { PluginClass } = loadPlugin();
     const plugin = pluginInstance(PluginClass);
-    plugin.transferChunkBytes = () => 2;
+    plugin.downloadChunkBytes = () => 2;
     plugin.waitForForegroundBeforeLargeTransfer = async () => {};
     plugin.updateTransferProgress = () => {};
     const source = new Uint8Array([10, 20, 30, 40, 50, 60]);
