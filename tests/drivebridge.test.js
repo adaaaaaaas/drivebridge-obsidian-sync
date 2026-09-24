@@ -38,6 +38,7 @@ class FakeTFolder {}
 function loadPlugin() {
   const requests = [];
   const responses = [];
+  const notices = [];
   const sandbox = {
     module: { exports: {} },
     exports: {},
@@ -73,7 +74,11 @@ function loadPlugin() {
         Setting: FakeSetting,
         PluginSettingTab: FakeSettingTab,
         TFile: FakeTFile,
-        Notice: class {},
+        Notice: class {
+          constructor(message, duration) {
+            notices.push({ message, duration });
+          }
+        },
         requestUrl: async (request) => {
           requests.push(request);
           const response = responses.shift();
@@ -87,7 +92,7 @@ function loadPlugin() {
     "\nmodule.exports.__ReviewModal = DriveBridgeConflictReviewModal;" +
     "\nmodule.exports.__ProgressModal = DriveBridgeProgressModal;";
   vm.runInNewContext(code, sandbox, { filename: "main.js" });
-  return { PluginClass: sandbox.module.exports, requests, responses };
+  return { PluginClass: sandbox.module.exports, requests, responses, notices };
 }
 
 function pluginInstance(PluginClass, settings = {}) {
@@ -2141,6 +2146,53 @@ async function run() {
     console.warn = previousWarn;
     assert.strictEqual(plugin.syncing, false, "cleanup must release the sync lock even when dirty queue persistence fails");
     assert.strictEqual(plugin.activeOperation, "");
+  }
+
+  {
+    const runFailingSync = async (error) => {
+      const { PluginClass, notices } = loadPlugin();
+      const plugin = pluginInstance(PluginClass);
+      plugin.syncing = false;
+      plugin.activeOperation = "";
+      plugin.resetSyncDetailLog = async () => {};
+      plugin.checkInterruptedSync = async () => ({ interrupted: false });
+      plugin.updateSyncProgress = () => {};
+      plugin.buildSyncContext = async () => { throw error; };
+      plugin.safeWriteJournal = async () => {};
+      plugin.saveSettings = async () => {};
+      plugin.showProgressModal = () => {};
+      plugin.lastProgressForModal = () => ({});
+      plugin.safeFlushOperationJournal = async () => {};
+      plugin.flushSyncDetailBuffer = async () => {};
+      plugin.flushDirtyQueue = async () => {};
+      plugin.clearSyncStatus = () => {};
+      plugin.startPendingRemoteIndexRepair = () => {};
+      const previousError = console.error;
+      console.error = () => {};
+      await plugin.syncNow({ dryRun: false, quiet: true });
+      console.error = previousError;
+      return notices;
+    };
+
+    const offline = new Error("offline");
+    offline.code = "DRIVEBRIDGE_NETWORK_ERROR";
+    const offlineNotices = await runFailingSync(offline);
+    assert.strictEqual(offlineNotices.length, 0, "offline sync failures must not create Obsidian notices");
+
+    const configurationNotices = await runFailingSync(new Error("Authorize Google Drive first."));
+    assert.strictEqual(configurationNotices.length, 1, "non-network sync failures must remain visible");
+    assert.match(configurationNotices[0].message, /DriveBridge failed/);
+  }
+
+  {
+    const { PluginClass, responses } = loadPlugin();
+    const plugin = pluginInstance(PluginClass, { accessToken: "", tokenExpiresAt: 0 });
+    responses.push(new Error("offline"));
+    await assert.rejects(
+      () => plugin.ensureAccessToken(),
+      (error) => error.code === "DRIVEBRIDGE_NETWORK_ERROR",
+      "offline token refreshes must use the same network-error classification as Drive requests"
+    );
   }
 
   {

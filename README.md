@@ -2,6 +2,7 @@
 
 ## Latest change
 
+- 0.5.85: Suppresses Obsidian failure notices when a sync fails only because Google Drive is unreachable, including token refresh and per-file transfer failures. Network failures remain recorded in the progress modal, settings summary, journal, and developer console, while authentication, configuration, conflict, and other actionable errors still notify normally.
 - 0.5.84: Speeds up large PDF and attachment downloads by using download-specific 8 MiB HTTP Range chunks in mobile lightweight mode and 4 MiB chunks elsewhere, reducing request round trips while preserving the existing smaller resumable-upload chunks and content verification safeguards.
 - 0.5.83: Avoids uploading an existing same-size attachment when the already-loaded upload bytes match the current Google Drive MD5, so metadata-only timestamp changes on PDFs are adopted without network transfer. No-change real syncs now bulk-account for unchanged paths and skip identical local snapshot, remote-state cache, and review-queue atomic rewrites, reducing fixed overhead on cloud-backed vaults without weakening content checks.
 - 0.5.82: Prevents folder create/delete/rename events from entering the incremental file dirty queue and being uploaded as files. Folder structure changes now force a safe full local rescan, saved dirty-folder entries are ignored during incremental scans, and upload execution rejects non-file paths before binary reads or Google Drive mutations.

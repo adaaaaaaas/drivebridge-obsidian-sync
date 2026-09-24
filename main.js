@@ -638,7 +638,11 @@ module.exports = class DriveBridgePlugin extends Plugin {
       this.settings.lastRecoverySummary = "";
       await this.saveSettings();
       if (executed.errors.length) {
-        new Notice("DriveBridge sync completed with errors. Check DriveBridge settings for details.", 10000);
+        const onlyNetworkErrors = executed.errorCount > 0 &&
+          executed.networkErrorCount === executed.errorCount;
+        if (!onlyNetworkErrors) {
+          new Notice("DriveBridge sync completed with errors. Check DriveBridge settings for details.", 10000);
+        }
         this.showProgressModal(this.formatErrorModalMessage("DriveBridge sync completed with errors.", executed.errors), {
           current: executed.processedBytes,
           total: executed.totalBytes,
@@ -674,7 +678,9 @@ module.exports = class DriveBridgePlugin extends Plugin {
         fatalError: failure
       });
       await this.saveSettings();
-      new Notice(`DriveBridge failed: ${failure.message}. Check DriveBridge settings for details.`, 10000);
+      if (!this.isNetworkFailure(err)) {
+        new Notice(`DriveBridge failed: ${failure.message}. Check DriveBridge settings for details.`, 10000);
+      }
       this.showProgressModal(this.formatErrorModalMessage("DriveBridge failed.", [failure]), this.lastProgressForModal());
       console.error("[drivebridge-obsidian-sync]", err);
     } finally {
@@ -1386,6 +1392,8 @@ module.exports = class DriveBridgePlugin extends Plugin {
     let processed = passiveEntries.length;
     let processedBytes = 0;
     let errorCount = 0;
+    let networkErrorCount = 0;
+    let notifiableErrorCount = 0;
     let skippedChangedCount = 0;
     let skippedSafeCount = 0;
     let batchFiles = 0;
@@ -1499,13 +1507,20 @@ module.exports = class DriveBridgePlugin extends Plugin {
         const error = this.errorRecord(entry, err);
         this.markPlanEntryDirty(entry);
         errorCount++;
+        const networkFailure = this.isNetworkFailure(err);
+        if (networkFailure) {
+          networkErrorCount++;
+        }
         await this.pushBoundedSyncDetail(errors, "error", error);
         stats.error++;
         await this.updateOperation(runId, entry, "failed", context, err);
-        if (stats.error <= 3) {
-          new Notice(`DriveBridge error: ${error.action} ${error.path}: ${error.message}`, 10000);
-        } else if (stats.error === 4) {
-          new Notice(`More DriveBridge errors occurred. See developer console for details.`, 10000);
+        if (!networkFailure) {
+          notifiableErrorCount++;
+          if (notifiableErrorCount <= 3) {
+            new Notice(`DriveBridge error: ${error.action} ${error.path}: ${error.message}`, 10000);
+          } else if (notifiableErrorCount === 4) {
+            new Notice(`More DriveBridge errors occurred. See developer console for details.`, 10000);
+          }
         }
         this.showProgressModal(this.formatErrorModalMessage(`DriveBridge sync error ${stats.error}. Continuing...`, [error]), {
           current: processedBytes,
@@ -1544,6 +1559,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       stats,
       errors,
       errorCount,
+      networkErrorCount,
       skippedChanged,
       skippedChangedCount,
       skippedSafe,
@@ -1927,11 +1943,17 @@ module.exports = class DriveBridgePlugin extends Plugin {
     if (this.settings.clientSecret) {
       body.set("client_secret", this.settings.clientSecret);
     }
-    const data = await parseJsonResponse(await customFetch(OAUTH_TOKEN, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body
-    }));
+    let response;
+    try {
+      response = await customFetch(OAUTH_TOKEN, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body
+      });
+    } catch (cause) {
+      throw this.driveNetworkError("POST", cause);
+    }
+    const data = await parseJsonResponse(response);
     this.settings.accessToken = data.access_token;
     this.settings.tokenExpiresAt = Date.now() + Math.max(0, (data.expires_in || 3600) - 60) * 1000;
     await this.saveSettings();
@@ -1969,12 +1991,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
         await sleep(this.retryDelayMs(attempt));
         return this.driveFetch(url, options, attempt + 1);
       }
-      const error = new Error(`Google Drive network request failed (${method}): ${cause && cause.message ? cause.message : String(cause)}`);
-      error.code = "DRIVEBRIDGE_NETWORK_ERROR";
-      error.method = method;
-      error.cause = cause;
-      error.retryable = retryableNetworkError;
-      throw error;
+      throw this.driveNetworkError(method, cause, retryableNetworkError);
     }
     if (res.status === 401 && this.settings.refreshToken && attempt === 1) {
       this.settings.tokenExpiresAt = 0;
@@ -2002,6 +2019,15 @@ module.exports = class DriveBridgePlugin extends Plugin {
   isNonRetryableNetworkError(error) {
     const message = String(error && error.message ? error.message : error || "");
     return /\bERR_(?:INVALID_ARGUMENT|INVALID_URL|UNSAFE_PORT)\b/i.test(message);
+  }
+
+  driveNetworkError(method, cause, retryable = !this.isNonRetryableNetworkError(cause)) {
+    const error = new Error(`Google Drive network request failed (${method}): ${cause && cause.message ? cause.message : String(cause)}`);
+    error.code = "DRIVEBRIDGE_NETWORK_ERROR";
+    error.method = method;
+    error.cause = cause;
+    error.retryable = retryable;
+    return error;
   }
 
   async ensureRootFolder() {
@@ -5542,8 +5568,22 @@ module.exports = class DriveBridgePlugin extends Plugin {
       action: entry.action || "",
       message: err && err.message ? err.message : String(err),
       name: err && err.name ? err.name : "",
+      code: err && err.code ? err.code : "",
       time: new Date().toISOString()
     };
+  }
+
+  isNetworkFailure(error) {
+    const seen = new Set();
+    let current = error;
+    while (current && (typeof current === "object" || typeof current === "function") && !seen.has(current)) {
+      if (current.code === "DRIVEBRIDGE_NETWORK_ERROR") {
+        return true;
+      }
+      seen.add(current);
+      current = current.cause;
+    }
+    return false;
   }
 
   skipRecord(entry, err) {
