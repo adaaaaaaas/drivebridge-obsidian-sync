@@ -12,13 +12,15 @@ class FakeElement {
   }
   empty() { this.children = []; }
   addClass() {}
-  createEl() {
+  createEl(tag, options = {}) {
     const child = new FakeElement();
+    child.tag = tag;
+    child.text = options.text || "";
     this.children.push(child);
     return child;
   }
   createDiv() { return this.createEl(); }
-  addEventListener() {}
+  addEventListener(name, callback) { this[name] = callback; }
   setAttribute(name, value) { this[name] = value; }
   setText(value) { this.text = value; }
   querySelectorAll() { return []; }
@@ -30,12 +32,22 @@ class FakeModal {
   open() { if (this.onOpen) this.onOpen(); }
   close() { if (this.onClose) this.onClose(); }
 }
-class FakeSetting {}
+class FakeSetting {
+  constructor() { this.record = {}; FakeSetting.records.push(this.record); }
+  setName(value) { this.record.name = value; return this; }
+  setDesc(value) { this.record.desc = value; return this; }
+  addText() { return this; }
+  addTextArea() { return this; }
+  addToggle() { return this; }
+  addDropdown() { return this; }
+  addButton() { return this; }
+}
+FakeSetting.records = [];
 class FakeSettingTab {}
 class FakeTFile {}
 class FakeTFolder {}
 
-function loadPlugin() {
+function loadPlugin(language = "en") {
   const requests = [];
   const responses = [];
   const notices = [];
@@ -74,6 +86,7 @@ function loadPlugin() {
         Setting: FakeSetting,
         PluginSettingTab: FakeSettingTab,
         TFile: FakeTFile,
+        getLanguage: () => language,
         Notice: class {
           constructor(message, duration) {
             notices.push({ message, duration });
@@ -90,6 +103,8 @@ function loadPlugin() {
   };
   const code = fs.readFileSync(path.join(__dirname, "..", "main.js"), "utf8") +
     "\nmodule.exports.__ReviewModal = DriveBridgeConflictReviewModal;" +
+    "\nmodule.exports.__LargeDeleteModal = DriveBridgeLargeDeleteModal;" +
+    "\nmodule.exports.__SettingTab = DriveBridgeSettingTab;" +
     "\nmodule.exports.__ProgressModal = DriveBridgeProgressModal;";
   vm.runInNewContext(code, sandbox, { filename: "main.js" });
   return { PluginClass: sandbox.module.exports, requests, responses, notices };
@@ -751,6 +766,84 @@ async function run() {
   }
 
   {
+    for (const [language, expectedName, expectedDelete] of [["ja", "同期モード", "大量削除の確認"], ["ja-JP", "同期モード", "大量削除の確認"], ["en", "Sync mode", "Review large deletions"], ["fr", "Sync mode", "Review large deletions"]]) {
+      const { PluginClass } = loadPlugin(language);
+      const plugin = pluginInstance(PluginClass);
+      const tab = new PluginClass.__SettingTab({}, plugin);
+      tab.containerEl = new FakeElement();
+      FakeSetting.records = [];
+      tab.display();
+      assert.ok(FakeSetting.records.some((record) => record.name === expectedName), `${language}: sync settings use the selected language`);
+      assert.ok(FakeSetting.records.some((record) => record.name === expectedDelete), `${language}: review settings use the selected language`);
+      let result;
+      const entries = [{ action: "deleteRemote", path: "keep-path.md", reason: "local deletion detected" }];
+      const modal = new PluginClass.__LargeDeleteModal({}, entries, { entries }, "guard", (value) => { result = value; });
+      modal.open();
+      const displayed = modal.contentEl.children.map((child) => child.text).join("\n");
+      assert.match(displayed, /keep-path\.md/);
+      assert.match(displayed, language.startsWith("ja") ? /大量削除の確認/ : /Review large deletions/);
+      modal.close();
+      assert.strictEqual(result, false);
+      const progress = new PluginClass.__ProgressModal({});
+      progress.open();
+      progress.update("DriveBridge failed.\nError details:\n   Code: DRIVEBRIDGE_LARGE_DELETE", null);
+      assert.match(progress.statusEl.text, language.startsWith("ja") ? /エラーの詳細/ : /Error details/);
+      assert.match(progress.statusEl.text, /DRIVEBRIDGE_LARGE_DELETE/);
+      assert.match(progress.titleEl.text, language.startsWith("ja") ? /通常同期が停止/ : /Normal sync stopped/);
+    }
+  }
+
+  {
+    const { PluginClass } = loadPlugin("ja");
+    const plugin = pluginInstance(PluginClass);
+    const err = new Error("blocked");
+    err.code = "DRIVEBRIDGE_LARGE_DELETE";
+    err.guardReason = "削除予定 18 件";
+    const record = plugin.errorRecord({ action: "sync", path: "(sync)" }, err);
+    const details = plugin.formatErrorModalMessage("DriveBridge failed.", [record]);
+    assert.match(details, /DRIVEBRIDGE_LARGE_DELETE/);
+    assert.match(details, /削除予定 18 件/);
+    assert.match(details, /意図した削除/);
+    const httpError = new Error("forbidden");
+    httpError.status = 403;
+    const httpRecord = plugin.errorRecord({ action: "upload", path: "a.md" }, httpError);
+    assert.match(plugin.formatErrorLines([httpRecord], 1)[0], /HTTP status: 403/);
+    assert.match(plugin.formatErrorLines([httpRecord], 1)[0], /アクセス権/);
+    assert.match(plugin.formatErrorLines([plugin.errorRecord({}, new Error("unknown"))], 1)[0], /コードなし/);
+
+    const entries = [
+      { action: "deleteRemote", path: "foo.md", reason: "local deletion detected" },
+      { action: "deleteLocal", path: "bar.md", reason: "remote deletion tombstone detected" }
+    ];
+    let result;
+    const modal = new PluginClass.__LargeDeleteModal({}, entries, { entries: [...entries, { action: "upload" }] }, "test guard", (value) => { result = value; });
+    modal.open();
+    const visible = modal.contentEl.children.map((child) => child.text).join("\n");
+    assert.match(visible, /Google Drive 1 件/);
+    assert.match(visible, /この端末 1 件/);
+    assert.match(visible, /foo\.md[\s\S]*この端末で削除/);
+    assert.match(visible, /bar\.md[\s\S]*Google Drive側の削除/);
+    assert.match(visible, /アップロード: 1 件/);
+    modal.close();
+    assert.strictEqual(result, false, "closing the review must cancel");
+    const modal2 = new PluginClass.__LargeDeleteModal({}, entries, { entries }, "test guard", (value) => { result = value; });
+    modal2.open();
+    const buttonRow = modal2.contentEl.children.find((child) => child.children.some((button) => /今回だけ同期/.test(button.text)));
+    buttonRow.children.find((button) => /今回だけ同期/.test(button.text)).click();
+    assert.strictEqual(result, true, "approval requires the explicit confirmation button");
+
+    const progress = new PluginClass.__ProgressModal({});
+    progress.open();
+    let reviews = 0;
+    progress.setReviewAction(() => { reviews++; });
+    assert.strictEqual(reviews, 0);
+    progress.actionEl.children[0].click();
+    assert.strictEqual(reviews, 1);
+    progress.update("Next run", null);
+    assert.strictEqual(progress.actionEl.children.length, 0, "old review actions must not remain on later progress");
+  }
+
+  {
     const { PluginClass } = loadPlugin();
     const plugin = pluginInstance(PluginClass, {
       syncDeletes: true,
@@ -774,7 +867,48 @@ async function run() {
     assert.throws(() => plugin.assertRealSyncAllowed(context, plan), /Large delete safeguard/);
     plugin.settings.allowLargeDeleteOnce = true;
     plugin.settings.approvedDeletePlanDigest = "approved-plan";
-    plugin.assertRealSyncAllowed(context, plan);
+    assert.throws(() => plugin.assertRealSyncAllowed(context, plan), /Large delete safeguard/, "old persisted approvals must not bypass review");
+    assert.throws(() => plugin.assertRealSyncAllowed(context, plan, "different-plan"), /Large delete safeguard/);
+    plugin.assertRealSyncAllowed(context, plan, "approved-plan");
+  }
+
+  {
+    for (const scenario of ["cancel", "changed", "approved", "quiet", "review-no-deletes"]) {
+      const { PluginClass } = loadPlugin();
+      const plugin = pluginInstance(PluginClass, { syncDeletes: true, protectModifyPercentage: 100, safeInitialSync: false });
+      const entries = Array.from({ length: 10 }, (_, i) => ({ path: `deleted-${i}.md`, action: "deleteRemote" }));
+      let scans = 0;
+      let journalWrites = 0;
+      let prompts = 0;
+      plugin.manifest = { version: "test" };
+      plugin.resetSyncDetailLog = async () => {};
+      plugin.checkInterruptedSync = async () => ({ interrupted: false });
+      plugin.updateSyncProgress = () => {};
+      plugin.buildSyncContext = async () => {
+        scans++;
+        const remote = Object.fromEntries(entries.map((e, i) => [e.path, { id: `r${i}`, size: scenario === "changed" && scans > 1 && i === 0 ? 2 : 1 }]));
+        return { snapshot: { previous: {} }, local: {}, remote };
+      };
+      plugin.buildSyncPlan = async () => ({ entries: scenario === "review-no-deletes" ? [{ path: "safe.md", action: "upload" }] : entries, stats: {} });
+      plugin.confirmLargeDelete = async (list) => { prompts++; assert.strictEqual(list.length, 10); return scenario !== "cancel"; };
+      plugin.writeJournal = async () => { journalWrites++; throw new Error("test reached execution"); };
+      plugin.safeWriteJournal = async () => {};
+      plugin.saveSettings = async () => {};
+      plugin.showProgressModal = () => {};
+      plugin.lastProgressForModal = () => ({});
+      plugin.safeFlushOperationJournal = async () => {};
+      plugin.flushSyncDetailBuffer = async () => {};
+      plugin.flushDirtyQueue = async () => {};
+      plugin.clearSyncStatus = () => {};
+      plugin.startPendingRemoteIndexRepair = () => {};
+      const previousError = console.error;
+      console.error = () => {};
+      try { await plugin.syncNow({ dryRun: false, quiet: scenario === "quiet", reviewDeletesOnly: scenario === "review-no-deletes" }); } finally { console.error = previousError; }
+      assert.strictEqual(journalWrites, scenario === "approved" ? 1 : 0, `${scenario}: only the unchanged approved plan may reach execution`);
+      assert.strictEqual(prompts, scenario === "quiet" || scenario === "review-no-deletes" ? 0 : 1, `${scenario}: prompts only for manual sync`);
+      assert.strictEqual(scans, scenario === "changed" || scenario === "approved" ? 2 : 1);
+      if (scenario === "changed") assert.match(plugin.settings.lastSyncSummary, /plan changed during approval/);
+    }
   }
 
   {
@@ -1248,6 +1382,31 @@ async function run() {
       drivebridgeDeviceId: "device-test",
       drivebridgeProtocolVersion: "2"
     });
+
+  {
+    const { PluginClass } = loadPlugin();
+    const plugin = pluginInstance(PluginClass, { deviceId: "device-cbe55c7c7ecc1404" });
+    const prefix = "0_Notes/03_Lab_Notes/032_学習資料/0325_その他スピントロニクス/Antigravity自動承認設定_files";
+    const created = [];
+    plugin.folderCache = new Map();
+    plugin.findRemoteFolder = async () => null;
+    plugin.createRemoteFolder = async (parentId, name, options) => {
+      created.push(options);
+      return `id-${created.length}`;
+    };
+    plugin.operationJournalCache = { runId: "20260930-173521-2319ae", folderReservations: {} };
+    await plugin.ensureRemoteParent(`${prefix}/769236.576df3510a.css`, "root");
+    assert.strictEqual(created.length, prefix.split("/").length);
+    for (const options of created) {
+      assert.match(options.operationId, /^folder-[0-9a-f]{32}$/);
+      const properties = plugin.provenanceProperties(options.operationId, options.runId);
+      for (const [key, value] of Object.entries(properties)) {
+        assert.ok(Buffer.byteLength(key + value, "utf8") <= 124, `${key} exceeds the Drive appProperties limit`);
+      }
+    }
+    assert.strictEqual(plugin.folderOperationId(prefix), plugin.folderOperationId(prefix));
+    assert.notStrictEqual(plugin.folderOperationId(prefix), plugin.folderOperationId(`${prefix}2`));
+  }
   }
 
   {

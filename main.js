@@ -1,4 +1,66 @@
-const { Modal, Notice, Platform = {}, Plugin, PluginSettingTab, Setting, TFile, requestUrl } = require("obsidian");
+const { Modal, Notice, Platform = {}, Plugin, PluginSettingTab, Setting, TFile, requestUrl, getLanguage } = require("obsidian");
+
+function isJapanese() {
+  try {
+    return typeof getLanguage === "function" && /^ja(?:[-_]|$)/i.test(String(getLanguage()));
+  } catch (_) {
+    return false;
+  }
+}
+
+function ui(en, ja) {
+  return isJapanese() ? ja : en;
+}
+
+// Translate known display labels only; keep paths, API details and machine-readable codes intact.
+function displayText(value) {
+  const text = String(value || "");
+  if (!isJapanese()) return text;
+  const labels = {
+    "DriveBridge failed.": "DriveBridge の同期が停止しました。",
+    "Preview only. No files changed.": "プレビューのみ。ファイルは変更していません。",
+    "Planned real sync.": "実同期の予定。",
+    "Scanning local vault and Google Drive...": "端末の Vault と Google Drive を確認中...",
+    "Preview complete.": "プレビューが完了しました。",
+    "Sync complete.": "同期が完了しました。",
+    "Error details:": "エラーの詳細:",
+    "First planned changes:": "主な変更予定:"
+  };
+  const prefixes = {
+    "DriveBridge version:": "DriveBridge バージョン:", "Logged at:": "記録時刻:", "Stopped at:": "停止時刻:",
+    "Completed at:": "完了時刻:", "Planned at:": "計画時刻:", "Elapsed:": "経過時間:",
+    "Mode:": "モード:", "Conflict handling:": "競合の処理:", "Protect modify threshold:": "変更保護のしきい値:",
+    "Upload:": "アップロード:", "Download:": "ダウンロード:", "Move remote:": "Drive側の移動:",
+    "Conflicts:": "競合:", "Adopt unchanged:": "変更なし:", "Delete local:": "端末から削除:",
+    "Delete remote:": "Driveから削除:", "Skipped:": "スキップ:", "Errors:": "エラー:",
+    "Uploaded:": "アップロード済み:", "Downloaded:": "ダウンロード済み:", "Deleted local:": "端末から削除済み:",
+    "Deleted remote:": "Driveから削除済み:", "Time:": "時刻:", "Code:": "コード:", "Error:": "エラー:",
+    "Next step:": "対処:", "Assessment:": "判定:", "Overall:": "全体:", "Files:": "ファイル:",
+    "Phase:": "段階:", "Work attempted:": "処理したデータ量:", "Moved remote:": "Driveで移動済み:",
+    "Queued for review:": "確認待ち:", "Adopted:": "同期済みとして採用:", "Changed-during-sync skips:": "同期中の変更によるスキップ:",
+    "Safety skips:": "安全のためのスキップ:", "Drive API requests:": "Drive API リクエスト:",
+    "Reserved-ID batch requests:": "ID予約の一括リクエスト:", "Recovery-only lookups:": "復旧専用の照会:",
+    "Duplicate guard preflight parents:": "重複保護の事前確認フォルダ:", "Duplicate guard postflight parents:": "重複保護の事後確認フォルダ:",
+    "Duplicate creates self-healed:": "自動解消した重複作成:", "Remote snapshot writes:": "リモート同期記録の書き込み:",
+    "Remote snapshot writes skipped:": "省略したリモート同期記録の書き込み:", "Remote snapshot conflict merges:": "リモート同期記録の競合統合:",
+    "Remote metadata batch requests:": "リモートメタデータの一括照会:", "Drive Changes pages:": "Drive 差分ページ:",
+    "Local full scans:": "端末の全件スキャン:", "Local dirty scans:": "端末の差分スキャン:",
+    "Local hash cache hits:": "端末ハッシュのキャッシュ利用:", "Local snapshot writes:": "端末同期記録の書き込み:",
+    "Local snapshot writes skipped:": "省略した端末同期記録の書き込み:", "Remote state cache writes:": "リモート状態キャッシュの書き込み:",
+    "Remote state cache writes skipped:": "省略したリモート状態キャッシュの書き込み:"
+  };
+  return text.split("\n").map((line) => {
+    const match = line.match(/^(\s*)(.*)$/);
+    const body = match[2];
+    if (Object.prototype.hasOwnProperty.call(labels, body)) return match[1] + labels[body];
+    if (/^Failed after /.test(body)) return match[1] + body.replace(/^Failed after (.+)s$/, "$1秒後に失敗");
+    if (/^Also saved in /.test(body)) return match[1] + "詳細は同期ログと DriveBridge 設定にも保存されています。";
+    for (const [prefix, translation] of Object.entries(prefixes)) {
+      if (body.startsWith(prefix)) return match[1] + translation + body.slice(prefix.length);
+    }
+    return line;
+  }).join("\n");
+}
 
 const DEFAULT_EXCLUDED_PATTERNS = [
   ".obsidian/**",
@@ -199,17 +261,17 @@ module.exports = class DriveBridgePlugin extends Plugin {
     this.addSettingTab(new DriveBridgeSettingTab(this.app, this));
     this.addCommand({
       id: "drivebridge-preview-sync",
-      name: "Preview Google Drive sync",
+      name: ui("Preview Google Drive sync", "Google Drive 同期をプレビュー"),
       callback: () => this.previewSync()
     });
     this.addCommand({
       id: "drivebridge-sync-now",
-      name: "Sync vault with Google Drive",
+      name: ui("Sync vault with Google Drive", "Vault を Google Drive と同期"),
       callback: () => this.syncNow({ dryRun: false })
     });
     this.addCommand({
       id: "drivebridge-compact-sync",
-      name: "Run compact sync",
+      name: ui("Run compact sync", "コンパクト同期を実行"),
       callback: () => this.syncNow({
         dryRun: this.settings.dryRunDefault,
         quiet: true
@@ -217,12 +279,12 @@ module.exports = class DriveBridgePlugin extends Plugin {
     });
     this.addCommand({
       id: "drivebridge-rebuild-remote-snapshot",
-      name: "Repair remote index (not a normal sync)",
+      name: ui("Repair remote index (not a normal sync)", "リモート索引を修復（通常の同期ではありません）"),
       callback: () => this.rebuildRemoteSnapshotFromDrive()
     });
     this.addCommand({
       id: "drivebridge-review-conflicts",
-      name: "Review sync conflicts",
+      name: ui("Review sync conflicts", "同期の競合を確認"),
       callback: () => runUiAction(() => this.openConflictReview())
     });
     this.addRibbonIcon("refresh-cw", "Preview Google Drive sync", () => this.previewSync());
@@ -421,9 +483,10 @@ module.exports = class DriveBridgePlugin extends Plugin {
     const dryRun = options.dryRun !== undefined ? options.dryRun : this.settings.dryRunDefault;
     const quiet = Boolean(options.quiet);
     const recoveryResume = Boolean(options.recoveryResume);
+    const reviewDeletesOnly = Boolean(options.reviewDeletesOnly);
     if (this.syncing) {
       if (!quiet) {
-        new Notice("DriveBridge sync is already running.");
+        new Notice(ui("DriveBridge sync is already running.", "DriveBridge の同期はすでに実行中です。"));
       }
       return;
     }
@@ -481,13 +544,13 @@ module.exports = class DriveBridgePlugin extends Plugin {
         message: "Scanning local vault and Google Drive..."
       });
       if (!quiet) {
-        new Notice(dryRun ? "DriveBridge preview started." : "DriveBridge sync started. Avoid editing notes until it completes.");
+        new Notice(dryRun ? ui("DriveBridge preview started.", "DriveBridge のプレビューを開始しました。") : ui("DriveBridge sync started. Avoid editing notes until it completes.", "DriveBridge の同期を開始しました。完了までノートの編集をお控えください。"));
       }
-      const context = await this.buildSyncContext();
+      let context = await this.buildSyncContext();
       if (recoveryResume) {
         await this.reconcileRecoveryContext(recovery, context);
       }
-      const plan = await this.buildSyncPlan(context);
+      let plan = await this.buildSyncPlan(context);
       context.planDigest = planDigest(plan, context);
       context.newUploadParentPathCounts = this.newUploadParentPathCounts(plan, context);
       const summary = this.formatPlanSummary(plan, dryRun, Date.now() - started);
@@ -512,7 +575,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
         this.settings.lastSyncSummary = summary;
         await this.saveSettings();
         if (!quiet) {
-          new Notice("DriveBridge preview complete.");
+          new Notice(ui("DriveBridge preview complete.", "DriveBridge のプレビューが完了しました。"));
         }
         this.updateSyncProgress({
           phase: "Preview",
@@ -529,9 +592,36 @@ module.exports = class DriveBridgePlugin extends Plugin {
         return;
       }
 
-      const deferredResumeActions = recoveryResume ? this.unsafeResumePlanEntries(plan) : [];
-      const executionPlan = recoveryResume ? this.safeResumePlan(plan) : plan;
-      this.assertRealSyncAllowed(context, executionPlan);
+      let deferredResumeActions = recoveryResume ? this.unsafeResumePlanEntries(plan) : [];
+      let executionPlan = recoveryResume ? this.safeResumePlan(plan) : plan;
+      try {
+        this.assertRealSyncAllowed(context, executionPlan);
+        if (reviewDeletesOnly) {
+          new Notice(ui("There is no longer a large-delete plan to review. No sync was performed.", "現在、大量削除の確認が必要な計画はありません。同期は実行していません。"), 10000);
+          return;
+        }
+      } catch (err) {
+        if (!err.largeDeleteEntries || quiet || recoveryResume) throw err;
+        if (this.progressModal) this.progressModal.close();
+        const approved = await this.confirmLargeDelete(err.largeDeleteEntries, executionPlan, err.guardReason);
+        if (!approved) {
+          new Notice(ui("DriveBridge sync cancelled. No planned changes were applied.", "DriveBridge の同期をキャンセルしました。予定された変更は実行していません。"));
+          return;
+        }
+        const approvedDigest = context.planDigest;
+        this.updateSyncProgress({ phase: "Sync", message: "Checking the approved plan again..." });
+        context = await this.buildSyncContext();
+        plan = await this.buildSyncPlan(context);
+        context.planDigest = planDigest(plan, context);
+        context.newUploadParentPathCounts = this.newUploadParentPathCounts(plan, context);
+        if (context.planDigest !== approvedDigest) {
+          const changed = new Error("The sync plan changed during approval. No changes were applied. Run sync again to review the new plan.");
+          changed.code = "DRIVEBRIDGE_DELETE_PLAN_CHANGED";
+          throw changed;
+        }
+        executionPlan = plan;
+        this.assertRealSyncAllowed(context, executionPlan, approvedDigest);
+      }
       if (recoveryResume) {
         this.assertResumePlanSafe(executionPlan);
       }
@@ -641,7 +731,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
         const onlyNetworkErrors = executed.errorCount > 0 &&
           executed.networkErrorCount === executed.errorCount;
         if (!onlyNetworkErrors) {
-          new Notice("DriveBridge sync completed with errors. Check DriveBridge settings for details.", 10000);
+          new Notice(ui("DriveBridge sync completed with errors. Check DriveBridge settings for details.", "DriveBridge の同期中にエラーが発生しました。設定画面で詳細を確認してください。"), 10000);
         }
         this.showProgressModal(this.formatErrorModalMessage("DriveBridge sync completed with errors.", executed.errors), {
           current: executed.processedBytes,
@@ -679,9 +769,20 @@ module.exports = class DriveBridgePlugin extends Plugin {
       });
       await this.saveSettings();
       if (!this.isNetworkFailure(err)) {
-        new Notice(`DriveBridge failed: ${failure.message}. Check DriveBridge settings for details.`, 10000);
+        const noticeDetail = isJapanese() && failure.code === "DRIVEBRIDGE_LARGE_DELETE" ? "大量削除の確認が必要です。" : failure.message;
+        new Notice(ui(`DriveBridge failed: ${failure.message}. Check DriveBridge settings for details.`, `DriveBridge が停止しました: ${noticeDetail} 詳細は設定画面を確認してください。`), 10000);
       }
       this.showProgressModal(this.formatErrorModalMessage("DriveBridge failed.", [failure]), this.lastProgressForModal());
+      if (err && err.code === "DRIVEBRIDGE_LARGE_DELETE" && this.progressModal) {
+        this.progressModal.setReviewAction(() => {
+          if (this.syncing) {
+            new Notice(ui("Wait for the current sync to finish, then try again.", "同期処理の終了を待ってから、もう一度押してください。"));
+            return;
+          }
+          this.progressModal.close();
+          this.syncNow({ dryRun: false, reviewDeletesOnly: true });
+        });
+      }
       console.error("[drivebridge-obsidian-sync]", err);
     } finally {
       try {
@@ -1270,7 +1371,11 @@ module.exports = class DriveBridgePlugin extends Plugin {
     return { path, action: "download", reason: "pull mode remote changed" };
   }
 
-  assertRealSyncAllowed(context, plan) {
+  confirmLargeDelete(entries, plan, guardReason) {
+    return new Promise((resolve) => new DriveBridgeLargeDeleteModal(this.app, entries, plan, guardReason, resolve).open());
+  }
+
+  assertRealSyncAllowed(context, plan, approvedDeleteDigest = "") {
     const snapshotEmpty = Object.keys(context.snapshot).length === 0;
     const hasLocal = Object.keys(context.local).length > 0;
     const hasRemote = Object.keys(context.remote).length > 0;
@@ -1289,8 +1394,12 @@ module.exports = class DriveBridgePlugin extends Plugin {
       const unexpectedlyEmpty = Object.keys(context.snapshot).length > 0 &&
         (Object.keys(context.local).length === 0 || Object.keys(context.remote).length === 0);
       const largeDelete = dangerousDeletes.length >= 10 || deleteRatio >= 0.2 || unexpectedlyEmpty;
-      if (largeDelete && (!this.settings.allowLargeDeleteOnce || this.settings.approvedDeletePlanDigest !== context.planDigest)) {
-        throw new Error(`Large delete safeguard: ${dangerousDeletes.length} delete(s) require Preview and approval for this exact plan.`);
+      if (largeDelete && (!approvedDeleteDigest || approvedDeleteDigest !== context.planDigest)) {
+        const error = new Error(`Large delete safeguard: ${dangerousDeletes.length} delete(s) need review. Run Normal sync to review and approve them.`);
+        error.code = "DRIVEBRIDGE_LARGE_DELETE";
+        error.guardReason = ui(`${dangerousDeletes.length} planned deletion(s) / ${totalKnown} known files (${(deleteRatio * 100).toFixed(1)}%)${unexpectedlyEmpty ? "; one side is empty." : "."}`, `削除予定 ${dangerousDeletes.length} 件 / 既知ファイル ${totalKnown} 件（${(deleteRatio * 100).toFixed(1)}%）${unexpectedlyEmpty ? "。片側のファイルが空です。" : "。"}`);
+        error.largeDeleteEntries = dangerousDeletes;
+        throw error;
       }
     }
     if (!snapshotEmpty) {
@@ -3179,7 +3288,7 @@ module.exports = class DriveBridgePlugin extends Plugin {
       parentId = folder ? folder.id : await this.createRemoteFolder(parentId, part, {
         reservedId: this.reservedFolderIdForPrefix(prefix),
         runId: this.operationJournalCache && this.operationJournalCache.runId || "",
-        operationId: `folder-${prefix}`
+        operationId: this.folderOperationId(prefix)
       });
       this.folderCache.set(cacheKey, parentId);
       if (this.activeSyncContext) {
@@ -3188,6 +3297,11 @@ module.exports = class DriveBridgePlugin extends Plugin {
       }
     }
     return parentId;
+  }
+
+  folderOperationId(prefix) {
+    // Drive limits each appProperties key + value to 124 UTF-8 bytes, so never embed the folder path.
+    return `folder-${md5Hex(new TextEncoder().encode(prefix).buffer)}`;
   }
 
   async findRemoteFolder(parentId, name) {
@@ -5553,7 +5667,13 @@ module.exports = class DriveBridgePlugin extends Plugin {
   formatErrorLines(errors, limit) {
     const visible = errors.slice(0, limit).map((error, index) => {
       const line = `${index + 1}. ${error.action}: ${error.path}`;
-      return `${line}\n   Time: ${error.time || "unknown"}\n   Error: ${error.message}`;
+      const code = error.code || ui("not provided", "コードなし");
+      const http = error.status ? `\n   HTTP status: ${error.status}` : "";
+      const cause = error.causeCode ? `\n   Cause code: ${error.causeCode}` : "";
+      const detail = error.guardReason ? `\n   ${ui("Assessment", "判定")}: ${error.guardReason}` : "";
+      const message = isJapanese() && error.code === "DRIVEBRIDGE_LARGE_DELETE" ? "大量削除を検知したため、同期を停止しました。" :
+        isJapanese() && error.code === "DRIVEBRIDGE_DELETE_PLAN_CHANGED" ? "確認中に同期計画が変わったため、変更を実行せず停止しました。" : error.message;
+      return `${line}\n   ${ui("Time", "時刻")}: ${error.time || "unknown"}\n   ${ui("Code", "コード")}: ${code}${http}${cause}\n   ${ui("Error", "エラー")}: ${message}${detail}\n   ${ui("Next step", "対処")}: ${this.errorGuidance(error)}`;
     });
     const remaining = errors.length - visible.length;
     if (remaining > 0) {
@@ -5569,8 +5689,22 @@ module.exports = class DriveBridgePlugin extends Plugin {
       message: err && err.message ? err.message : String(err),
       name: err && err.name ? err.name : "",
       code: err && err.code ? err.code : "",
+      status: err && Number.isInteger(err.status) ? err.status : null,
+      causeCode: err && err.cause && err.cause.code ? String(err.cause.code) : "",
+      guardReason: err && err.guardReason ? err.guardReason : "",
       time: new Date().toISOString()
     };
+  }
+
+  errorGuidance(error) {
+    if (error.code === "DRIVEBRIDGE_LARGE_DELETE") return ui("Review the files and approve only if the deletions are intended.", "削除対象を確認し、意図した削除の場合だけ承認してください。");
+    if (error.code === "DRIVEBRIDGE_DELETE_PLAN_CHANGED") return ui("The plan changed during review. Run sync again and review the new plan.", "確認中に計画が変わりました。再度同期して新しい対象を確認してください。");
+    if (error.code === "DRIVEBRIDGE_NETWORK_ERROR") return ui("Check your connection and try again.", "通信状態を確認し、再試行してください。");
+    if (error.status === 401) return ui("Check your Google Drive authorization.", "Google Driveの認証状態を確認してください。");
+    if (error.status === 403) return ui("Check the Google Drive response and access permissions.", "Google Driveの応答内容とアクセス権を確認してください。");
+    if (error.status === 429) return ui("Requests are rate-limited. Wait and try again.", "リクエストが制限されています。時間をおいて再試行してください。");
+    if (error.status >= 500) return ui("Check the Google Drive response and try again later.", "Google Driveの応答を確認し、時間をおいて再試行してください。");
+    return ui("Check the action, path, error details and sync log.", "上記の処理・対象・エラー内容と同期ログを確認してください。");
   }
 
   isNetworkFailure(error) {
@@ -5611,6 +5745,60 @@ module.exports = class DriveBridgePlugin extends Plugin {
   }
 };
 
+class DriveBridgeLargeDeleteModal extends Modal {
+  constructor(app, entries, plan, guardReason, resolve) {
+    super(app);
+    this.entries = entries;
+    this.plan = plan;
+    this.guardReason = guardReason;
+    this.resolve = resolve;
+    this.approved = false;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    const localCount = this.entries.filter((entry) => entry.action === "deleteLocal").length;
+    const remoteCount = this.entries.length - localCount;
+    const otherCounts = {};
+    for (const entry of this.plan.entries) {
+      if (!["deleteLocal", "deleteRemote", "skip", "adopt"].includes(entry.action)) otherCounts[entry.action] = (otherCounts[entry.action] || 0) + 1;
+    }
+    contentEl.createEl("h2", { text: ui("Review large deletions", "大量削除の確認") });
+    contentEl.createEl("p", { text: `${ui("Safeguard", "安全装置")}: DRIVEBRIDGE_LARGE_DELETE\n${this.guardReason}` });
+    contentEl.createEl("p", { text: ui(`Deletion targets: this device ${localCount}; Google Drive ${remoteCount}. Google Drive files are moved to trash.`, `削除先: この端末 ${localCount} 件 / Google Drive ${remoteCount} 件。Google Drive側の削除はゴミ箱への移動です。`) });
+    const otherText = Object.entries(otherCounts).map(([action, count]) => `${this.actionText(action)}: ${count}${ui("", " 件")}`).join(ui(", ", "、")) || ui("none", "なし");
+    contentEl.createEl("p", { text: ui(`Other planned changes: ${otherText}. These will also run if you approve.`, `削除以外の同期予定: ${otherText}。承認すると、これらも同期されます。`) });
+    contentEl.createEl("p", { text: ui("All deletion targets are listed below. Scroll to review every path and reason.", "以下は削除対象の全件です。スクロールしてパスと理由を確認してください。") });
+    const list = contentEl.createEl("pre", { text: this.entries.map((entry, index) => `${index + 1}. ${entry.action === "deleteLocal" ? ui("This device", "この端末") : "Google Drive"}: ${entry.path}\n   ${ui("Reason", "理由")}: ${this.reasonText(entry.reason)}`).join("\n\n") });
+    list.style.maxHeight = "25vh";
+    list.style.overflow = "auto";
+    list.style.whiteSpace = "pre-wrap";
+    const buttons = contentEl.createDiv();
+    const cancel = buttons.createEl("button", { text: ui("Cancel", "キャンセル") });
+    cancel.addEventListener("click", () => this.close());
+    const approve = buttons.createEl("button", { text: ui("Approve once and sync", "確認して今回だけ同期"), cls: "mod-warning" });
+    approve.addEventListener("click", () => { this.approved = true; this.close(); });
+    contentEl.createEl("p", { text: ui("Approval is not saved. The plan is checked again before sync.", "承認は保存されません。承認後に計画が変わっていないか再確認します。") });
+  }
+
+  onClose() {
+    this.contentEl.empty();
+    this.resolve(this.approved);
+  }
+
+  reasonText(reason) {
+    if (reason === "local deletion detected") return ui("Deletion detected on this device", "この端末で削除されたと判定");
+    if (reason === "remote deletion tombstone detected") return ui("Google Drive deletion record detected", "Google Drive側の削除記録を検出");
+    return reason || ui("No further reason available", "理由の詳細なし");
+  }
+
+  actionText(action) {
+    const labels = { upload: "アップロード", download: "ダウンロード", moveRemote: "Drive側の移動", conflict: "競合", review: "確認" };
+    return isJapanese() && labels[action] ? labels[action] : action;
+  }
+}
+
 class DriveBridgeProgressModal extends Modal {
   constructor(app) {
     super(app);
@@ -5622,6 +5810,7 @@ class DriveBridgeProgressModal extends Modal {
     this.onClosed = null;
     this.titleEl = null;
     this.footerEl = null;
+    this.actionEl = null;
   }
 
   onOpen() {
@@ -5636,13 +5825,14 @@ class DriveBridgeProgressModal extends Modal {
       cls: "drivebridge-progress-count"
     });
     this.statusEl = contentEl.createEl("pre", {
-      text: this.message || "Starting...",
+      text: displayText(this.message || "Starting..."),
       cls: "drivebridge-progress-message"
     });
     this.footerEl = contentEl.createEl("p", {
       text: this.footerForMessage(this.message),
       cls: "drivebridge-muted"
     });
+    this.actionEl = contentEl.createDiv();
     this.updateProgressElements();
   }
 
@@ -5656,11 +5846,12 @@ class DriveBridgeProgressModal extends Modal {
 
   update(message, progress) {
     this.message = message;
+    if (this.actionEl) this.actionEl.empty();
     if (progress) {
       this.progress = progress;
     }
     if (this.statusEl) {
-      this.statusEl.setText(message);
+      this.statusEl.setText(displayText(message));
     }
     if (this.titleEl) {
       this.titleEl.setText(this.titleForMessage(message));
@@ -5671,29 +5862,37 @@ class DriveBridgeProgressModal extends Modal {
     this.updateProgressElements();
   }
 
+  setReviewAction(callback) {
+    if (!this.actionEl) return;
+    this.actionEl.empty();
+    const button = this.actionEl.createEl("button", { text: ui("Review deletions", "削除対象を確認"), cls: "mod-cta" });
+    button.addEventListener("click", callback);
+  }
+
   titleForMessage(message) {
     const text = String(message || "");
-    if (text.includes("REPAIR REMOTE INDEX — QUEUED")) return "Repair is queued";
-    if (text.includes("REPAIR REMOTE INDEX — COMPLETE")) return "Repair complete";
-    if (text.includes("REPAIR REMOTE INDEX — STOPPED")) return "Repair stopped";
-    if (text.includes("REPAIR REMOTE INDEX") || text.includes("DriveBridge REPAIR")) return "Repair remote index";
-    if (/sync completed with errors/i.test(text)) return "Normal sync completed with errors";
-    if (/Completed with pending items/i.test(text)) return "Normal sync completed with pending items";
-    if (/Sync complete\./i.test(text)) return "Normal sync complete";
-    if (/sync error \d+\. Continuing/i.test(text)) return "Normal sync is running with errors";
-    if (/DriveBridge failed\.|Failed after/i.test(text)) return "Normal sync stopped";
-    return "Normal sync is running";
+    if (text.includes("REPAIR REMOTE INDEX — QUEUED")) return ui("Repair is queued", "修復は実行待ちです");
+    if (text.includes("REPAIR REMOTE INDEX — COMPLETE")) return ui("Repair complete", "修復が完了しました");
+    if (text.includes("REPAIR REMOTE INDEX — STOPPED")) return ui("Repair stopped", "修復が停止しました");
+    if (text.includes("REPAIR REMOTE INDEX") || text.includes("DriveBridge REPAIR")) return ui("Repair remote index", "リモート索引の修復");
+    if (/sync completed with errors/i.test(text)) return ui("Normal sync completed with errors", "通常同期でエラーが発生しました");
+    if (/Completed with pending items/i.test(text)) return ui("Normal sync completed with pending items", "通常同期は未処理項目を残して完了しました");
+    if (/Sync complete\./i.test(text)) return ui("Normal sync complete", "通常同期が完了しました");
+    if (/sync error \d+\. Continuing/i.test(text)) return ui("Normal sync is running with errors", "エラーが発生しましたが通常同期を続行中です");
+    if (/DriveBridge failed\.|Failed after/i.test(text)) return ui("Normal sync stopped", "通常同期が停止しました");
+    return ui("Normal sync is running", "通常同期を実行中");
   }
 
   footerForMessage(message) {
     const text = String(message || "");
-    if (text.includes("QUEUED")) return "Repair will start automatically; keep Obsidian open.";
-    if (text.includes("COMPLETE")) return "Repair finished. You may continue with Normal Preview.";
-    if (text.includes("STOPPED")) return "Resolve the displayed cause before retrying Repair.";
-    if (text.includes("REPAIR REMOTE INDEX")) return "Keep Obsidian open. This is metadata Repair, not a normal backup.";
-    if (/sync completed with errors|Completed with pending items/i.test(text)) return "All planned work was attempted. Review the pending items before retrying.";
-    if (/Sync complete\./i.test(text)) return "Sync finished. You may continue editing notes.";
-    return "Keep Obsidian open and avoid editing notes until this finishes.";
+    if (text.includes("QUEUED")) return ui("Repair will start automatically; keep Obsidian open.", "修復は自動で開始します。Obsidian を開いたままにしてください。");
+    if (text.includes("COMPLETE")) return ui("Repair finished. You may continue with Normal Preview.", "修復が完了しました。通常プレビューに進めます。");
+    if (text.includes("STOPPED")) return ui("Resolve the displayed cause before retrying Repair.", "表示された原因を解消してから修復を再試行してください。");
+    if (text.includes("REPAIR REMOTE INDEX")) return ui("Keep Obsidian open. This is metadata Repair, not a normal backup.", "Obsidian を開いたままにしてください。これはメタデータの修復で、通常のバックアップではありません。");
+    if (/sync completed with errors|Completed with pending items/i.test(text)) return ui("All planned work was attempted. Review the pending items before retrying.", "予定された処理を試行しました。再試行前に未処理項目を確認してください。");
+    if (/Sync complete\./i.test(text)) return ui("Sync finished. You may continue editing notes.", "同期が完了しました。ノートを編集できます。");
+    if (/DriveBridge failed\.|Failed after/i.test(text)) return ui("Sync stopped. Review the error and next steps.", "同期は停止しました。エラー内容と対処を確認してください。");
+    return ui("Keep Obsidian open and avoid editing notes until this finishes.", "完了するまで Obsidian を開いたままにし、ノートの編集をお控えください。");
   }
 
   updateProgressElements() {
@@ -5710,13 +5909,14 @@ class DriveBridgeProgressModal extends Modal {
         : `${current}/${total}`;
       const details = [];
       if (this.progress.totalItems > 0) {
-        details.push(`Files ${this.progress.completedItems || 0}/${this.progress.totalItems}`);
+        details.push(ui(`Files ${this.progress.completedItems || 0}/${this.progress.totalItems}`, `ファイル ${this.progress.completedItems || 0}/${this.progress.totalItems}`));
       }
       if (this.progress.elapsedText) {
-        details.push(`Elapsed ${this.progress.elapsedText}`);
+        details.push(ui(`Elapsed ${this.progress.elapsedText}`, `経過 ${this.progress.elapsedText}`));
       }
       if (this.progress.etaText) {
-        details.push(`ETA ${this.progress.etaText}`);
+        const eta = this.progress.etaText === "Estimating..." ? ui("Estimating...", "計算中...") : this.progress.etaText === "Finalizing..." ? ui("Finalizing...", "最終処理中...") : this.progress.etaText === "Done" ? ui("Done", "完了") : this.progress.etaText;
+        details.push(ui(`ETA ${eta}`, `残り ${eta}`));
       }
       if (this.progress.finishText) {
         details.push(`Finish around ${this.progress.finishText}`);
@@ -5767,9 +5967,9 @@ class DriveBridgeConflictReviewModal extends Modal {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("drivebridge-review-modal");
-    contentEl.createEl("h2", { text: `DriveBridge conflict review (${this.queue.items.length})` });
+    contentEl.createEl("h2", { text: ui(`DriveBridge conflict review (${this.queue.items.length})`, `DriveBridge 競合の確認（${this.queue.items.length} 件）`) });
     if (!this.queue.items.length) {
-      contentEl.createEl("p", { text: "No conflicts need review.", cls: "drivebridge-muted" });
+      contentEl.createEl("p", { text: ui("No conflicts need review.", "確認が必要な競合はありません。"), cls: "drivebridge-muted" });
       return;
     }
 
@@ -5780,17 +5980,17 @@ class DriveBridgeConflictReviewModal extends Modal {
     selectAll.type = "checkbox";
     selectAll.checked = resolvableItems.length > 0 && resolvableItems.every((item) => this.checkedIds.has(item.id));
     selectAll.indeterminate = !selectAll.checked && resolvableItems.some((item) => this.checkedIds.has(item.id));
-    selectAllLabel.createEl("span", { text: "Select all" });
+    selectAllLabel.createEl("span", { text: ui("Select all", "すべて選択") });
     selectAll.addEventListener("change", () => {
       this.checkedIds = selectAll.checked ? new Set(resolvableItems.map((item) => item.id)) : new Set();
       this.render();
     });
     bulk.createDiv({
-      text: `${this.checkedIds.size} selected`,
+      text: ui(`${this.checkedIds.size} selected`, `${this.checkedIds.size} 件選択中`),
       cls: "drivebridge-review-selection-count"
     });
-    this.addBulkAction(bulk, "Use Local for selected", "keepLocal", this.checkedIds.size === 0);
-    this.addBulkAction(bulk, "Use Drive for selected", "keepRemote", this.checkedIds.size === 0);
+    this.addBulkAction(bulk, ui("Use Local for selected", "選択項目に端末側を使用"), "keepLocal", this.checkedIds.size === 0);
+    this.addBulkAction(bulk, ui("Use Drive for selected", "選択項目に Drive 側を使用"), "keepRemote", this.checkedIds.size === 0);
 
     const layout = contentEl.createDiv({ cls: "drivebridge-review-layout" });
     const list = layout.createDiv({ cls: "drivebridge-review-list" });
@@ -5825,7 +6025,7 @@ class DriveBridgeConflictReviewModal extends Modal {
     detail.createEl("h3", { text: selected.path });
     detail.createEl("p", { text: selected.reason, cls: "drivebridge-muted" });
     const compare = detail.createDiv({ cls: "drivebridge-review-compare" });
-    this.renderSide(compare, "Local", selected.local);
+    this.renderSide(compare, ui("Local", "この端末"), selected.local);
     this.renderSide(compare, "Google Drive", selected.remote);
     if (selected.type === "duplicateRepair") {
       detail.createEl("p", {
@@ -5833,19 +6033,19 @@ class DriveBridgeConflictReviewModal extends Modal {
         cls: "drivebridge-muted"
       });
       const deferOnly = detail.createDiv({ cls: "drivebridge-review-actions" });
-      const defer = deferOnly.createEl("button", { text: "Defer" });
+      const defer = deferOnly.createEl("button", { text: ui("Defer", "保留") });
       defer.addEventListener("click", () => this.close());
       return;
     }
     detail.createEl("p", {
-      text: "Use Local / Use Drive permanently discards the other version after rechecking both sides. Only Keep both creates a conflict copy.",
+      text: ui("Use Local / Use Drive permanently discards the other version after rechecking both sides. Only Keep both creates a conflict copy.", "端末側または Drive 側を使用すると、両側を再確認した後、選ばなかった版は完全に破棄されます。競合コピーを残すには「両方を保持」を選んでください。"),
       cls: "drivebridge-muted"
     });
     const actions = detail.createDiv({ cls: "drivebridge-review-actions" });
-    this.addAction(actions, "Use Local", "keepLocal", selected.id, true);
-    this.addAction(actions, "Use Drive", "keepRemote", selected.id, false);
-    this.addAction(actions, "Keep both (Local canonical)", "keepBoth", selected.id, false);
-    const defer = actions.createEl("button", { text: "Defer" });
+    this.addAction(actions, ui("Use Local", "端末側を使用"), "keepLocal", selected.id, true);
+    this.addAction(actions, ui("Use Drive", "Drive 側を使用"), "keepRemote", selected.id, false);
+    this.addAction(actions, ui("Keep both (Local canonical)", "両方を保持（端末側を優先）"), "keepBoth", selected.id, false);
+    const defer = actions.createEl("button", { text: ui("Defer", "保留") });
     defer.addEventListener("click", () => this.close());
   }
 
@@ -5853,15 +6053,15 @@ class DriveBridgeConflictReviewModal extends Modal {
     const card = parent.createDiv({ cls: "drivebridge-review-side" });
     card.createEl("h4", { text: title });
     if (!info) {
-      card.createEl("p", { text: "Missing", cls: "drivebridge-muted" });
+      card.createEl("p", { text: ui("Missing", "存在しません"), cls: "drivebridge-muted" });
       return;
     }
-    card.createEl("div", { text: `Size: ${formatBytes(info.size || 0)}` });
+    card.createEl("div", { text: `${ui("Size", "サイズ")}: ${formatBytes(info.size || 0)}` });
     if (info.mtime) {
-      card.createEl("div", { text: `Modified: ${new Date(info.mtime).toLocaleString()}` });
+      card.createEl("div", { text: `${ui("Modified", "更新日時")}: ${new Date(info.mtime).toLocaleString()}` });
     }
     if (info.modifiedTime) {
-      card.createEl("div", { text: `Modified: ${new Date(info.modifiedTime).toLocaleString()}` });
+      card.createEl("div", { text: `${ui("Modified", "更新日時")}: ${new Date(info.modifiedTime).toLocaleString()}` });
     }
     const hash = info.sha256 || info.md5Checksum || "not available";
     card.createEl("div", { text: `Hash: ${hash}`, cls: "drivebridge-review-hash" });
@@ -5873,10 +6073,10 @@ class DriveBridgeConflictReviewModal extends Modal {
       if (action === "keepLocal" || action === "keepRemote") {
         const canonical = action === "keepLocal" ? "Local" : "Google Drive";
         const discarded = action === "keepLocal" ? "Google Drive" : "Local";
-        const confirmed = window.confirm(
-          `Use ${canonical} as canonical?\n\n` +
-          `The current ${discarded} version will be permanently discarded after both sides are rechecked. No conflict copy will be kept.`
-        );
+        const confirmed = window.confirm(ui(
+          `Use ${canonical} as canonical?\n\nThe current ${discarded} version will be permanently discarded after both sides are rechecked. No conflict copy will be kept.`,
+          `${action === "keepLocal" ? "端末側" : "Google Drive 側"}を正として使用しますか？\n\n両側を再確認した後、${action === "keepLocal" ? "Google Drive 側" : "端末側"}の版は完全に破棄されます。競合コピーは残りません。`
+        ));
         if (!confirmed) return;
       }
       const buttons = Array.from(parent.querySelectorAll("button"));
@@ -5900,10 +6100,10 @@ class DriveBridgeConflictReviewModal extends Modal {
         .map((item) => item.id);
       if (!selectedIds.length) return;
       const canonical = action === "keepLocal" ? "Local" : "Google Drive";
-      const confirmed = window.confirm(
-        `Use ${canonical} as canonical for ${selectedIds.length} selected conflict(s)?\n\n` +
-        "Each other version will be permanently discarded. No conflict copies will be kept. Both sides are rechecked before every change."
-      );
+      const confirmed = window.confirm(ui(
+        `Use ${canonical} as canonical for ${selectedIds.length} selected conflict(s)?\n\nEach other version will be permanently discarded. No conflict copies will be kept. Both sides are rechecked before every change.`,
+        `選択した ${selectedIds.length} 件の競合について${action === "keepLocal" ? "端末側" : "Google Drive 側"}を正として使用しますか？\n\nそれぞれ反対側の版は完全に破棄され、競合コピーは残りません。各変更前に両側を再確認します。`
+      ));
       if (!confirmed) return;
 
       const controls = Array.from(this.contentEl.querySelectorAll("button, input"));
@@ -5943,8 +6143,8 @@ class DriveBridgeSettingTab extends PluginSettingTab {
     containerEl.createEl("h2", { text: "DriveBridge for Obsidian" });
 
     new Setting(containerEl)
-      .setName("OAuth Client ID")
-      .setDesc("OAuth client ID created in Google Cloud Console.")
+      .setName(ui("OAuth Client ID", "OAuth クライアント ID"))
+      .setDesc(ui("OAuth client ID created in Google Cloud Console.", "Google Cloud Console で作成した OAuth クライアント ID。"))
       .addText((text) => text
         .setPlaceholder("client-id.apps.googleusercontent.com")
         .setValue(this.plugin.settings.clientId)
@@ -5954,8 +6154,8 @@ class DriveBridgeSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName("OAuth Client Secret")
-      .setDesc("Enter this only if your OAuth client type requires a client secret.")
+      .setName(ui("OAuth Client Secret", "OAuth クライアントシークレット"))
+      .setDesc(ui("Enter this only if your OAuth client type requires a client secret.", "利用する OAuth クライアントでシークレットが必要な場合のみ入力します。"))
       .addText((text) => {
         text.inputEl.type = "password";
         text.setValue(this.plugin.settings.clientSecret)
@@ -5966,8 +6166,8 @@ class DriveBridgeSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
-      .setName("Root folder name")
-      .setDesc("Google Drive folder name used as the remote vault root.")
+      .setName(ui("Root folder name", "ルートフォルダ名"))
+      .setDesc(ui("Google Drive folder name used as the remote vault root.", "Google Drive の同期先ルートフォルダ名。"))
       .addText((text) => text
         .setValue(this.plugin.settings.rootFolderName)
         .onChange(async (value) => {
@@ -5981,12 +6181,12 @@ class DriveBridgeSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName("Sync mode")
-      .setDesc("Use bidirectional for normal sync. Push-only and pull-only are useful for first-time migration.")
+      .setName(ui("Sync mode", "同期モード"))
+      .setDesc(ui("Use bidirectional for normal sync. Push-only and pull-only are useful for first-time migration.", "通常は双方向を使用します。アップロード専用・ダウンロード専用は初回移行時に便利です。"))
       .addDropdown((dropdown) => dropdown
-        .addOption("bidirectional", "Bidirectional")
-        .addOption("push", "Push local to Drive")
-        .addOption("pull", "Pull Drive to local")
+        .addOption("bidirectional", ui("Bidirectional", "双方向"))
+        .addOption("push", ui("Push local to Drive", "端末から Drive へ"))
+        .addOption("pull", ui("Pull Drive to local", "Drive から端末へ"))
         .setValue(this.plugin.settings.syncMode)
         .onChange(async (value) => {
           this.plugin.settings.syncMode = value;
@@ -5994,8 +6194,8 @@ class DriveBridgeSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName("Preview by default")
-      .setDesc("Commands and automatic sync create a plan without modifying files by default.")
+      .setName(ui("Preview by default", "通常はプレビューする"))
+      .setDesc(ui("Commands and automatic sync create a plan without modifying files by default.", "コマンドと自動同期は、通常はファイルを変更せず計画を表示します。"))
       .addToggle((toggle) => toggle
         .setValue(this.plugin.settings.dryRunDefault)
         .onChange(async (value) => {
@@ -6004,8 +6204,8 @@ class DriveBridgeSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName("Safe initial sync")
-      .setDesc("Blocks real sync without explicit approval when both sides contain files and no initial snapshot exists.")
+      .setName(ui("Safe initial sync", "初回同期の安全保護"))
+      .setDesc(ui("Blocks real sync without explicit approval when both sides contain files and no initial snapshot exists.", "両側にファイルがあり初回の同期記録がない場合、明示的に承認するまで実同期を停止します。"))
       .addToggle((toggle) => toggle
         .setValue(this.plugin.settings.safeInitialSync)
         .onChange(async (value) => {
@@ -6014,8 +6214,8 @@ class DriveBridgeSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName("Allow first real sync once")
-      .setDesc("Allow one first real sync after you have reviewed the preview result.")
+      .setName(ui("Allow first real sync once", "初回の実同期を一度だけ許可"))
+      .setDesc(ui("Allow one first real sync after you have reviewed the preview result.", "プレビューの内容を確認した後、初回の実同期を一度だけ許可します。"))
       .addToggle((toggle) => toggle
         .setValue(this.plugin.settings.allowFirstRealSync)
         .onChange(async (value) => {
@@ -6025,8 +6225,8 @@ class DriveBridgeSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName("Sync deletes")
-      .setDesc("Move files deleted on one side to the trash on the other side. Keeping this off is recommended at first.")
+      .setName(ui("Sync deletes", "削除を同期"))
+      .setDesc(ui("Move files deleted on one side to the trash on the other side. Keeping this off is recommended at first.", "片側で削除されたファイルをもう片側のゴミ箱へ移動します。最初はオフを推奨します。"))
       .addToggle((toggle) => toggle
         .setValue(this.plugin.settings.syncDeletes)
         .onChange(async (value) => {
@@ -6035,25 +6235,14 @@ class DriveBridgeSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName("Allow one large delete plan")
-      .setDesc("After Preview, approve only that exact plan when 10+ or 20%+ of known files would be deleted. Resets after sync.")
-      .addToggle((toggle) => toggle
-        .setValue(this.plugin.settings.allowLargeDeleteOnce)
-        .onChange(async (value) => {
-          this.plugin.settings.allowLargeDeleteOnce = value;
-          this.plugin.settings.approvedDeletePlanDigest = value ? (this.plugin.settings.lastPreviewDigest || "") : "";
-          await this.plugin.saveSettings();
-        }));
-
-    new Setting(containerEl)
-      .setName("Conflict handling")
-      .setDesc("Manual review queues conflicts without blocking other safe files. Automatic modes remain available for advanced use.")
+      .setName(ui("Conflict handling", "競合の処理"))
+      .setDesc(ui("Manual review queues conflicts without blocking other safe files. Automatic modes remain available for advanced use.", "手動確認では競合を保留し、他の安全なファイルの同期を続けます。上級者向けに自動処理も選べます。"))
       .addDropdown((dropdown) => dropdown
-        .addOption("manualReview", "Manual review (recommended)")
-        .addOption("newerWithBackup", "Keep newest, backup older")
-        .addOption("keepLocalWithBackup", "Keep local, backup remote")
-        .addOption("keepRemoteWithBackup", "Keep remote, backup local")
-        .addOption("keepBothLocalWins", "Keep both, local wins")
+        .addOption("manualReview", ui("Manual review (recommended)", "手動で確認（推奨）"))
+        .addOption("newerWithBackup", ui("Keep newest, backup older", "新しい方を使用し古い方をバックアップ"))
+        .addOption("keepLocalWithBackup", ui("Keep local, backup remote", "端末側を使用し Drive 側をバックアップ"))
+        .addOption("keepRemoteWithBackup", ui("Keep remote, backup local", "Drive 側を使用し端末側をバックアップ"))
+        .addOption("keepBothLocalWins", ui("Keep both, local wins", "両方を保持し端末側を優先"))
         .setValue(this.plugin.settings.conflictAction || DEFAULT_SETTINGS.conflictAction)
         .onChange(async (value) => {
           this.plugin.settings.conflictAction = value;
@@ -6061,8 +6250,8 @@ class DriveBridgeSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName("Protect modify percentage")
-      .setDesc("Abort real sync if more than this percentage of local files would change/delete. Set 100 to disable.")
+      .setName(ui("Protect modify percentage", "変更件数の保護しきい値（%）"))
+      .setDesc(ui("Abort real sync if more than this percentage of local files would change/delete. Set 100 to disable.", "端末側ファイルの変更・削除予定がこの割合を超えると実同期を停止します。100 で無効。"))
       .addText((text) => text
         .setPlaceholder("40")
         .setValue(String(this.plugin.settings.protectModifyPercentage ?? DEFAULT_SETTINGS.protectModifyPercentage))
@@ -6072,10 +6261,10 @@ class DriveBridgeSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName("Root folder ID")
-      .setDesc("Optional advanced override. Use this to pin DriveBridge to one Google Drive folder when duplicate folder names exist.")
+      .setName(ui("Root folder ID", "ルートフォルダ ID"))
+      .setDesc(ui("Optional advanced override. Use this to pin DriveBridge to one Google Drive folder when duplicate folder names exist.", "上級者向けの任意設定。同名フォルダが複数ある場合に同期先を固定します。"))
       .addText((text) => text
-        .setPlaceholder("Google Drive folder ID")
+        .setPlaceholder(ui("Google Drive folder ID", "Google Drive フォルダ ID"))
         .setValue(this.plugin.settings.rootFolderId)
         .onChange(async (value) => {
           const nextId = value.trim();
@@ -6087,12 +6276,12 @@ class DriveBridgeSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName("Duplicate guard")
-      .setDesc("Auto protects only new Drive creates: a lone create uses small exact-name pre/post checks, while batches share parent scans. Strict refreshes the parent before every create. Existing-file updates and unchanged syncs add no guard requests; Off is fastest but less safe.")
+      .setName(ui("Duplicate guard", "重複作成の保護"))
+      .setDesc(ui("Auto protects only new Drive creates: a lone create uses small exact-name pre/post checks, while batches share parent scans. Strict refreshes the parent before every create. Existing-file updates and unchanged syncs add no guard requests; Off is fastest but less safe.", "自動では新規作成時のみ重複を確認します。厳密では各作成前に親フォルダを再確認します。オフは高速ですが安全性が下がります。"))
       .addDropdown((dropdown) => dropdown
-        .addOption("auto", "Auto")
-        .addOption("strict", "Strict")
-        .addOption("off", "Off")
+        .addOption("auto", ui("Auto", "自動"))
+        .addOption("strict", ui("Strict", "厳密"))
+        .addOption("off", ui("Off", "オフ"))
         .setValue(this.plugin.settings.duplicateGuardMode || DEFAULT_SETTINGS.duplicateGuardMode)
         .onChange(async (value) => {
           this.plugin.settings.duplicateGuardMode = value;
@@ -6100,11 +6289,11 @@ class DriveBridgeSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName("Obsidian config sync")
-      .setDesc("Off excludes .obsidian. Safe syncs themes, snippets, hotkeys, plugin files, and selected config while always excluding tokens, plugin data, workspaces, and DriveBridge state.")
+      .setName(ui("Obsidian config sync", "Obsidian 設定の同期"))
+      .setDesc(ui("Off excludes .obsidian. Safe syncs themes, snippets, hotkeys, plugin files, and selected config while always excluding tokens, plugin data, workspaces, and DriveBridge state.", "オフでは .obsidian を除外します。安全な設定のみではテーマ、スニペット、ホットキー、プラグインなどを同期し、トークンやプラグインデータ等は除外します。"))
       .addDropdown((dropdown) => dropdown
-        .addOption("off", "Off")
-        .addOption("safe", "Safe")
+        .addOption("off", ui("Off", "オフ"))
+        .addOption("safe", ui("Safe", "安全な設定のみ"))
         .setValue(this.plugin.settings.obsidianSyncMode || DEFAULT_SETTINGS.obsidianSyncMode)
         .onChange(async (value) => {
           this.plugin.settings.obsidianSyncMode = value;
@@ -6112,8 +6301,8 @@ class DriveBridgeSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName("Auto sync on startup")
-      .setDesc("Run sync after Obsidian starts. If Preview by default is on, startup sync only creates a preview.")
+      .setName(ui("Auto sync on startup", "起動時に自動同期"))
+      .setDesc(ui("Run sync after Obsidian starts. If Preview by default is on, startup sync only creates a preview.", "Obsidian 起動後に同期します。通常はプレビューする設定がオンならプレビューのみ行います。"))
       .addToggle((toggle) => toggle
         .setValue(this.plugin.settings.autoSyncOnStartup)
         .onChange(async (value) => {
@@ -6122,8 +6311,8 @@ class DriveBridgeSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName("Auto sync interval minutes")
-      .setDesc("Set to 0 to disable. Restart Obsidian after changing this value.")
+      .setName(ui("Auto sync interval minutes", "自動同期間隔（分）"))
+      .setDesc(ui("Set to 0 to disable. Restart Obsidian after changing this value.", "0 で無効。変更後は Obsidian を再起動してください。"))
       .addText((text) => text
         .setPlaceholder("0")
         .setValue(String(this.plugin.settings.autoSyncIntervalMinutes))
@@ -6133,8 +6322,8 @@ class DriveBridgeSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName("Max file size MB")
-      .setDesc("Files larger than this limit are skipped.")
+      .setName(ui("Max file size MB", "最大ファイルサイズ（MB）"))
+      .setDesc(ui("Files larger than this limit are skipped.", "この上限より大きいファイルはスキップします。"))
       .addText((text) => text
         .setPlaceholder("50")
         .setValue(String(this.plugin.settings.maxFileSizeMb))
@@ -6144,8 +6333,8 @@ class DriveBridgeSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName("Mobile lightweight mode")
-      .setDesc("Prioritize Markdown, use resumable/range transfers, batch work, throttle UI updates, and pause new large transfers while Obsidian is in the background.")
+      .setName(ui("Mobile lightweight mode", "モバイル軽量モード"))
+      .setDesc(ui("Prioritize Markdown, use resumable/range transfers, batch work, throttle UI updates, and pause new large transfers while Obsidian is in the background.", "Markdown を優先し、転送の再開や分割、処理の分割を使用します。バックグラウンドでは新しい大容量転送を一時停止します。"))
       .addToggle((toggle) => toggle
         .setValue(this.plugin.settings.mobileLightweightMode !== false)
         .onChange(async (value) => {
@@ -6154,8 +6343,8 @@ class DriveBridgeSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName("Google Drive incremental changes")
-      .setDesc("Use the Drive Changes API after a one-time bootstrap scan so normal sync reads only changed remote metadata.")
+      .setName(ui("Google Drive incremental changes", "Google Drive の差分取得"))
+      .setDesc(ui("Use the Drive Changes API after a one-time bootstrap scan so normal sync reads only changed remote metadata.", "初回スキャン後は Drive Changes API を使い、変更されたメタデータだけを取得します。"))
       .addToggle((toggle) => toggle
         .setValue(this.plugin.settings.driveChangesEnabled !== false)
         .onChange(async (value) => {
@@ -6167,8 +6356,8 @@ class DriveBridgeSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName("Excluded folders")
-      .setDesc("One vault-relative folder per line. Files below these folders stay local-only and are not uploaded, downloaded, or deleted remotely.")
+      .setName(ui("Excluded folders", "除外フォルダ"))
+      .setDesc(ui("One vault-relative folder per line. Files below these folders stay local-only and are not uploaded, downloaded, or deleted remotely.", "Vault からの相対パスを1行に1つ入力します。配下のファイルは同期や Drive 側の削除対象になりません。"))
       .addTextArea((text) => {
         text.inputEl.rows = 4;
         text.inputEl.cols = 40;
@@ -6181,8 +6370,8 @@ class DriveBridgeSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
-      .setName("Excluded patterns")
-      .setDesc("One pattern per line. `*` and `**` are supported. Excluded paths are local-only and are not uploaded, downloaded, or deleted remotely.")
+      .setName(ui("Excluded patterns", "除外パターン"))
+      .setDesc(ui("One pattern per line. `*` and `**` are supported. Excluded paths are local-only and are not uploaded, downloaded, or deleted remotely.", "1行に1パターンを入力します。`*` と `**` が使えます。除外対象は同期や Drive 側の削除対象になりません。"))
       .addTextArea((text) => {
         text.inputEl.rows = 8;
         text.inputEl.cols = 40;
@@ -6194,16 +6383,16 @@ class DriveBridgeSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
-      .setName("Authorize")
-      .setDesc("Use Step 1 to get a code, complete Google authorization, then press Step 2.")
+      .setName(ui("Authorize", "認証"))
+      .setDesc(ui("Use Step 1 to get a code, complete Google authorization, then press Step 2.", "手順1でコードを取得し、Google で認証後、手順2を押します。"))
       .addButton((button) => button
-        .setButtonText("Step 1: Get code")
+        .setButtonText(ui("Step 1: Get code", "手順1: コードを取得"))
         .onClick(async () => {
           await runUiAction(() => this.plugin.startDeviceAuth());
           this.display();
         }))
       .addButton((button) => button
-        .setButtonText("Step 2: Finish")
+        .setButtonText(ui("Step 2: Finish", "手順2: 認証を完了"))
         .onClick(async () => {
           await runUiAction(() => this.plugin.finishDeviceAuth());
           this.display();
@@ -6217,16 +6406,16 @@ class DriveBridgeSettingTab extends PluginSettingTab {
     }
 
     new Setting(containerEl)
-      .setName("Sync")
-      .setDesc("Preview does not modify files. Run sync applies the planned changes.")
+      .setName(ui("Sync", "同期"))
+      .setDesc(ui("Preview does not modify files. Run sync applies the planned changes.", "プレビューはファイルを変更しません。同期実行で予定された変更を適用します。"))
       .addButton((button) => button
-        .setButtonText("Preview")
+        .setButtonText(ui("Preview", "プレビュー"))
         .onClick(async () => {
           await this.plugin.previewSync();
           this.display();
         }))
       .addButton((button) => button
-        .setButtonText("Run sync")
+        .setButtonText(ui("Run sync", "同期を実行"))
         .setCta()
         .onClick(async () => {
           await this.plugin.syncNow({ dryRun: false });
@@ -6234,36 +6423,46 @@ class DriveBridgeSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName("Conflict review")
-      .setDesc(`${this.plugin.reviewCount || 0} conflict(s) are waiting. Other safe files continue syncing.`)
+      .setName(ui("Review large deletions", "大量削除の確認"))
+      .setDesc(ui("Recheck and review the current plan after a large-delete stop. No changes are applied until you approve.", "同期が大量削除で止まったとき、現在の計画を読み直して対象を確認します。承認するまで変更は実行されません。"))
       .addButton((button) => button
-        .setButtonText("Open review")
+        .setButtonText(ui("Review deletions", "削除対象を確認"))
+        .onClick(async () => {
+          await this.plugin.syncNow({ dryRun: false, reviewDeletesOnly: true });
+          this.display();
+        }));
+
+    new Setting(containerEl)
+      .setName(ui("Conflict review", "競合の確認"))
+      .setDesc(ui(`${this.plugin.reviewCount || 0} conflict(s) are waiting. Other safe files continue syncing.`, `${this.plugin.reviewCount || 0} 件の競合が確認待ちです。他の安全なファイルは同期を続けます。`))
+      .addButton((button) => button
+        .setButtonText(ui("Open review", "確認画面を開く"))
         .setDisabled(!this.plugin.reviewCount)
         .onClick(async () => {
           await runUiAction(() => this.plugin.openConflictReview());
         }));
 
     new Setting(containerEl)
-      .setName("Repair remote index — not Normal sync")
-      .setDesc(`Use only when DriveBridge asks for index repair. This full-scans Google Drive metadata and rewrites ${REMOTE_SNAPSHOT_FILE}; it does not upload/download normal note files and is not the regular backup button. Wait for REPAIR COMPLETE before running Normal Preview and Normal sync.`)
+      .setName(ui("Repair remote index — not Normal sync", "リモート索引の修復（通常の同期ではありません）"))
+      .setDesc(ui(`Use only when DriveBridge asks for index repair. This full-scans Google Drive metadata and rewrites ${REMOTE_SNAPSHOT_FILE}; it does not upload/download normal note files and is not the regular backup button. Wait for REPAIR COMPLETE before running Normal Preview and Normal sync.`, `DriveBridge から索引修復を求められた場合のみ使用します。Google Drive のメタデータ全体を走査し ${REMOTE_SNAPSHOT_FILE} を再作成します。通常のノートは転送しません。修復完了後に通常プレビューと同期を実行してください。`))
       .addButton((button) => button
-        .setButtonText("Start index repair")
+        .setButtonText(ui("Start index repair", "索引の修復を開始"))
         .onClick(async () => {
           await runUiAction(() => this.plugin.rebuildRemoteSnapshotFromDrive());
           this.display();
         }));
 
     new Setting(containerEl)
-      .setName("Duplicate-aware repair")
-      .setDesc("Preview scans Google Drive only when requested. Apply moves only byte-identical extra files to Drive trash; ambiguous files and folders go to Manual Review.")
+      .setName(ui("Duplicate-aware repair", "重複を考慮した修復"))
+      .setDesc(ui("Preview scans Google Drive only when requested. Apply moves only byte-identical extra files to Drive trash; ambiguous files and folders go to Manual Review.", "プレビューは要求時のみ Google Drive を走査します。適用時は内容が完全一致する余分なファイルだけをゴミ箱に移し、判断できないものは手動確認に回します。"))
       .addButton((button) => button
-        .setButtonText("1. Preview duplicates")
+        .setButtonText(ui("1. Preview duplicates", "1. 重複をプレビュー"))
         .onClick(async () => {
           await runUiAction(() => this.plugin.scanDuplicateRepairPlan());
           this.display();
         }))
       .addButton((button) => button
-        .setButtonText("2. Apply safe repair")
+        .setButtonText(ui("2. Apply safe repair", "2. 安全な修復を適用"))
         .setWarning()
         .onClick(async () => {
           await runUiAction(() => this.plugin.applyDuplicateRepairPlan());
@@ -6271,19 +6470,19 @@ class DriveBridgeSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName("Recovery")
-      .setDesc("Use in order after an interrupted sync. Safe resume defers deletes and automatic conflict writes, runs only safe operations, then asks you to review deferred actions in Normal Preview.");
+      .setName(ui("Recovery", "復旧"))
+      .setDesc(ui("Use in order after an interrupted sync. Safe resume defers deletes and automatic conflict writes, runs only safe operations, then asks you to review deferred actions in Normal Preview.", "同期が中断した場合に順番に使用します。安全な再開では削除と競合の自動書き込みを保留し、安全な操作だけ実行します。"));
 
     const recoveryButtonsEl = containerEl.createDiv({ cls: "drivebridge-recovery-flow" });
-    this.addRecoveryButton(recoveryButtonsEl, "1. Preview recovery", false, async () => {
+    this.addRecoveryButton(recoveryButtonsEl, ui("1. Preview recovery", "1. 復旧をプレビュー"), false, async () => {
       await runUiAction(() => this.plugin.previewRecovery());
       this.display();
     });
-    this.addRecoveryButton(recoveryButtonsEl, "2. Discard partial downloads", false, async () => {
+    this.addRecoveryButton(recoveryButtonsEl, ui("2. Discard partial downloads", "2. 部分ダウンロードを破棄"), false, async () => {
       await runUiAction(() => this.plugin.discardPartialDownloads());
       this.display();
     });
-    this.addRecoveryButton(recoveryButtonsEl, "3. Normal Preview", !this.plugin.settings.recoveryPreviewSafe, async () => {
+    this.addRecoveryButton(recoveryButtonsEl, ui("3. Normal Preview", "3. 通常プレビュー"), !this.plugin.settings.recoveryPreviewSafe, async () => {
       await this.plugin.previewSync();
       this.display();
     });
@@ -6292,27 +6491,27 @@ class DriveBridgeSettingTab extends PluginSettingTab {
       this.plugin.settings.recoveryPlanPreviewRunId === this.plugin.settings.recoveryPreviewRunId &&
       Boolean(this.plugin.settings.recoveryPlanPreviewAt) &&
       this.plugin.settings.recoveryPlanPreviewSafe;
-    this.addRecoveryButton(recoveryButtonsEl, "4. Resume safe operations", !resumeEnabled, async () => {
+    this.addRecoveryButton(recoveryButtonsEl, ui("4. Resume safe operations", "4. 安全な操作を再開"), !resumeEnabled, async () => {
       await runUiAction(() => this.plugin.syncNow({ dryRun: false, recoveryResume: true }));
       this.display();
     }, true);
 
     if (this.plugin.settings.lastRecoverySummary) {
       containerEl.createEl("div", {
-        text: this.plugin.settings.lastRecoverySummary,
+        text: displayText(this.plugin.settings.lastRecoverySummary),
         cls: "drivebridge-status"
       });
     }
 
     if (this.plugin.syncing && this.plugin.currentSyncProgress) {
       containerEl.createEl("div", {
-        text: this.plugin.currentSyncProgress,
+        text: displayText(this.plugin.currentSyncProgress),
         cls: "drivebridge-status drivebridge-live-status"
       });
     }
 
     containerEl.createEl("div", {
-      text: this.plugin.settings.lastSyncSummary || "No sync has run yet.",
+      text: this.plugin.settings.lastSyncSummary ? displayText(this.plugin.settings.lastSyncSummary) : ui("No sync has run yet.", "同期はまだ実行されていません。"),
       cls: "drivebridge-status"
     });
   }
